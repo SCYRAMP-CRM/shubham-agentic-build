@@ -7,6 +7,7 @@ import { assertExecutionCAS } from '../../shared/chat-execution.ts'
 import { executionHttpError } from '../../shared/chat-execution-http.ts'
 import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.ts'
 import { profileName } from '../codex/home.ts'
+import { isSupportedCodexVersion } from '../codex/versions.ts'
 import type { CodexManager } from '../codex/index.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ChatPool } from './chats.ts'
@@ -83,7 +84,7 @@ export function createNativeCodexExecution(o: NativeCodexOptions) {
   const capability = () => {
     const status = o.manager.status(), bin = o.manager.bin()
     if (process.platform !== 'win32' || process.arch !== 'x64' || !o.host.inspect || !o.host.current || !bin
-      || !status.installed || status.version !== '0.163.0' || status.state !== 'ok') throw executionHttpError('execution-capability-required', 'capability')
+      || !status.installed || !isSupportedCodexVersion(status.version) || status.state !== 'ok') throw executionHttpError('execution-capability-required', 'capability')
     const resolved = nativeCodexExecutable(bin)
     return { bin: resolved.executable, binHash: resolved.fingerprint, host: { ...o.host.current() } }
   }

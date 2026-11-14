@@ -2804,10 +2804,49 @@ ConPTY on Windows) and streams it: the key and any password never reach the brow
 - **The form**: `GET /agent-api/pc-ssh/pcs/<id>/target` fills it with the last target used for that PC (`<state>/agent/ssh/targets.json`, saved
   when a session opens), else the PC's Tailscale address from its link (port 22, user empty). Host keys: OpenSSH takes a PC's key on another port
   without asking when the same key is known for the bare host (port 22); it asks only for a new or different key, and that answer is Shubham's.
-- Nothing about SSH itself is changed here: no config, no key. The read-only SSH status list (installed, running, port, password and root login,
-  allowed users, key fingerprints, Tailscale SSH, a Test that reads the banner only) is the next slice.
+- Nothing about SSH itself is changed here: no config, no key.
+- **The read-only status** (order o1fa0's second slice; pc-ssh.ts, pc-ssh-read.ts, shared/pc-ssh.ts, src/pc-control/SshStatusCard.tsx), on the same
+  mount: `GET /agent-api/pc-ssh/pcs/<id>/status` answers `PcSshReport`: OpenSSH installed (Windows: `sc.exe query/qc sshd`; Linux: `systemctl show`
+  of ssh.service, ssh.socket, sshd.service, or /usr/sbin/sshd), running ('socket' = systemd waits for a connection), at boot, its ports and where they
+  listen now (netstat; /proc/net/tcp and tcp6), password login (PasswordAuthentication, or keyboard-interactive with PAM), root login, AllowUsers and
+  AllowGroups, the keys it accepts for this agent's own user (and on Windows `administrators_authorized_keys`): type, `SHA256:` fingerprint and
+  comment only, never the key, Tailscale's own SSH (`tailscale debug prefs` RunSSH), and the ready `ssh user@<Tailscale IP> [-p port]`. The settings
+  come from `sshd -T` when it answers, else from the config files read as sshd does (Include in place and sorted, the first value wins, Port, ListenAddress
+  and AllowUsers add up, Match blocks left out); a file it cannot read is said, never guessed. The Server asks a member on a `pc-ssh-v1` stream (as
+  Ports; `answerOnce`/`exchange` from pc-ports.ts); off, older build or a wrong answer is said so. Checked by the Server and again by the page
+  (`cleanSshReport`: the right PC, bounded words, the command rebuilt from its parts).
+- **The Test** `POST …/pcs/<id>/test {}` (nothing else accepted): the Server connects to that PC's Tailscale address and SSH port from its own report,
+  else the last terminal target used for it, reads the greeting line ("SSH-2.0-…", 5 s) and closes. Nothing is sent: no key, no login.
 - Tests: `shared/pc-ssh-term.test.ts`, `pc-ssh-term.test.ts` (the human rule, the ticket, the session with a pretend pty, 4 at most, known_hosts,
-  the saved target), `src/pc-control/ssh-term.test.mjs`, `workspace-tabs.test.mjs` (SSH after Ports, the owner's only), `src/pages/phone-width.test.mjs`.
+  the saved target, the status/test routes), `src/pc-control/ssh-term.test.mjs`, `workspace-tabs.test.mjs` (SSH after Ports, the owner's only),
+  `src/pages/phone-width.test.mjs`; the status: `pc-ssh-read.test.ts` (sshd -T, the config files, authorized_keys, systemd/netstat//proc, the Z800 as
+  Agent 6 set it up, Windows not installed and locked), `pc-ssh.test.ts` (self, member, older build, liar, silent, the real banner probe on 127.0.0.1),
+  `shared/pc-ssh.test.ts`, `src/pc-control/ssh-status.test.mjs`.
+
+## PC control's Dependencies tab (order oc7c9, 14 Nov 2026; pc-deps.ts, pc-deps-read.ts, pc-deps-fixes.ts, shared/pc-deps.ts, src/pc-control/PcDepsPanel.tsx)
+
+Shubham: "If dependencies are the issue, then in PC control introduce a Dependencies tab and list all dependencies required." The owner's tab after
+Resources (a phone's tab says "Deps"). READ ONLY: no install button; an install needs his yes.
+
+- **The rows** (`DepRow`: id, group, name, required, installed, where, state ok|outdated|missing|broken|unknown, note, fix, fixRights), by group: Node.js
+  (engines, `>=22.22`) and npm (`npm --version` run once with this Node's own npm-cli.js: one that crashes is *broken*, its error line said); the app's
+  packages from the app folder's own package.json (an installed build lists only its run-time four; one row per missing or outdated one, after a
+  summary row); Claude Code (findClaude, `--version`), Codex CLI (findCodex) and the app's CODEX_HOME (`<state>/agent/codex/home` and its config.toml:
+  existence only, the login is never opened); git, Python (>=3.10, only for uvx MCP servers and helpers), Tailscale (installed, and `BackendState`
+  Running: else *broken*, fixed by the person's own `tailscale up`), the OpenSSH client (`ssh -V`) and server (pc-ssh-read.ts), Chrome or Edge
+  (defaultEngines; Windows: the highest version folder beside the program); the drive: WinFsp (its DLL's own VS_FIXEDFILEINFO, >=2.1) or, on Linux,
+  gio, gvfs's WebDAV and FUSE backends and FUSE 3; Windows' voice: Whisper's server and its model (`ggml-<SAD_WHISPER_MODEL|small>.bin` under
+  `%LOCALAPPDATA%\shubham-agentic`) and the en-IN and hi-IN voices (the registry's Speech_OneCore tokens, read with `reg query`). The independent
+  questions start together (about 1 s here; PowerShell took 4-9 s and is not used).
+- **The fix commands**: one table, `pc-deps-fixes.ts` (`DEP_FIXES`: row id → the Windows and the Linux command and what it needs: admin, sudo, none,
+  or person), worked out from that PC (its Node folder and version, the app folder, a lock file or not). Agent 6's installer (order o20e2) imports
+  this table rather than keeping a copy. The page shows each as text to copy, with what it needs; nothing is run from it.
+- **Route** `GET /agent-api/pc-deps/pcs/<id>` (`?fresh=1` asks again; a PC's own list is kept a minute): not a scoped mount, so the owner only. The
+  Server asks a member on a `pc-deps-v1` stream (`answerOnce`/`exchange` from pc-ports.ts); off, an older build or a wrong answer is said so.
+  Checked by the Server and again by the page (`cleanDepsReport`).
+- Tests: `shared/pc-deps.test.ts` (versions, the check), `pc-deps-read.test.ts` (the Server today; the Z800 with its broken npm and missing
+  postgres; a system Node; Tailscale signed out; the DLL's version; the voices; the fix table covers every row), `pc-deps.test.ts` (kept a minute,
+  fresh, a member, off, older build, liar, the route), `src/pc-control/deps-report.test.mjs`, `workspace-tabs.test.mjs`, `src/pages/phone-width.test.mjs`.
 
 ## F-118: who is using the app (auth/, agentic/access.ts, shared/auth.ts)
 
@@ -2929,6 +2968,17 @@ Run from the intended conversation working directory. `CODEX_HOME` selects the C
 **Engine changes.** `shared/codex.ts` keeps the existing 409 code and changes its message to say the conversation carries over, the original stays saved, and conversion failure starts a new conversation. The existing `confirmNewConversation` request field remains compatible. `agentic/floors.ts` validates the entire chart before calling the server's carry-over hook. `agentic/index.ts` resolves the old engine's actual transcript, converts it, and binds a fresh app session plus `codexThread` for Codex, or the new Claude `sessionId` for Claude. The next open resumes it. A replaced running chat is stopped. Missing/invalid transcripts, unavailable destination homes and conversations on another PC fall back to the existing empty binding, with a warning explaining why. There is no remote conversion protocol yet. The original file remains readable and untouched.
 
 **Mapping and limits.** Imports preserve user/assistant text and paired tool calls/results. Claude queued prompts are included; Codex custom/function calls become Claude tool_use/tool_result blocks, and Claude tools become Codex custom calls/outputs. Missing tool answers receive a placeholder; orphan outputs become text. Claude images get an omission marker. Thinking, developer instructions, account metadata, sidechains, unknown blocks and malformed lines are skipped. Codex task boundaries are emitted when importing Claude. Lines over 8 MiB are skipped; text/output bodies are capped at 32,000 characters, nested values at 30 levels and arrays at 1,000 entries. Credential-named object fields are removed recursively (including serialized JSON); recognizable inline key/token assignments and bearer/API-key forms are redacted. Arbitrary secrets embedded in ordinary prose cannot be identified reliably. File-based switching streams bounded lines. Claude imports scan for the final main-session system/compact_boundary first, then stream only that context; the pure converter also handles multiple boundaries in an iterable. The following isCompactSummary user message is preserved even when isMeta is true. A 400 KiB serialized rollout budget retains the summary and newest whole turns, with an omission note when turns are dropped; exceptionally large summaries are explicitly shortened. Tool pairs are evicted together with their turn. No whole transcript read or source mutation is involved.
+
+**A chat with no conversation (oc66d, 14 Nov 2026).** The PC that holds the conversation (`switchSourceState`; asked by the
+hub with `engine-switch-prepare {checkOnly}`, which answers `empty: true`) finds it: Codex, the rollout of the thread recorded for
+the agent, else (the chat ran but its id never reached the floor) the rollout whose first lines carry its marker `[sad-chat <id>]`;
+Claude, its transcript. When the chat is not running and nothing of it exists (Codex: no thread recorded and no marked rollout;
+Claude: no transcript and the hub has no record of it running anywhere), it never held a conversation: the hub does no conversion
+and, at the commit, lets its unused session go (kept in its history list) so the engine changes as for an agent with no chat. Not on
+a PC Control floor (refused, as before). A recorded Codex conversation whose file is gone, Codex not set up on that PC, or a running
+chat whose file is not written yet: refused, saying which, where it looked, and on which PC. (Marketing on 1cal, Codex homed on
+the Z800, had never started: "source transcript is unavailable on its home PC".) Tests: `codex-chats.test.ts` (oc66d),
+`team.test.ts` (oc66d, the home on another PC).
 
 **Tests and acceptance proof.** `codex/{from-claude,to-claude}.test.ts` use invented fixtures only: reader compatibility, round trips, UUID chains, tool pairing, malformed data, redaction, caps, fresh files, CLI destinations and failure cases. `agentic/codex-chats.test.ts` exercises the real API/pool/stores with fake CLIs: confirmed changes in both directions, next-open resume, original-file preservation, and logged fallback when the source is missing. The floor-store tests cover confirmation and validation before conversion.
 

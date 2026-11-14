@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { screenReplay, SCREEN_REPLAY_MESSAGES } from './screen-replay.ts'
 
 type Row = Record<string, unknown>
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v)
@@ -174,10 +175,16 @@ export function convertClaude(lines: Iterable<string>, options: ConversionOption
     }
   }
   finish()
-  const build = () => mapClaude([...summary, ...(stats.omittedTurns ? [JSON.stringify({ type: 'user', message: { content: `[Import omitted ${stats.omittedTurns} older or oversized turns to fit the conversation budget.]` } })] : []), ...turns.flat()], options)
+  const build = (replayLimit = 0) => mapClaude([...summary, ...(stats.omittedTurns ? [JSON.stringify({ type: 'user', message: { content: `[Import omitted ${stats.omittedTurns} older or oversized turns to fit the conversation budget.]` } })] : []), ...turns.flat()], options, replayLimit)
+  const size = (rows: string[]) => Buffer.byteLength(rows.join('\n') + '\n')
   let result = build()
-  while (Buffer.byteLength(result.join('\n') + '\n') > budget && turns.length) { turns.shift(); stats.omittedTurns++; result = build() }
-  stats.outputBytes = Buffer.byteLength(result.join('\n') + '\n')
+  while (size(result) > budget && turns.length) { turns.shift(); stats.omittedTurns++; result = build() }
+  // The screen-replay rows are display only, so they never cost a turn: as many of the last messages as still fit the budget.
+  for (const limit of [SCREEN_REPLAY_MESSAGES, 20, 10, 5, 2]) {
+    const replayed = build(limit)
+    if (size(replayed) <= budget) { result = replayed; break }
+  }
+  stats.outputBytes = size(result)
   return { lines: result, stats }
 }
 
@@ -186,9 +193,10 @@ export function fromClaude(lines: Iterable<string>, options: ConversionOptions):
 }
 
 /** Claude JSONL -> Codex 0.163.0 rollout JSONL. Unknown/malformed rows and private metadata are skipped. */
-function mapClaude(lines: Iterable<string>, options: ConversionOptions): string[] {
+function mapClaude(lines: Iterable<string>, options: ConversionOptions, replayLimit = 0): string[] {
   const out: string[] = []
   const emit = (type: string, payload: Row, timestamp = options.timestamp) => out.push(JSON.stringify({ timestamp, ordinal: out.length, type, payload }))
+  const replay = screenReplay(replayLimit)
   emit('session_meta', { session_id: options.id, id: options.id, timestamp: options.timestamp, cwd: options.cwd, runtime_workspace_roots: [options.cwd], originator: 'codex_cli_rs', cli_version: options.cliVersion ?? '0.163.0', source: 'cli', thread_source: 'user', model_provider: 'openai', base_instructions: { text: '' }, history_mode: 'paginated' })
   let turn = 0
   let messageNumber = 0
@@ -216,6 +224,7 @@ function mapClaude(lines: Iterable<string>, options: ConversionOptions): string[
     emit('event_msg', { type: 'item_completed', thread_id: options.id, turn_id: turnId(), item: role === 'assistant'
       ? { type: 'AgentMessage', id, content: [{ type: 'Text', text: body }], phase: 'final_answer' }
       : { type: 'UserMessage', id, client_id: null, content: [{ type: 'text', text: body, text_elements: [] }] } }, at)
+    replay.add(role, body, at)
   }
   for (const line of lines) {
     if (line.length > 8 * 1024 * 1024) continue
@@ -251,6 +260,7 @@ function mapClaude(lines: Iterable<string>, options: ConversionOptions): string[
     if (role === 'assistant' && ['end_turn', 'stop_sequence'].includes(String(r.message.stop_reason))) finish(at)
   }
   finish(options.timestamp)
+  for (const row of replay.payloads()) emit('event_msg', row.payload, row.at)
   return out
 }
 

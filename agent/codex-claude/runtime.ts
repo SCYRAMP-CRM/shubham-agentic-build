@@ -300,7 +300,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     claude = provedClaudeBinary({ binDir: o.claudeBinDir ?? claudeBinDir(o.directory), version: REQUIRED.claude,
       sources: installedClaudeSources(REQUIRED.claude, findClaude()) })
     const codex = findCodex()
-    if (!claude || !/\.exe$/i.test(claude) || !codex || codex.version !== REQUIRED.codex || process.versions.node !== REQUIRED.node) throw executionHttpError('execution-capability-required', 'runtime')
+    if (!claude || !/\.exe$/i.test(claude) || !codex || !codex.version || !REQUIRED.codexInstalled.includes(codex.version) || process.versions.node !== REQUIRED.node) throw executionHttpError('execution-capability-required', 'runtime')
     const version = spawnSync(claude, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
     if (version.status !== 0 || parseVersion(version.stdout) !== REQUIRED.claude) throw executionHttpError('execution-capability-required', 'runtime')
     binaryPin = pinImmutableBinary(claude)

@@ -41,10 +41,11 @@ export function dependencyReport(f: DependencyFacts, now: number): DependencyRep
     !f.claude.found ? 'Not found on this PC' : f.claude.version ? `Claude Code ${f.claude.version}` : 'Found, but its version could not be read',
     'The chat window is this exact Claude Code. A newer one (Claude Code updates itself) is refused until the bridge has been checked against it, and the error above shows.',
     `Install Claude Code ${REQUIRED.claude} (the Windows .exe) and keep it on that version on this PC, then restart the app.`))
-  checks.push(row('codex', `Codex CLI ${REQUIRED.codex}`, !f.codex.found ? 'missing' : f.codex.version === REQUIRED.codex ? 'ok' : 'missing',
+  const codexVersions = REQUIRED.codexInstalled.join(' or ')
+  checks.push(row('codex', `Codex CLI ${codexVersions}`, !f.codex.found ? 'missing' : f.codex.version && REQUIRED.codexInstalled.includes(f.codex.version) ? 'ok' : 'missing',
     !f.codex.found ? 'Not found on this PC' : f.codex.version ? `Codex CLI ${f.codex.version}` : 'Found, but its version could not be read',
-    `Requests go to ChatGPT the way Codex ${REQUIRED.codex} sends them, and the bridge checks that this is the Codex installed here.`,
-    `Install Codex CLI ${REQUIRED.codex} on this PC, then restart the app.`))
+    `Requests go to ChatGPT the way Codex ${REQUIRED.codex} sends them, and the bridge checks that the Codex installed here is one it was proved with (${codexVersions}).`,
+    `Install Codex CLI ${REQUIRED.codexInstalled[REQUIRED.codexInstalled.length - 1]} on this PC, then restart the app.`))
   checks.push(row('chat-host', 'The app\'s chat host is running', f.chatHost ? 'ok' : 'missing', f.chatHost ? 'Connected' : 'Not connected',
     'Every chat runs inside the chat host; the bridge asks it which chats run and proves each one before letting it reach ChatGPT.',
     'Restart the app on this PC (Start.cmd). The chat host starts with it and keeps chats running across updates.'))

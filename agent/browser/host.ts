@@ -437,15 +437,32 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
   }
 
   async function screencast() {
-    if (!cdp || !page) return
+    const c = cdp
+    const p = page
+    if (!c || !p) return
     // Order o15b2: the page is drawn at the screen's own density (up to 3x: a phone's text was blurred 1.5x at the old 2x cap) for the sharp frame;
     // the quick frames of a scroll stay at most 2x.
     const dpr = Math.min(3, Math.max(1, size.dpr))
     const quick = Math.min(2, dpr)
-    await cdp.send('Emulation.setDeviceMetricsOverride', { width: size.w, height: size.h, deviceScaleFactor: dpr, mobile: size.mobile }, page)
-    await cdp.send('Page.stopScreencast', {}, page).catch(() => undefined)
+    // Order o15b2 (14 Nov): a command sent to the page while a navigation commits is refused ("Not attached to an active page"). The stop
+    // before the start had gone through, so the picture stayed frozen until the next size change (the view opened on a phone while a page
+    // loads; flaky in the full test run). Each step is tried again until the page takes it, while it is still the page shown and the same
+    // browser (a newer screencast() takes over otherwise), for up to 10 s.
+    const until = now() + 10_000
+    const step = async (method: string, params: Record<string, unknown>) => {
+      for (;;) {
+        try {
+          return await c.send(method, params, p)
+        } catch (e) {
+          if (cdp !== c || page !== p || now() > until) throw e
+          await sleep(150)
+        }
+      }
+    }
+    await step('Emulation.setDeviceMetricsOverride', { width: size.w, height: size.h, deviceScaleFactor: dpr, mobile: size.mobile })
+    await c.send('Page.stopScreencast', {}, p).catch(() => undefined)
     lastQuick = ''
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 62, maxWidth: Math.round(size.w * quick), maxHeight: Math.round(size.h * quick), everyNthFrame: 1 }, page)
+    await step('Page.startScreencast', { format: 'jpeg', quality: 62, maxWidth: Math.round(size.w * quick), maxHeight: Math.round(size.h * quick), everyNthFrame: 1 })
   }
 
   /** Order o02a5: the view shows tab `t` from now on (its picture, his input, the Assistant's look and act). */

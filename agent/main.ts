@@ -1,12 +1,23 @@
 import { createPcBuild, safeHubOrigin, PC_BUILD_STREAM, type BuildControl } from './pc-build.ts'
 import { createPcPorts, PC_PORTS_STREAM } from './pc-ports.ts'
 import { createSshTerm } from './pc-ssh-term.ts'
-import { loadNodePty } from './agentic/chats.ts'
+import { createSshStatus, PC_SSH_STREAM } from './pc-ssh.ts'
+import { readSsh, realSshDeps } from './pc-ssh-read.ts'
+import { createPcDeps, PC_DEPS_STREAM } from './pc-deps.ts'
+import { readDeps } from './pc-deps-read.ts'
+import { findClaude, loadNodePty } from './agentic/chats.ts'
+import { BRIDGE_REQUIREMENTS } from './codex-claude/requirements.ts'
+import { defaultEngines } from './browser/host.ts'
 import os from 'node:os'
+import { createPcResources, PC_RESOURCES_STREAM } from './pc-resources.ts'
+import { createResourceReader } from './resources/collect.ts'
+import { createSampler } from './resources/sampler.ts'
+import { createWindowsSampler } from './resources/windows.ts'
 import { buildPortRows, cleanTailnetIp, cleanTailnetName, knownAppPorts, safeLink, stableFallbackRows, type PcPortRow, type PcPortsReport } from '../shared/pc-ports.ts'
 import { FREE_CREDENTIAL, openCodeCredential } from './opencode/crm.ts'
 import type net from 'node:net'
 import { copyFileSync, existsSync } from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type HostOs, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
@@ -25,7 +36,7 @@ import { createAuth } from './auth/index.ts'
 import { CRM_URL, CrmError, trimUrl } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
-import { findCodex } from './codex/find.ts'
+import { findCodex, parseVersion } from './codex/find.ts'
 import { createCodex } from './codex/index.ts'
 import { startRowWatch } from './claude/rowwatch.ts'
 import { loadUserEnv } from './claude/userenv.ts'
@@ -51,7 +62,7 @@ import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
 import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, readRustdeskWhitelist, rustdeskHandler } from './rustdesk.ts'
 import { createSavedPasswords } from './saved-passwords.ts'
 import { createAppScreen } from './screen/index.ts'
-import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
+import { createEngine, modelFromEnv, type Engine as SpeechEngine } from './speech/engine.ts'
 import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { createTts, type Tts } from './speech/tts.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
@@ -237,6 +248,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   })
   let pcBuild: ReturnType<typeof createPcBuild> | null = null
   let pcPorts: ReturnType<typeof createPcPorts> | null = null
+  let sshStatus: ReturnType<typeof createSshStatus> | null = null
+  let pcDeps: ReturnType<typeof createPcDeps> | null = null
+  let pcResources: ReturnType<typeof createPcResources> | null = null
   const onOpen = {
     [PC_BUILD_STREAM]: (meta: OpenMeta) => {
       if (!pcBuild) throw new Error('PC build controls unavailable')
@@ -246,6 +260,21 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     [PC_PORTS_STREAM]: (meta: OpenMeta) => {
       if (!pcPorts) throw new Error('the ports report is unavailable')
       return pcPorts.serve(meta)
+    },
+    // Order o1fa0: the Server asks this PC for its SSH status (PC control's SSH tab). Read only.
+    [PC_SSH_STREAM]: (meta: OpenMeta) => {
+      if (!sshStatus) throw new Error('the SSH status is unavailable')
+      return sshStatus.serve(meta)
+    },
+    // Order oc7c9: the Server asks this PC for its dependency list (PC control's Dependencies tab). Read only.
+    [PC_DEPS_STREAM]: (meta: OpenMeta) => {
+      if (!pcDeps) throw new Error('the dependency list is unavailable')
+      return pcDeps.serve(meta)
+    },
+    // Order odbd8: the Server asks this PC what it is using (PC control's Resources tab). Read only.
+    [PC_RESOURCES_STREAM]: (meta: OpenMeta) => {
+      if (!pcResources) throw new Error('the resources report is unavailable')
+      return pcResources.serve(meta)
     },
     // F-116: dialled at an address RustDesk's IP whitelist lets in (read from its own settings at each stream; never changed).
     rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, tailnet, whitelist: () => readRustdeskWhitelist(), log: log.child('rustdesk') }),
@@ -495,6 +524,97 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     },
     dir: path.join(paths.agent, 'ssh'),
     log: log.child('ssh'),
+    status: { status: id => sshStatus!.status(id), test: id => sshStatus!.test(id) },
+  })
+  // Order o1fa0, the read-only status: this PC's OpenSSH as it can see it (pc-ssh-read.ts), a member's over their link, and the banner-only Test.
+  const sshDeps = realSshDeps(tailscaleRunner)
+  sshStatus = createSshStatus({
+    selfId: identity.id,
+    role: () => role,
+    hubId: () => devices.hub()?.id ?? null,
+    read: () => readSsh(sshDeps),
+    tailnet: () => {
+      const self = portsMod.state().self
+      return { name: cleanTailnetName(self.name) ?? cleanTailnetName(tailnetName.get()), address: cleanTailnetIp(self.address) ?? cleanTailnetIp(tailnet()) }
+    },
+    peer: id => {
+      const mux = hub?.links.mux(id)
+      return mux ? { open: () => mux.open(PC_SSH_STREAM, {}) } : null
+    },
+    member: id => {
+      const m = devices.member(id)
+      return m ? { name: m.name } : null
+    },
+    savedTarget: id => sshTerm.savedTarget(id),
+  })
+
+  // Order oc7c9: PC control's Dependencies tab. This PC's list of what the app needs and what it has (pc-deps-read.ts), a member's over their link.
+  // Read only: version questions, `npm --version` once, file checks, the registry's voice list on Windows; nothing is installed.
+  const stateRoot = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'shubham-agentic')
+  const claudeInfo = async (): Promise<{ path: string | null; version: string | null }> => {
+    const file = findClaude()
+    if (!file) return { path: null, version: null }
+    const cmd = /\.(cmd|bat)$/i.test(file)
+    const r = await sshDeps.exec(cmd ? process.env.ComSpec || 'cmd.exe' : file, cmd ? ['/d', '/c', file, '--version'] : ['--version'], 8000)
+    return { path: file, version: r.code === 0 ? parseVersion(r.stdout) : null }
+  }
+  pcDeps = createPcDeps({
+    selfId: identity.id,
+    role: () => role,
+    hubId: () => devices.hub()?.id ?? null,
+    read: async () => {
+      const codex = findCodex()
+      return readDeps({
+        platform: process.platform,
+        arch: process.arch,
+        node: { version: process.versions.node, exec: process.execPath },
+        appRoot: path.resolve(import.meta.dirname, '..'),
+        stateRoot,
+        home: os.homedir(),
+        exec: sshDeps.exec,
+        readFile: sshDeps.readFile,
+        readBytes: file => fsp.readFile(file),
+        exists: sshDeps.exists,
+        listDir: sshDeps.listDir,
+        tailscale: tailscaleRunner,
+        claude: claudeInfo,
+        codex: codex ? { path: codex.path, version: codex.version } : null,
+        codexHome: path.join(paths.agent, 'codex', 'home'),
+        bridge: { claude: BRIDGE_REQUIREMENTS.claude, codex: BRIDGE_REQUIREMENTS.codex },
+        browsers: defaultEngines(),
+        ssh: () => readSsh(sshDeps),
+        whisperModel: modelFromEnv(process.env.SAD_WHISPER_MODEL),
+      })
+    },
+    peer: id => {
+      const mux = hub?.links.mux(id)
+      return mux ? { open: () => mux.open(PC_DEPS_STREAM, {}) } : null
+    },
+    member: id => {
+      const m = devices.member(id)
+      return m ? { name: m.name } : null
+    },
+  })
+
+  // Order odbd8: PC control's Resources tab. Each PC notes its CPU and memory every 3 s (the graphs' last 15 minutes) and reads the rest only while
+  // somebody looks (Windows: one hidden PowerShell that ends a minute after the last look); the Server asks a member over their link, like Ports.
+  const resourceSampler = createSampler()
+  resourceSampler.start()
+  const windowsResources = process.platform === 'win32' ? createWindowsSampler({ log: m => log.child('resources').info(m) }) : null
+  const resourceReader = createResourceReader({ selfId: identity.id, sampler: resourceSampler, windows: windowsResources })
+  pcResources = createPcResources({
+    selfId: identity.id,
+    role: () => role,
+    hubId: () => devices.hub()?.id ?? null,
+    report: () => resourceReader.report(),
+    peer: id => {
+      const mux = hub?.links.mux(id)
+      return mux ? { open: () => mux.open(PC_RESOURCES_STREAM, {}) } : null
+    },
+    member: id => {
+      const m = devices.member(id)
+      return m ? { name: m.name } : null
+    },
   })
 
   if (role === 'hub') hub = await startHub()
@@ -1071,7 +1191,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: process.env.WA_BACKEND_DIR ?? path.join(paths.root, 'whatsapp-backend') }), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
@@ -1090,6 +1210,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   async function stopAll() {
     for (const t of timers) clearInterval(t)
+    resourceSampler.stop()
+    windowsResources?.stop()
     extras.updateCoordinator?.current?.close()
     // F-079: WhatsApp closes its Chrome properly alongside the rest (if the agent ends first, the worker still does).
     const waClosed = whatsapp?.close()

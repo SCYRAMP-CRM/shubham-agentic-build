@@ -99,8 +99,11 @@ export function createPcPorts(o: PcPortsOptions): PcPorts {
   return { mount, serve, get }
 }
 
-/** The member's side: one JSON line in, one JSON line out ({ok:true,value} or {ok:false}), then the stream ends. */
-function answerOnce(stream: Duplex, work: (raw: unknown) => PcPortsReport) {
+/**
+ * The member's side: one JSON line in, one JSON line out ({ok:true,value} or {ok:false}), then the stream ends. `work` may take a while (order o1fa0's
+ * SSH report runs a few read-only commands); the stream is closed after 15 s whatever happens. Also used by pc-ssh.ts.
+ */
+export function answerOnce(stream: Duplex, work: (raw: unknown) => unknown) {
   let data = ''
   let used = false
   const timer = setTimeout(() => stream.destroy(), 15_000)
@@ -119,18 +122,22 @@ function answerOnce(stream: Duplex, work: (raw: unknown) => PcPortsReport) {
     const i = data.indexOf('\n')
     if (i < 0) return
     used = true
-    let reply: string
+    const refuse = () => stream.end(JSON.stringify({ ok: false }) + '\n')
+    let raw: unknown
     try {
-      reply = JSON.stringify({ ok: true, value: work(JSON.parse(data.slice(0, i))) })
+      raw = JSON.parse(data.slice(0, i))
     } catch {
-      reply = JSON.stringify({ ok: false })
+      refuse()
+      return
     }
-    stream.end(reply + '\n')
+    void Promise.resolve()
+      .then(() => work(raw))
+      .then(value => stream.end(JSON.stringify({ ok: true, value }) + '\n'), refuse)
   })
 }
 
-/** The Server's side: sends the request line, reads one answer line (bounded in size and time). */
-function exchange(stream: Duplex, request: PcPortsRequest, timeoutMs: number): Promise<unknown> {
+/** The Server's side: sends the request line, reads one answer line (bounded in size and time). Also used by pc-ssh.ts. */
+export function exchange(stream: Duplex, request: unknown, timeoutMs: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let data = ''
     let done = false

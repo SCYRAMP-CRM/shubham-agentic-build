@@ -29,6 +29,8 @@ export interface SshTermOptions {
   ssh: { exe: string; keyFile: string | null; knownHosts: string; cwd: string; env: Record<string, string> }
   /** <state>/agent/ssh: targets.json (the last target per PC). */
   dir: string
+  /** Order o1fa0's read-only status and its Test (pc-ssh.ts), on this same mount: GET /pcs/<id>/status, POST /pcs/<id>/test {}. */
+  status?: { status(id: string): Promise<unknown>; test(id: string): Promise<unknown> }
   now?: () => number
   log?: { info(m: string): void; warn(m: string): void }
 }
@@ -39,6 +41,8 @@ export interface SshTerm {
   closeAll(): void
   /** For tests: how many sessions are open. */
   open(): number
+  /** The last target a session used for this PC (targets.json), or null. */
+  savedTarget(id: string): SshTarget | null
 }
 
 interface Ticket {
@@ -233,12 +237,19 @@ export function createSshTerm(o: SshTermOptions): SshTerm {
   const mount: ApiMount = {
     prefix: PC_SSH_PREFIX,
     async http(r: MountRequest) {
-      const m = /^\/pcs\/([^/]+)\/(target|session)$/.exec(r.rest)
+      const m = /^\/pcs\/([^/]+)\/(target|session|status|test)$/.exec(r.rest)
       if (!m) throw apiError(404, 'Nothing here.')
       if (r.query.toString()) throw apiError(400, 'Nothing after the path, please.')
       if (m[2] === 'target') {
         if (r.method !== 'GET') throw apiError(405, 'Only GET.')
         return target(m[1])
+      }
+      if (m[2] === 'status' || m[2] === 'test') {
+        if (!o.status) throw apiError(404, 'Nothing here.')
+        if (r.method !== (m[2] === 'status' ? 'GET' : 'POST')) throw apiError(405, m[2] === 'status' ? 'Only GET.' : 'Only POST.')
+        if (m[2] === 'test' && r.body !== null && r.body !== undefined && (typeof r.body !== 'object' || Array.isArray(r.body) || Object.keys(r.body).length)) throw apiError(400, 'The test takes an empty JSON object.')
+        if (!ID.test(m[1]) || !o.pc(m[1])) throw apiError(404, 'That is not one of this app’s PCs.')
+        return m[2] === 'status' ? o.status.status(m[1]) : o.status.test(m[1])
       }
       if (r.method !== 'POST') throw apiError(405, 'Only POST.')
       return session(m[1], r)
@@ -271,6 +282,10 @@ export function createSshTerm(o: SshTermOptions): SshTerm {
       sessions.clear()
     },
     open: () => sessions.size,
+    savedTarget: id => {
+      const t = readTargets()[id]
+      return t ? { user: t.user, host: t.host, port: t.port } : null
+    },
   }
 }
 

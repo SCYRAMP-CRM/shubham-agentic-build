@@ -79,7 +79,7 @@ import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type P
 import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
-import { createUiBridge } from './ui-bridge.ts'
+import { createUiBridge, type UiWho } from './ui-bridge.ts'
 import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
 import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress } from './orders.ts'
 import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
@@ -293,10 +293,8 @@ const ADMIN_TOOLS = new Set([
   'task_add',
   'task_list',
   'task_update',
-  'ui_screen',
-  'ui_control',
-  'ui_modules',
-  'ui_invoke',
+  // Order o355e (+ oe3b1): ui_screen / ui_control / ui_modules / ui_invoke are not here any more: a person's own Assistant (duty orchestrator) uses
+  // them on that person's own pages only (ui-bridge.ts scopes every call to its chat's owner).
   'phone_screen',
   'phone_control',
   'phone_update',
@@ -727,6 +725,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const access = createAccess(o.auth)
   // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
   const ui = createUiBridge()
+  /** Order o355e (+ oe3b1): whose page or call it is, for the screen bridge: the signed-in person (or nobody), and an administrator or not. */
+  const uiWho = (c: Caller): UiWho => ({ person: c.person?.id ? c.person.id.toLowerCase() : null, admin: access.isAdmin(c) })
   /** One event as this caller may see it, as text; null when it is not theirs at all. */
   function eventFor(e: AgenticEvent, c: Caller): string | null {
     if (e.t === 'tasks') return access.isAdmin(c) ? JSON.stringify(e) : null
@@ -4819,19 +4819,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
         log?.info(`${agent.name} wrote to the CRM`)
         return out
       }
-      // F-070: the overlay assistant's hands. Only that agent: nobody else moves Shubham's screen.
+      // F-070: the overlay assistant's hands. Only that agent (duty orchestrator); order o355e: each person's own Assistant, on that person's own pages only.
       case 'ui_screen':
       case 'ui_control':
       case 'ui_modules':
       case 'ui_invoke': {
-        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
+        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves the screen; ask it (it is the sparkle button in the app).")
         // "Goals on mobile: use the API" (Settings › Assistant, on unless turned off): on a phone the CRM Goals page is not driven. What opens
         // it, or its handlers, is refused here; the page refuses a press or typing while it is on the Goals page (told to by goalsApi).
         if (name === 'ui_invoke') {
           const climb = pathClimb(args.args)
           if (climb) throw apiError(400, `ui_invoke: an argument may not climb out of a path ("${climb.slice(0, 60)}"): give plain ids and words.`)
         }
-        const goalsApi = ui.onPhone() === true && assistantSettings.get().goalsOnMobile
+        // Order o355e (+ oe3b1): the chat's own person's pages only (its owner's; the owner of the app's own pages and open app on any of his PCs).
+        const as = uiWho(me)
+        const goalsApi = ui.onPhone(as) === true && assistantSettings.get().goalsOnMobile
         if (goalsApi) {
           const why = goalsPageCall(name, args)
           if (why) throw apiError(409, why)
@@ -4839,6 +4841,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const out = await ui.call(
           name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
           goalsApi ? { ...args, goalsApi: true } : args,
+          undefined,
+          as,
         )
         return typeof out === 'string' ? out : json(out)
       }
@@ -4975,19 +4979,65 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function localSwitchSource(previous: FloorAgent): string | null {
+    const source = switchSourceState(previous)
+    if (source.empty) throw neverHeld(previous)
+    return source.file
+  }
+
+  /** oc66d: where nothing can be switched without a conversation (a PC Control slot, or a conversion asked for anyway). */
+  const neverHeld = (previous: FloorAgent) => Object.assign(apiError(409, `${previous.name}'s chat has never held a conversation, so there is nothing to carry over. The current engine and conversation are unchanged.`), { code: 'engine-change-conversion-failed' })
+
+  /** oc66d: the patch as the page sent it, its expected conversation now without the unused session that was let go just before. */
+  function withoutFreshSessions(body: FloorPatch, fresh: ReadonlySet<string>): FloorPatch {
+    const e = body.expectedConversation
+    if (!e || !fresh.has(e.agentId)) return body
+    return { ...body, expectedConversation: { ...e, sessionId: null, ...(e.codexThread !== undefined ? { codexThread: null } : {}), ...(e.opencodeSession !== undefined ? { opencodeSession: null } : {}) } }
+  }
+
+  /**
+   * The conversation an engine switch carries, on the PC that holds it: its file, or `empty` when the chat never held one.
+   * oc66d (14 Nov 2026, Shubham: "Find out why, and this error should not come again"): Marketing (Codex, home the Z800) never started,
+   * so no Codex conversation of it existed anywhere, and the switch failed with "source transcript is unavailable on its home PC".
+   * - Codex: its rollout by the thread recorded for it; none recorded (the chat ran but its id never reached the floor: the start-up
+   *   discovery waits for the hub), by the marker every chat of ours writes into its first lines ([sad-chat <id>]). A thread recorded whose
+   *   file is gone, or Codex not set up on this PC: refused, saying which, where it looked, and on which PC.
+   * - Claude: its transcript (every PC keeps a copy of a floor chat's, F-021).
+   * - `empty` only when the chat is not running here and nothing of it exists (Codex: no thread recorded and no rollout with its marker;
+   *   Claude: no transcript): nothing to lose. A running chat whose file is not written yet is refused (fail closed).
+   */
+  function switchSourceState(previous: FloorAgent): { file: string | null; empty: boolean } {
     requireLegacyExecution(previous, defaultsNow())
     const sid = previous.sessionId!
     const current = bySession(sid)
     if (current && isPcControl(current.floor) && chats.info(sid)) requireRunningEngine(engineFor(previous), chats.info(sid)!.engine)
+    const refuse = (words: string) => Object.assign(apiError(409, `${previous.name}: ${words} The current engine and conversation are unchanged.`), { code: 'engine-change-conversion-failed' })
     if (engineFor(previous) === 'opencode') {
       if (!chats.info(sid) && (!openCode.install() || !previous.opencodeSession)) throw Object.assign(apiError(409, 'OpenCode history is unavailable on its home PC. The current conversation is unchanged.'), { code: 'engine-change-conversion-failed' })
-      return null
+      return { file: null, empty: false }
     }
-    const file = engineFor(previous) === 'codex'
-      ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
-      : findClaudeTranscript(sid, projectsDir)
-    if (!file) throw Object.assign(apiError(409, `${previous.name}: source transcript is unavailable on its home PC. The current engine and conversation are unchanged.`), { code: 'engine-change-conversion-failed' })
-    return file
+    const running = !!chats.info(sid)
+    if (engineFor(previous) === 'codex') {
+      if (!o.codex) throw refuse(`Codex is not set up on ${self().name}, so its conversation cannot be read here.`)
+      const home = o.codex.paths.home
+      if (previous.codexThread) {
+        const file = findRollout(home, previous.codexThread)
+        if (!file) throw refuse(`its Codex conversation ${previous.codexThread} is not in ${path.join(home, 'sessions')} on ${self().name}.`)
+        return { file, empty: false }
+      }
+      const found = discoverThread(home, sid, 0)
+      if (found) {
+        log?.info(`engine switch: ${previous.name}'s Codex conversation was never recorded on its floor; found by its chat marker (${found.thread.slice(0, 8)})`)
+        return { file: found.file, empty: false }
+      }
+      if (running) throw refuse(`its Codex chat is running on ${self().name} but has not written its conversation yet. Try again in a moment.`)
+      return { file: null, empty: true }
+    }
+    const file = findClaudeTranscript(sid, projectsDir)
+    if (file) return { file, empty: false }
+    if (running) throw refuse(`its Claude chat is running on ${self().name} but has not written its conversation yet. Try again in a moment.`)
+    // A Claude chat that ran somewhere (the hub saw where it ran last) and has no transcript here: refused, as before (fail closed).
+    if (lastAll()[sid]) throw refuse(`its conversation is not on ${self().name} (looked for ${sid}.jsonl under ${projectsDir}).`)
+    return { file: null, empty: true }
   }
 
   function switchSourcePc(previous: FloorAgent) {
@@ -5081,8 +5131,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     if (!matches()) throw Object.assign(apiError(409, 'The source conversation changed on its home PC. Refresh and confirm again.'), { code: 'engine-change-stale' })
     if (!previous.sessionId || (!chats.info(previous.sessionId) && previous.homePc && previous.homePc !== self().id && lastAll()[previous.sessionId]?.pc !== self().name)) throw apiError(409, 'This PC does not hold the source conversation')
-    localSwitchSource(previous)
-    if (raw.checkOnly === true) return { ready: true }
+    // oc66d: the check says when the chat never held a conversation here (`empty`): the hub then switches it with nothing to carry.
+    const source = switchSourceState(previous)
+    if (raw.checkOnly === true) return { ready: true, ...(source.empty ? { empty: true } : {}) }
     const next = { ...previous, engine: raw.next.engine, opencodeProvider: raw.next.opencodeProvider, opencodeModel: raw.next.opencodeModel } as FloorAgent
     if (typeof raw.switchId !== 'string') throw apiError(400, 'Expected an engine-switch operation id')
     const binding = await prepareLocalSwitch(floor, previous, next, raw.switchId)
@@ -5151,16 +5202,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       // Hub lease/open/input barrier begins before any async preparation. The source host also fences itself.
       for (const { previous } of changes) switchFences.begin(previous.sessionId!, switchId)
+      // oc66d: a chat that never held a conversation (checked on the PC where it would be) has nothing to carry: no conversion and no seal;
+      // at the commit its unused session is let go (kept in its history list), so the engine changes as for an agent with no chat. A PC
+      // Control slot keeps its pinned conversation rule (refused as before).
+      const fresh = new Set<string>()
       for (const { previous, next } of changes) {
         const location = switchSourcePc(previous)
         if (location.id !== self().id) {
           const peer = team?.member(location.id)
           if (!peer) throw Object.assign(apiError(424, `${previous.name}'s newest history is on ${location.name}, which is offline. The current conversation is unchanged.`), { code: 'engine-change-home-offline' })
           peers.set(previous.id, peer)
-          await request(peer, 'engine-switch-prepare', { ...peerBody(previous, next), checkOnly: true }, 120_000)
-        } else localSwitchSource(previous)
+          const check = await request<unknown>(peer, 'engine-switch-prepare', { ...peerBody(previous, next), checkOnly: true }, 120_000)
+          if (isObject(check) && check.empty === true) {
+            if (isPcControl(before)) throw neverHeld(previous)
+            peers.delete(previous.id)
+            fresh.add(previous.id)
+          }
+        } else if (switchSourceState(previous).empty) {
+          if (isPcControl(before)) throw neverHeld(previous)
+          fresh.add(previous.id)
+        }
       }
       for (const { previous, next } of changes) {
+        if (fresh.has(previous.id)) continue
         const peer = peers.get(previous.id)
         let raw: unknown
         if (peer) {
@@ -5173,10 +5237,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       // Seal remote source hashes while every old session remains fenced, then check local sources synchronously.
       for (const { previous } of changes) if (peers.has(previous.id)) await finishPeer(previous, 'seal')
-      for (const { previous } of changes) if (!peers.has(previous.id)) switchFences.seal(previous.sessionId!, switchId)
+      for (const { previous } of changes) if (!peers.has(previous.id) && !fresh.has(previous.id)) switchFences.seal(previous.sessionId!, switchId)
       if (JSON.stringify(floorOf(id)) !== fingerprint || defaultsNow().engine !== defaultEngine) throw Object.assign(apiError(409, 'This floor changed while the conversation was prepared. Refresh and confirm again.'), { code: 'engine-change-stale' })
       for (const {previous} of changes) conversionProgress.update(id, previous.id, 'saving')
-      committed = floors.patch(id, body as FloorPatch, as)
+      for (const { previous } of changes) {
+        if (!fresh.has(previous.id)) continue
+        floors.bindSession(id, previous.id, null)
+        log?.info(`engine switch: ${previous.name}'s chat never held a conversation; its unused session ${previous.sessionId!.slice(0, 8)} is let go and the engine changes with nothing to carry`)
+      }
+      committed = floors.patch(id, withoutFreshSessions(body as FloorPatch, fresh), as)
       // Never release an old session after success, even while the member still has a debounced old replica.
       for (const { previous } of changes) {
         try { switchFences.retire(previous.sessionId!, switchId) } catch (error) { log?.warn('Could not persist retirement; durable preparation fence remains: ' + message(error)) }
@@ -6910,6 +6979,85 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return route({ method: raw.method, rest: raw.rest, query: new URLSearchParams(typeof raw.query === 'string' ? raw.query : ''), body, headers: {}, caller })
   }
 
+  /**
+   * Order o355e (Shubham: "When people use their screen they will be using localhost"): on a member PC, a page's screen socket (localhost:5173 on
+   * that PC, or its own tailnet address) is passed on to the Server, whose bridge the Assistant's ui tools use, with whoever is signed in on the page.
+   * One stream per page, its lines {m: text} both ways; either end closing closes the other. With no link to the Server the page is told to try again
+   * later (its socket reconnects by itself).
+   */
+  function relayUiPage(ws: WsSocket, caller: Caller) {
+    const link = team?.hub()?.link ?? null
+    if (!link) {
+      ws.close(1013, 'The Server is not reachable from this PC right now')
+      return
+    }
+    let stream: Duplex | null = null
+    let closed = false
+    const early: string[] = []
+    ws.onText(t => {
+      if (stream) writeLine(stream, { m: t })
+      else if (early.length < 50) early.push(t)
+    })
+    ws.onClose(() => {
+      closed = true
+      stream?.destroy()
+    })
+    const by = caller.person ? { id: caller.person.id, username: caller.person.username, name: caller.person.name } : null
+    link.open({ op: 'ui-page', by }).then(
+      s => {
+        if (closed) return void s.destroy()
+        stream = s
+        for (const t of early.splice(0)) writeLine(s, { m: t })
+        readLines(s, v => {
+          if (!isObject(v) || typeof v.m !== 'string') return
+          try {
+            ws.sendText(v.m)
+          } catch {
+            // the page went; its close ends the stream
+          }
+        })
+        s.on('close', () => {
+          if (!closed) ws.close(1012, 'The link to the Server closed')
+        })
+      },
+      () => ws.close(1013, 'The Server turned the screen link down'),
+    )
+  }
+
+  /** Order o355e: the Server's end of relayUiPage: the member's page as one of the bridge's own, tagged with the person signed in on it there. */
+  function serveUiPage(raw: unknown): (stream: Duplex) => void {
+    const by = isObject(raw) && typeof raw.id === 'string' && raw.id ? raw : null
+    // As for every request a member passes on for its own pages (fromMember): the person its page signed in; nobody: the owner's open app there.
+    const caller: Caller = by
+      ? { person: { id: String(by.id).toLowerCase().slice(0, 64), username: String(by.username ?? '').slice(0, 80), name: String(by.name ?? '').slice(0, 120), canSeeAll: (o.auth?.admins() ?? []).includes(String(by.id).toLowerCase()) }, via: 'local', sid: null }
+      : OPEN
+    return stream => {
+      let onText: (t: string) => void = () => undefined
+      let onClose: () => void = () => undefined
+      let gone = false
+      const end = () => {
+        if (gone) return
+        gone = true
+        onClose()
+      }
+      const page: WsSocket = {
+        sendText: t => void writeLine(stream, { m: t }),
+        onText: cb => void (onText = cb),
+        onClose: cb => void (onClose = cb),
+        close: () => {
+          stream.end()
+          end()
+        },
+      }
+      ui.socket()(page, uiWho(caller))
+      readLines(stream, v => {
+        if (isObject(v) && typeof v.m === 'string') onText(v.m)
+      })
+      stream.on('close', end)
+      stream.on('end', end)
+    }
+  }
+
   // ---------------------------------------------------------------------------------------
   // F-021: what the other PCs ask of this one
 
@@ -6920,6 +7068,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'hub') {
       switch (op) {
+        // Order o355e: a member's page (localhost there, or its tailnet address) joins this bridge, as the person signed in on it.
+        case 'ui-page':
+          return serveUiPage(meta.by)
         // F-165: a member's Dependencies page asks for the hub's checks.
         case 'dependencies':
           return answer(() => localDependencies())
@@ -7488,7 +7639,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return
       }
       // Order o5007: /old (the old-app reader) is the owner's, like the fast Assistant's.
-      if (rest === '/ui' || rest === '/fast' || rest === OLD_SOCKET) {
+      // Order o355e (+ oe3b1): the screen socket is anyone's own page: a signed-in person's (their own Assistant drives it, never anyone else's)
+      // or the owner's open app. A page nobody is signed in on, not the owner's, has no one to be driven by.
+      if (rest === '/ui') {
+        if (!access.isAdmin(caller) && !caller.person) {
+          o.auth?.deny(caller, 403, 'sign-in', where)
+          throw authError(403, 'Sign in to let your Assistant use this page.', 'sign-in')
+        }
+        return
+      }
+      if (rest === '/fast' || rest === OLD_SOCKET) {
         if (!access.isAdmin(caller)) {
           o.auth?.deny(caller, 403, 'admin-only', where)
           throw authError(403, 'This is for the owner of this app.', 'admin-only')
@@ -7506,7 +7666,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
           watch(query.get('session') ?? '', caller ?? OPEN, ws)
           chatSocket(query)(ws)
         }
-      if (rest === '/ui') return ui.socket()
+      // Order o355e: a member PC passes its pages on to the Server's bridge (the Assistant's ui tools run there); the Server keeps its own.
+      if (rest === '/ui') return (ws, caller) => (mode() === 'member' ? relayUiPage(ws, caller ?? OPEN) : ui.socket()(ws, uiWho(caller ?? OPEN)))
       // F-086/F-087: the fast Assistant's stream for the web page (shared/fast.ts); no host = off = no such socket.
       if (rest === '/fast') return fastSession?.socket('web') ?? null
       // Order o5007: the old-app reader's stream (the same frames); switched off, its folder not here, or a member PC: no such socket.

@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { sanitizeConversationValue } from './from-claude.ts'
+import { screenReplay } from './screen-replay.ts'
 
 type Row = Record<string, unknown>
 const obj = (v: unknown): v is Row => !!v && typeof v === 'object' && !Array.isArray(v)
@@ -74,6 +75,7 @@ export function* completeCodexToClaude(lines: Iterable<string>, o: CompleteHisto
 
 export function* completeClaudeToCodex(lines: Iterable<string>, o: CompleteHistoryOptions, includeHeader = true): Generator<string> {
   const wrap = (type: string, payload: unknown, timestamp = o.timestamp) => JSON.stringify({ timestamp, type, payload })
+  const replay = screenReplay()
   if (includeHeader) yield wrap('session_meta', { id: o.id, session_id: o.id, timestamp: o.timestamp, cwd: o.cwd, runtime_workspace_roots: [o.cwd],
     originator: 'codex_cli_rs', cli_version: '0.163.0', source: 'cli', thread_source: 'user', model_provider: 'openai', base_instructions: { text: '' } })
   const pending = new Set<string>(), seen = new Set<string>()
@@ -91,6 +93,7 @@ export function* completeClaudeToCodex(lines: Iterable<string>, o: CompleteHisto
     yield wrap('event_msg', { type: 'item_completed', thread_id: o.id, turn_id: `${o.id}-${turn}`, item: role === 'assistant'
       ? { type: 'AgentMessage', id, content: content.map(p => ({ type: 'Text', text: p.text ?? '[Image]' })), phase: 'final_answer' }
       : { type: 'UserMessage', id, client_id: null, content: content.map(p => ({ type: 'text', text: p.text ?? '[Image]', text_elements: [] })) } }, at)
+    replay.add(role, content.map(p => typeof p.text === 'string' ? p.text : '').filter(Boolean).join('\n'), at)
   }
   const finish = function* (at: string) {
     for (const call_id of pending) yield wrap('response_item', { type: 'custom_tool_call_output', call_id, output: '[No result recorded in the original session]' }, at)
@@ -134,4 +137,5 @@ export function* completeClaudeToCodex(lines: Iterable<string>, o: CompleteHisto
     }
   }
   yield* finish(o.timestamp)
+  for (const row of replay.payloads()) yield wrap('event_msg', row.payload, row.at)
 }
