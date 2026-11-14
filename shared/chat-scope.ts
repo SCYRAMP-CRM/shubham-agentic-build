@@ -1,3 +1,4 @@
+import { pageFeature } from './access.ts'
 import type { AuthPerson, ChatAccess, ChatCan, ChatOwner } from './auth.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 
@@ -105,7 +106,16 @@ export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }
 
-/** Whether this page may be shown to this person: everyone while the app is open or signed out of nothing, else the admin's pages only to the admin. */
-export function mayOpen(pathname: string, person: Pick<AuthPerson, 'canSeeAll'> | null): boolean {
-  return !person || person.canSeeAll || !adminOnlyPath(pathname)
+/**
+ * Whether this page may be shown to this person: everyone while the app is open or signed out of nothing, else the admin's pages only to the admin.
+ * Order o9465: when the agent says which features are open to this person (Settings › Access; AuthStatus.features), a page shows only when its
+ * feature is one of them, and a page that is no feature's is the owner's (fail closed).
+ */
+export function mayOpen(pathname: string, person: Pick<AuthPerson, 'canSeeAll'> | null, features?: readonly string[] | null): boolean {
+  if (!person || person.canSeeAll) return true
+  if (features) {
+    const f = pageFeature(pathname)
+    return f !== null && features.includes(f.key)
+  }
+  return !adminOnlyPath(pathname)
 }

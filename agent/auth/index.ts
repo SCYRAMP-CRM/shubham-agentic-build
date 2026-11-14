@@ -221,15 +221,18 @@ export function createAuth(o: AuthOptions): Auth {
   }
 
   function require(): AuthRequire {
-    if (broken()) return 'off'
+    // Break-glass (the Server's own file, or SAD_AUTH) resets the level to Everyone; it never opens the app.
+    if (broken()) return 'all'
     settleTrial()
     return f.require
   }
 
-  const needsSignIn = (via: Caller['via']) => {
-    const r = require()
-    return r === 'all' || (r === 'remote' && via === 'tailnet')
-  }
+  /**
+   * Order oc186: nobody signed in never gets the app's data, from any address and at any level. The levels 'off' and 'remote' stay
+   * selectable and mean 'all' now. Only the PC's own program (machine) and a signed-in person pass; the device-key routes check
+   * their own key.
+   */
+  const needsSignIn = (_via: Caller['via']) => true
 
   function cookieOf(headers: Record<string, string | string[] | undefined>): string | null {
     const raw = headers.cookie
@@ -309,11 +312,11 @@ export function createAuth(o: AuthOptions): Auth {
       canPublish: c.person?.canSeeAll === true,
       mayShowCode: c.person?.canSeeAll === true && !!sessionInfo(c.sid),
       mayApprove: !!c.person && !!sessionInfo(c.sid),
-      needsSignIn: !c.person && !c.machine && needsSignIn(c.via),
+      needsSignIn: !c.person && !c.machine,
     }
   }
 
-  const admin = (c: Caller) => (c.person ? isAdminId(c.person.id) : c.machine === true || !needsSignIn(c.via))
+  const admin = (c: Caller) => (c.person ? isAdminId(c.person.id) : c.machine === true)
 
   /** Five wrong tries a minute for one username, and thirty for the whole app (a spray over many usernames). */
   function throttled(login: string): boolean {

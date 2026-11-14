@@ -119,6 +119,9 @@ const alivePid = (pid: number) => {
   }
 }
 
+/** The longest one lookup of the process behind the agent's port is waited for (PowerShell into WMI, like the process table). */
+export const FIND_TIMEOUT_MS = 20_000
+
 /**
  * Which process listens on 127.0.0.1:<port> and runs the agent: its PID and start (one PowerShell call), or
  * null. Asked once, when an agent is found already running (the old Start.cmd's, or one that outlived the
@@ -131,7 +134,7 @@ export function findListener(port: number, pattern: RegExp = /main\.ts/): Promis
     const script =
       `$c = Get-NetTCPConnection -State Listen -LocalAddress 127.0.0.1 -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
       `if ($c) { $p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $c.OwningProcess); if ($p) { '{0}|{1}|{2}' -f $p.ProcessId, $(if ($p.CreationDate) { ([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds() } else { 0 }), $p.CommandLine } }`
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20_000 }, (err, stdout) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: FIND_TIMEOUT_MS }, (err, stdout) => {
       if (err) return resolve(null)
       const m = /^(\d+)\|(\d+)\|(.*)$/m.exec(String(stdout).trim())
       if (!m || !/node/i.test(m[3]) || !pattern.test(m[3])) return resolve(null)

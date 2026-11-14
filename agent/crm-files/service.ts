@@ -265,6 +265,12 @@ export interface CrmFilesService {
   readonly keep: PinsHost | null
   /** ocbbf: the whole accessible tree for the copies: every folder (projects, groups, Uncategorised) and every file, with its version and size. */
   pinTree(): Promise<PinItem[]>
+  /**
+   * oe86a: the whole drive as this PC's synced folder lays it out (local-sync.ts): the top folders (the categories, "Marketing Projects", "projects", Uncategorised), every project, and every
+   * file with its version token, with the rights the drive gives each. A project's groups are asked of the CRM only when one of its files sits in a group, or `needGroups` names it (a folder made
+   * on the PC to match): not one request per project. No sizes are probed (a file's size, when the CRM has none, is learned by its download).
+   */
+  syncTree(needGroups?: ReadonlySet<string>): Promise<SyncNode[]>
   /** S7: the .driveignore rules (null when there is no spool). `defaults`: the built-in list of editor and system files (~$*, *.tmp, Thumbs.db, desktop.ini, .DS_Store, node_modules, *.crdownload) is on (the default). */
   ignore: { defaults(): boolean; setDefaults(on: boolean): void; rules: IgnoreRules } | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
@@ -276,6 +282,11 @@ export interface CrmFilesService {
   /** od0b1: for the uploads in parts (uploads.ts); not a route. */
   uploadBackend: CrmUploadBackend
 }
+
+/** oe86a: a node of the drive for the synced folder: as the drive shows it, and for a file the token that changes when the file changes in the CRM. */
+export type SyncNode = CrmNode & { version?: string }
+/** oe86a: how old a project's folder list may be for the synced folder's listing (the drive's own listings keep their 60 s). */
+const SYNC_GROUPS_MAX_AGE_MS = 5 * 60_000
 
 // ---- what the CRM sends -------------------------------------------------------------------------------------------------
 
@@ -742,6 +753,41 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       items.push({ id: fileId(f.id), kind: 'file', parentId: placeOf(f, gmap).parent, name: f.fileName, size, version: versionToken({ fileKey: f.fileKey, modifiedAt, size, versions: f.versions }) })
     }
     return items
+  }
+
+  /** oe86a: the drive laid out for the synced folder (see the interface). */
+  async function syncTree(needGroups: ReadonlySet<string> = new Set()): Promise<SyncNode[]> {
+    const s = await load()
+    const mayUp = [...s.projects.values()].some(p => p.writable) ? await mayUpload() : false
+    const out: SyncNode[] = []
+    const tags = new Set<string>(['projects'])
+    for (const f of s.files) if (!isMarketingTag(f.folder)) tags.add(f.folder)
+    for (const t of tags) out.push({ id: catId(t), kind: 'category', name: t, parentId: 'root', isFolder: true, rights: NO })
+    if (marketingOn()) out.push({ id: MARKETING_ID, kind: 'category', name: MARKETING_FOLDER, parentId: 'root', isFolder: true, rights: NO })
+    if (s.files.some(f => f.folder === 'projects' && !pidOf(f))) out.push({ id: UNCATEGORISED, kind: 'project', name: 'Uncategorised', parentId: catId('projects'), isFolder: true, rights: NO })
+    // A project's groups: only where a file sits in one, or the PC asks (a folder made there).
+    const want = new Set<string>()
+    for (const pid of needGroups) want.add(pid.startsWith('proj:') ? pid.slice(5) : pid)
+    for (const f of s.files) if (f.folder === 'projects' && f.groupId) want.add(pidOf(f))
+    const gmap = new Map<string, RawGroup[]>()
+    for (const p of s.projects.values()) {
+      out.push(projectNode(p, 0, mayUp))
+      if (!want.has(p.id)) continue
+      // The synced folder looks every minute: a project's folders as known in the last few minutes will do (a folder made here clears its project's at once).
+      const hit = groupCache.get(p.id)
+      const groups = hit && now() - hit.at < SYNC_GROUPS_MAX_AGE_MS ? hit.groups : await groupsOf(p.id)
+      gmap.set(p.id, groups)
+      // As the drive lists them: a group whose parent is not among the project's sits at the project's top.
+      for (const g of groups) out.push(groupNode(p, g, g.parentId && groups.some(x => x.id === g.parentId) ? grpId(p.id, g.parentId) : projId(p.id), 0, mayUp))
+    }
+    for (const f of s.files) {
+      const { parent, pid } = placeOf(f, gmap)
+      const p = pid ? s.projects.get(pid) : undefined
+      if (pid && !p) continue // a project this person may not open: not on the drive
+      const size = sizeOf(f)
+      out.push({ ...fileNode(f, parent, p?.writable ?? false, mayUp), version: versionToken({ fileKey: f.fileKey, modifiedAt: f.updatedAt ?? f.createdAt, size, versions: f.versions }) })
+    }
+    return out
   }
 
   async function childrenOf(id: string): Promise<{ node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }> {
@@ -1457,6 +1503,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       return o.pins?.() ?? null
     },
     pinTree,
+    syncTree,
     ignore: spool
       ? {
           rules,

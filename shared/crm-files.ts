@@ -164,6 +164,32 @@ export interface CrmVersion {
 
 export type CrmWinfsp = 'installed' | 'missing' | 'unsupported'
 
+/**
+ * oe86a: this PC's synced CRM folder (agent/crm-files/local-sync.ts): a plain folder on its own disk (Windows %USERPROFILE%\CRM Files, Linux ~/CRM-Drive), there whether the app runs or
+ * not, kept in step with the CRM both ways while it runs.
+ */
+export interface CrmSyncStatus {
+  on: boolean
+  /** The folder. */
+  root: string
+  state: 'off' | 'signed-out' | 'starting' | 'syncing' | 'idle' | 'blocked' | 'error'
+  /** In plain words, when it is not simply idle. */
+  reason: string | null
+  /** The last pass that ran to its end. */
+  lastPass: { at: string; ms: number; downloaded: number; uploaded: number; conflicts: number; removed: number; failed: number } | null
+  /** The files in step, and their bytes. */
+  files: number
+  bytes: number
+  /** On this PC only, and why (nothing is lost: it stays). The first 50. */
+  waiting: { rel: string; why: string }[]
+  /** In the CRM but over the size cap and not kept on this PC: not brought here. The first 50. */
+  big: { rel: string; size: number | null }[]
+  /** The last failures (each is tried again later). */
+  errors: { rel: string; error: string; at: string }[]
+  capMb: number
+  quotaGb: number
+}
+
 export interface CrmMountStatus {
   /** This PC can mount at all: Windows with the drive program built in, or Linux with GNOME gvfs. */
   supported: boolean

@@ -218,7 +218,8 @@ export function supervise(spec: Spec, d: Deps): Supervisor {
     if (running || !spec.adopt) return
     let id: Identity | null = typeof answer === 'object' ? answer : null
     if (!id?.pid && spec.find) id = (await spec.find().catch(() => null)) ?? id
-    if (!id?.pid) return
+    // Stopped or released while the lookup ran (seconds on Windows), or something else took hold meanwhile: no handle now.
+    if (!id?.pid || stopped || running) return
     const proc = spec.adopt(id)
     if (!proc) return
     running = proc
@@ -281,12 +282,18 @@ export function supervise(spec: Spec, d: Deps): Supervisor {
       if (nextTryAt !== null && d.now() < nextTryAt) return
       // Something answers that this didn't start: leave it be, and watch it.
       const answer = await spec.probe()
+      // stop() or release() came while the probe was out: this look starts nothing and takes over nothing. (It did start one
+      // more agent, which nobody watched and which outlived the guard: guard flake, 14 Nov.)
+      if (stopped) return
       if (answer) {
         if (!adopted) d.log(`${spec.name}: already answering${firstLook ? '' : ' (not started by this guard)'}; watching it`)
         adopted = true
         firstLook = false
-        await watch(answer)
+        // It answers, so it is up now; which process it is comes after. On Windows that is a PowerShell lookup (the guard's
+        // findListener): 2.5 s on an idle PC, 10 to 20 s and more while PowerShell is slow, and the guard said "down" of an
+        // agent that answered all that time (guard flake, 14 Nov).
         answered()
+        await watch(answer)
         return
       }
       firstLook = false

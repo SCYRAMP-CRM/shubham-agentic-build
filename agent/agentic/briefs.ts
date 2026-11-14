@@ -79,6 +79,15 @@ You are one of several ${engine} chats running side by side in Shubham Agentic, 
     out.push(kit.join('\n\n'))
   }
 
+  // oe86a: the CRM files as a plain folder on this PC, when this agent keeps one in step (crm-files/local-sync.ts sets CRM_DRIVE once the folder is ready).
+  const crmDrive = (process.env.CRM_DRIVE ?? '').trim()
+  if (crmDrive) {
+    out.push('## The CRM files on this PC')
+    out.push(
+      `The CRM's files are a plain folder on this PC's own disk: \`${crmDrive}\` (also in your environment as \`CRM_DRIVE\`). Read and write them there directly, at disk speed. The app keeps the folder in step with the CRM both ways while it runs: a file saved inside a project's folder (\`Marketing Projects\` or \`projects\`, then a project, or one of its folders) goes up to the CRM, for everyone, once it is saved and closed; nothing is ever deleted in the CRM from there. Keep scratch work outside this folder. Its rules are in "README - CRM Files.txt" at its top.`,
+    )
+  }
+
   if (memory.trim()) out.push(memory.trim())
 
   return out.join('\n\n')

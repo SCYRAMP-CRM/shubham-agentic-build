@@ -7,6 +7,7 @@ export const DELIVERY_BLOCK_REASONS = [
   'menu', 'draft', 'unresolved-send', 'composer-unavailable', 'screen-unavailable',
   'input-changed', 'empty-message', 'preflight-failed',
   'asking', // 12 Nov (Stage 1): the transcript says Claude has a question open: nothing typed, answer it and send again
+  'withdrawn', // oeee2 (14 Nov): typed, but the chat's box never showed it as sent; taken back out of the box (Backspace), box read empty: nothing submitted
 ] as const
 export type DeliveryBlockReason = typeof DELIVERY_BLOCK_REASONS[number]
 export function isDeliveryBlockReason(value: unknown): value is DeliveryBlockReason {
@@ -37,7 +38,8 @@ export const DELIVERY_CAUSES = [
   'exception',
 ] as const
 export type DeliveryCause = typeof DELIVERY_CAUSES[number]
-export const DELIVERY_MARKS = ['wait-ready', 'paste', 'pasted', 'settled', 'enter-1', 'enter-2', 'enter-3', 'readback-1', 'readback-2', 'readback-3', 'end'] as const
+// oeee2: 'withdraw' = taking an unsent message back out of the box began; 'withdrawn' = the box read empty after it.
+export const DELIVERY_MARKS = ['wait-ready', 'paste', 'pasted', 'settled', 'enter-1', 'enter-2', 'enter-3', 'readback-1', 'readback-2', 'readback-3', 'withdraw', 'withdrawn', 'end'] as const
 export type DeliveryMark = typeof DELIVERY_MARKS[number]
 /** `marks`: [step, milliseconds since the send began], in order, at most one per step per attempt. */
 export interface DeliveryDiagnostic { cause: DeliveryCause; marks: [DeliveryMark, number][] }
@@ -84,5 +86,6 @@ export function deliveryBlockWords(reason: DeliveryBlockReason, targetPcName?: s
     case 'peer-blocked': return 'The destination PC refused this send without reporting a specific reason. Update that PC or inspect its terminal. Nothing was submitted.'
     case 'preflight-failed': return 'The delivery preflight failed before typing. Refresh the destination and review your kept draft.'
     case 'asking': return 'Claude is asking a question in the terminal. Answer it there, then send again. Nothing was typed.'
+    case 'withdrawn': return 'The chat did not take the message as it was typed (some of its characters may not have arrived), so it was taken back out of its input box. Nothing was submitted; it is safe to send it again. If this repeats, send it without special symbols.'
   }
 }

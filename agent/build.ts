@@ -281,17 +281,33 @@ export function createBuild(o: BuildOptions): Build {
       update.error = `Couldn't reach the build repo: ${fetched.stderr.trim().split('\n').at(-1) || `git fetch exited ${fetched.code}`}`
       return info()
     }
-    const [head, remote] = await Promise.all([git(['rev-parse', 'HEAD'], o.root), git(['rev-parse', 'origin/main'], o.root)])
+    const [head, remote, shown] = await Promise.all([git(['rev-parse', 'HEAD'], o.root), git(['rev-parse', 'origin/main'], o.root), git(['show', 'origin/main:RELEASE.json'], o.root)])
+    const headCommit = head.code === 0 ? head.stdout.trim() : ''
+    const remoteCommit = remote.code === 0 ? remote.stdout.trim() : ''
+    if (!headCommit || !remoteCommit) {
+      // Order oeb87: never "up to date" on a guess (two failed reads used to compare equal).
+      update.state = 'failed'
+      update.error = `Couldn't read this build's git folder: ${(head.code !== 0 ? head : remote).stderr.trim().split('\n').at(-1) || 'git rev-parse gave nothing'}`
+      return info()
+    }
     update.error = null
-    if (head.stdout.trim() === remote.stdout.trim()) {
+    const newest = shown.code === 0 ? parseVersion(shown.stdout) : null
+    // Order oeb87: the folder can already hold the newest build while this app still runs an older one: on Ravi_Scyramp it was pulled
+    // by hand (17:29, 14 Nov) and never restarted, so this said "up to date" for a PC on 2127 with 1707 published. That is an update
+    // too: Update restarts the app (Update.cmd's pull is then a no-op) and it runs the build its folder holds.
+    const behind = newest !== null && current !== null && newest.version !== current.version
+    if (headCommit === remoteCommit && !behind) {
       update.state = 'up-to-date'
       update.available = null
       return info()
     }
-    const shown = await git(['show', 'origin/main:RELEASE.json'], o.root)
-    update.available = shown.code === 0 ? parseVersion(shown.stdout) : null
+    update.available = newest
     update.state = 'available'
-    log?.info(`a newer build is published: ${update.available?.version ?? remote.stdout.trim().slice(0, 7)}`)
+    log?.info(
+      headCommit === remoteCommit
+        ? `the newest build, ${newest?.version}, is already in this folder but this app still runs ${current?.version}: Update restarts it onto it`
+        : `a newer build is published: ${newest?.version ?? remoteCommit.slice(0, 7)}`,
+    )
     return info()
   }
 

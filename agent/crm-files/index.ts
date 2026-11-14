@@ -10,6 +10,7 @@ import { CRM_FILES_MAX_UPLOAD } from '../../shared/crm-files.ts'
 import { UPLOAD_SETTINGS_FILE } from './upload-settings.ts'
 import { createCrmUploads, type CrmUploads } from './uploads.ts'
 import { createPinsHost, type PinsHost } from './pins-host.ts'
+import { createLocalSync, type LocalSync } from './local-sync.ts'
 
 // F-126: the CRM files module of the agent: the tree and its changes (service.ts), the page's routes (routes.ts), and the mount of this PC. On Windows the mount is crm-fs.exe through
 // WinFsp (mount-win.ts); on Linux the Linux agent brings its own driver (a loopback WebDAV that GNOME's gvfs mounts) and passes it in as `mountDriver`; anywhere else it says it is not
@@ -19,6 +20,8 @@ export interface CrmFilesModule {
   service: CrmFilesService
   /** od0b1: uploads of any size in parts, held by the agent (their pending folder is <dir>/crm-uploads). */
   uploads: CrmUploads
+  /** oe86a: this PC's synced CRM folder (local-sync.ts). */
+  sync: LocalSync
   mount: ApiMount
   /** At the agent's start: brings the Windows drive back if it was on. */
   resume(): Promise<void>
@@ -101,10 +104,13 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
   // oa2f8: the waiting folder is a setting (crm-uploads.json beside the default one); it may not be inside the app's own folder (an update replaces it).
   const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), settingsFile: path.join(o.dir, UPLOAD_SETTINGS_FILE), notInside: [o.root], backend: service.uploadBackend, log: o.log })
   uploadsRef = uploads
+  // oe86a: the CRM files as a plain folder on this PC (%USERPROFILE%\CRM Files, ~/CRM-Drive), kept in step both ways while the agent runs; beside the mounted drive, not instead of it.
+  const sync = createLocalSync({ dir: o.dir, service: () => serviceRef, signedIn: () => client.session().signedIn, keep: () => pinsRef, openFolder: openFolderHere, log: o.log })
   return {
     service,
     uploads,
-    mount: crmFilesMount(service, uploads),
+    sync,
+    mount: crmFilesMount(service, uploads, sync),
     resume: async () => {
       // The uploads that were going on when the agent stopped carry on, side by side with the drive coming back (neither waits for, or stops, the other).
       // They start in a test run too (their folder is the test's own); only the drive keeps S9a's rule of never mounting by itself there.
@@ -113,6 +119,8 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
       void pins.start().catch(e => o.log?.warn(`pins: the copies kept on this PC could not be read (${e instanceof Error ? e.message : String(e)})`))
       try {
         if (o.autoStart === false || (o.autoStart === undefined && process.env.NODE_TEST_CONTEXT)) return
+        // oe86a: the synced folder comes up by itself (never in a test run: it is this PC's real home folder), side by side with the drive.
+        void sync.start().catch(e => o.log?.warn(`crm sync: could not start (${e instanceof Error ? e.message : String(e)})`))
         await (win ?? o.mountDriver)?.resume?.()
       } finally {
         await going
@@ -123,6 +131,7 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
       // below can wait for a part or a send still in flight, and the agent may exit before they are done, and a marker left behind is read at the next start as a crash that switches the drive off.
       const driveClosing = (async () => (win ?? o.mountDriver)?.close?.())()
       driveClosing.catch(() => undefined)
+      await sync.close().catch(() => undefined)
       await uploads.close().catch(() => undefined)
       await pins.close().catch(() => undefined)
       await service.spool?.close().catch(() => undefined)

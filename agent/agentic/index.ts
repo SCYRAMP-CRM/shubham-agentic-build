@@ -155,8 +155,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
 import { AGENT_API_PREFIX } from '../../shared/agent-api.ts'
 import type { ChatOwner, ChatShare } from '../../shared/auth.ts'
+import type { FeatureAccess } from '../auth/feature-access.ts'
 import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
+import { GOALS_CRM_PATH, routeRule } from '../../shared/access.ts'
 import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
@@ -361,6 +363,11 @@ export interface ProofRequest {
 }
 
 export interface AgenticOptions {
+  /**
+   * Order o9465: Settings › Access. This mount tells it who has agents or floors of their own or shared with them, opens a feature's own owner-rule
+   * routes (Tasks) to the people it is open to, and runs Goals and the CRM page on a person's own CRM sign-in.
+   */
+  featureAccess?: FeatureAccess
   /** Canonical self + registered devices, including offline devices. Never starts chats. */
   pcControlDevices?: () => Array<{ id: string; name: string; online: boolean }>
   /** <state>/agent/agentic */
@@ -723,13 +730,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-118: every events socket with its caller: what it is sent is what that person may see.
   const events = new Map<WsSocket, Caller>()
   const access = createAccess(o.auth)
+  // Order o9465 (order o929e: an existing share is his explicit choice): a person with an agent or a floor of their own or shared with them keeps
+  // the Agents routes whatever Settings › Access says; this mount still shows them only those.
+  o.featureAccess?.useShares(c => !!c.person && !access.isAdmin(c) && allFloors().some(f => access.floorSeen(c, f)))
   // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
   const ui = createUiBridge()
   /** Order o355e (+ oe3b1): whose page or call it is, for the screen bridge: the signed-in person (or nobody), and an administrator or not. */
   const uiWho = (c: Caller): UiWho => ({ person: c.person?.id ? c.person.id.toLowerCase() : null, admin: access.isAdmin(c) })
   /** One event as this caller may see it, as text; null when it is not theirs at all. */
   function eventFor(e: AgenticEvent, c: Caller): string | null {
-    if (e.t === 'tasks') return access.isAdmin(c) ? JSON.stringify(e) : null
+    // Order o9465: the task list's changes also go to someone it is open to (Settings › Access).
+    if (e.t === 'tasks') return access.isAdmin(c) || (!!c.person && !!o.featureAccess?.allows(c, 'tasks')) ? JSON.stringify(e) : null
     if (e.t === 'auth') return JSON.stringify(e)
     if (e.t === 'memory') {
       const f = allFloors().find(x => x.id === e.floorId)
@@ -6874,8 +6885,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function checkRule(rule: Rule | undefined, params: string[], r: MountRequest) {
     const c = callerOf(r)
     const where = `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`
+    // Order o9465: Settings › Access, for every route of this mount, also when a member PC passes its page's person on (that request never went
+    // through this PC's own gate): the same check as api.ts gate(), so a person reaches only what is open to them (or shared with them) here.
+    if (o.featureAccess && c.person && !access.isAdmin(c) && !o.featureAccess.opensRoute(c, r.method, `${AGENTIC_PREFIX}${r.rest}`)) {
+      o.auth?.deny(c, 403, 'not-allowed', where)
+      throw authError(403, 'This is not open to you. The owner of this app opens pages and features in Settings › Access.', 'not-allowed')
+    }
     if (rule === undefined || rule.kind === 'owner') {
       if (access.isAdmin(c)) return
+      // Order o9465: a feature's own routes (shared/access.ts ROUTES, e.g. Tasks) open to someone Settings › Access opened that feature to. Only
+      // the routes listed for it: never another owner route, and never through a share.
+      const opened = routeRule(r.method, `${AGENTIC_PREFIX}${r.rest}`)
+      if (c.person && opened && opened.features.some(f => o.featureAccess?.allows(c, f) === true)) return
       o.auth?.deny(c, 403, 'admin-only', where)
       throw authError(403, 'This is for the owner of this app.', 'admin-only')
     }
@@ -7583,9 +7604,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (rest.startsWith('/crm-proxy/')) {
         return (req, res, caller) => {
+          const c = caller ?? OPEN
+          const sub = rest.slice('/crm-proxy/'.length)
           // The built-in CRM runs on this PC's own CRM session: the owner's.
-          if (!access.isAdmin(caller ?? OPEN)) throw authError(403, 'The CRM page is for the owner of this app.', 'admin-only')
-          return crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search)
+          if (access.isAdmin(c)) return crmProxy.handle(req, res, sub, url.search)
+          // Order o9465: Goals (its own CRM paths only) or the CRM page, opened to this person in Settings › Access: on THEIR OWN CRM sign-in
+          // (their sign-in to this app), never this PC's; the CRM decides what they may see and do.
+          const fa = o.featureAccess
+          const open = !!c.person && !!fa && (fa.allows(c, 'crm') || (fa.allows(c, 'goals') && GOALS_CRM_PATH.test(sub)))
+          if (!open) throw authError(403, 'The CRM page is for the owner of this app.', 'admin-only')
+          const session = o.auth?.viewerCrm(req.headers)
+          if (!session || session.user.id.toLowerCase() !== c.person!.id.toLowerCase()) throw authError(401, 'Your CRM sign-in here has ended: sign in again.', 'sign-in')
+          return crmProxy.handleAs({ url: session.url, cookie: session.cookie }, req, res, sub, url.search)
         }
       }
       // F-069: a file sent to a chat (the body is the file), and one already sent, for its thumbnail.

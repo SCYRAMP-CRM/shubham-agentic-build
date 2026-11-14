@@ -1,4 +1,5 @@
 import { composer, menuOnScreen, ownedComposerTail } from './screen.ts'
+import { asciiStandIns, splitForConsole, win32Keys, type ConsoleInput } from './console-keys.ts'
 import type { DeliveryBlockReason, DeliveryCause, DeliveryMark } from '../../shared/delivery-reason.ts'
 
 const PASTE_START = '\u001b[200~'
@@ -41,8 +42,25 @@ export interface SendOptions {
    * hold exactly them, and only the settle, Enter and read-back steps run. A box holding anything else is refused as a draft.
    */
   preTyped?: boolean
+  /**
+   * oeee2: how the text goes into a Windows console (console-keys.ts). 'win32-input': each character past plain ASCII as a key press of its
+   * own, between pastes (it arrives exactly); 'ascii': the common symbols as plain-text stand-ins (the box then holds the stand-ins). Absent:
+   * as it is (Linux, macOS, and every adapter that is not a native Codex console).
+   */
+  console?: ConsoleInput
+  /**
+   * oeee2: a message that did not go in is taken back out of the box (Backspace only) when nothing but this send typed into the chat since
+   * its paste and no question is on the screen; a box that then reads empty ends the send 'blocked' with 'withdrawn' (nothing submitted,
+   * safe to send again). Off: such a send ends 'unconfirmed' with the text left in the box, as before.
+   */
+  withdraw?: boolean
 }
 const normalized = (s: string) => s.replace(/\s+/g, '')
+/** oeee2: Backspace as a terminal sends it; never Esc (it interrupts a working Codex) and never Ctrl+C. */
+const BACKSPACE = '\x7f'
+/** oeee2: how long taking a message back out may take, past the send's own budget; and the Backspaces per round. */
+const WITHDRAW_MS = 20_000
+const WITHDRAW_ROUND = 128
 
 /** Working output alone never proves acceptance. Only submit the owned composer. */
 export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {}): Promise<SendResult> {
@@ -73,7 +91,8 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   if (io.interrupted?.()) return blocked('input-changed')
   const initial = input(before)
   if (!initial) return blocked('composer-unavailable')
-  const pasted = text.split(PASTE_END).join('')
+  // oeee2: on a Windows console that cannot take them as key presses the common symbols go in as plain-text stand-ins; the box then holds those.
+  const pasted = o.console === 'ascii' && !o.preTyped ? asciiStandIns(text.split(PASTE_END).join('')) : text.split(PASTE_END).join('')
   if (o.preTyped) {
     if (!pasted.trim()) return blocked('empty-message')
     if (!initial.text || initial.collapsed || normalized(initial.text) !== normalized(pasted)) return blocked('draft')
@@ -97,6 +116,24 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   }
   mark('paste')
   if (!io.write(PASTE_START)) return finish('gone', 'write-refused')
+  // oeee2: in win32 input mode a run of characters past plain ASCII goes in as key presses of their own, outside the paste brackets (a
+  // console that keeps a paste literal would otherwise type the key sequences as text); the paste opens again for the plain text after it.
+  let open = true
+  const type = (chunk: string): boolean => {
+    if (o.console !== 'win32-input') return io.write(chunk)
+    for (const part of splitForConsole(chunk)) {
+      if (part.plain) {
+        if (!open && !io.write(PASTE_START)) return false
+        open = true
+        if (!io.write(part.text)) return false
+      } else {
+        if (open && !io.write(PASTE_END)) return false
+        open = false
+        if (!io.write(win32Keys(part.text))) return false
+      }
+    }
+    return true
+  }
   for (let offset = 0; offset < pasted.length;) {
     // Before the first chunk only the paste brackets were written: nothing of the message is in the terminal, so a stop here is a safe refusal.
     const stop = (reason: DeliveryBlockReason, cause: DeliveryCause): SendResult => { io.write(PASTE_END); return offset === 0 ? blockedWith(reason, cause) : finish('unconfirmed', cause) }
@@ -108,11 +145,11 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.beforeInput) { const current = read(); if (!current || menu(current)) return stop(!current ? 'screen-unavailable' : 'menu', !current ? 'screen-unreadable' : 'menu-appeared') }
     let end = Math.min(offset + 1024, pasted.length)
     if (end < pasted.length && /[\uD800-\uDBFF]/.test(pasted[end - 1])) end--
-    if (!io.write(pasted.slice(offset, end))) return finish('gone', 'write-refused')
+    if (!type(pasted.slice(offset, end))) return finish('gone', 'write-refused')
     offset = end
     if (offset < pasted.length) await sleep(10)
   }
-  if (!io.write(PASTE_END)) return finish('gone', 'write-refused')
+  if (open && !io.write(PASTE_END)) return finish('gone', 'write-refused')
   mark('pasted')
   return submitOwned()
 
@@ -129,36 +166,48 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   let ownedText: string | undefined
   let settled = false
   let attemptedEnter = false
+  // oeee2: the box's text when it is NOT the message, and how many looks in a row it stayed so.
+  let other: string | undefined
+  let otherLooks = 0
   for (let poll = 0; poll <= Math.ceil(maxSettleMs / settleMs); poll++) {
     await sleep(settleMs)
     if (io.confirmed?.()) return finish('sent', 'confirmed')
     if (interrupted()) return finish('unconfirmed', why())
-    if (expired()) return finish('unconfirmed', 'deadline')
+    if (expired()) return withdraw('deadline')
     const lines = read()
     if (!lines) return io.gone?.() ? finish('gone', 'terminal-gone') : finish('unconfirmed', 'screen-unreadable')
     if (menu(lines)) return finish('unconfirmed', 'menu-appeared')
     const c = currentOwned(lines)
     if (c && previous === c.text) { settled = true; ownedText = c.text; mark('settled'); break }
     previous = c?.text
+    // oeee2: a box that holds something other than a piece of the message (characters lost or changed on the way in: 14 Nov, the console
+    // had dropped the message's arrows) and stays the same for three looks in a row will not become it. It is taken back out now, while
+    // the caller still waits for the outcome, not after the whole budget (96 s: the tool had long said "still in progress" and the text sat
+    // in the box). A box that holds a piece of it (the start of a long paste still coming in, a clipped view) is waited for as before.
+    const box = c ? undefined : input(lines)?.text
+    if (box && box === other) otherLooks++
+    else { other = box; otherLooks = box ? 1 : 0 }
+    if (o.withdraw && otherLooks >= 3 && other !== undefined && !expected.includes(normalized(other))) return withdraw('not-settled')
   }
-  if (!settled) return finish('unconfirmed', 'not-settled')
+  if (!settled) return withdraw('not-settled')
   for (let attempt = 0; attempt < tries; attempt++) {
     if (io.confirmed?.()) return finish('sent', 'confirmed')
     if (interrupted()) return finish('unconfirmed', why())
-    if (expired()) return finish('unconfirmed', 'deadline')
+    if (expired()) return attemptedEnter ? finish('unconfirmed', 'deadline') : withdraw('deadline')
     const lines = read()
     if (!lines) return attemptedEnter ? finish('unconfirmed', 'screen-unreadable') : io.gone?.() ? finish('gone', 'terminal-gone') : finish('unconfirmed', 'screen-unreadable')
     if (menu(lines)) return finish('unconfirmed', 'menu-appeared')
     const c = currentOwned(lines)
-    if (!c || c.text !== ownedText) return finish('unconfirmed', 'composer-changed')
+    // After an Enter a box that changed may be the message going in late: never taken out then.
+    if (!c || c.text !== ownedText) return attemptedEnter ? finish('unconfirmed', 'composer-changed') : withdraw('composer-changed')
     if (io.beforeInput && !(await io.beforeInput('submit').catch(() => false))) return finish('unconfirmed', 'authorization-denied')
     // Network authorization may have yielded while a person typed or a prompt changed.
     if (interrupted()) return finish('unconfirmed', why())
-    if (expired()) return finish('unconfirmed', 'deadline')
+    if (expired()) return attemptedEnter ? finish('unconfirmed', 'deadline') : withdraw('deadline')
     const fresh = read()
     if (!fresh) return finish('unconfirmed', 'screen-unreadable')
     if (menu(fresh)) return finish('unconfirmed', 'menu-appeared')
-    if (currentOwned(fresh)?.text !== ownedText) return finish('unconfirmed', 'composer-changed')
+    if (currentOwned(fresh)?.text !== ownedText) return attemptedEnter ? finish('unconfirmed', 'composer-changed') : withdraw('composer-changed')
     attemptedEnter = true
     mark(`enter-${attempt + 1}` as DeliveryMark)
     if (!io.write('\r')) return finish('unconfirmed', 'write-refused')
@@ -190,6 +239,50 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     // An absent/clipped/unreadable box never authorizes another Enter.
     if (!unchangedOwned) return finish('unconfirmed', 'box-unreadable-after-enter')
   }
-  return finish('unconfirmed', 'enter-attempts-exhausted')
+  // Three Enters and the box still holds exactly the message (read back after each): it did not go in. Taken out only while it still does.
+  return withdraw('enter-attempts-exhausted', ownedText)
+
+  /**
+   * oeee2 (14 Nov 2026, Shubham: "This happened before also."): a message that did not go in never stays in the box blocking the chat. It is
+   * taken back out when nothing but this send typed into the chat since its paste (no terminal input: interrupted() is false, the chat's
+   * input epoch never moved) and no question is on the screen: Backspace only (never Esc, never Ctrl+C), at most as many as were typed (plus
+   * a few), in rounds, each followed by a look at the box. A box that reads empty ends the send 'blocked' with 'withdrawn': nothing was
+   * submitted, safe to send again (the page keeps his draft; a tool caller gets the words). Anything else (someone typed, a menu, the box
+   * unreadable, `holds` no longer in it, a box that does not empty within WITHDRAW_MS) ends it 'unconfirmed' as before, with what is left.
+   * Never for words typed by someone else (preTyped), and never after a changed box following an Enter (the message may be going in).
+   */
+  async function withdraw(cause: DeliveryCause, holds?: string): Promise<SendResult> {
+    if (!o.withdraw || o.preTyped) return finish('unconfirmed', cause)
+    mark('withdraw')
+    const until = Date.now() + WITHDRAW_MS
+    let left = [...pasted].length + 4
+    for (let round = 0; round < 200; round++) {
+      if (io.confirmed?.()) return finish('sent', 'confirmed')
+      if (interrupted()) return finish('unconfirmed', why())
+      if (io.gone?.()) return finish('unconfirmed', 'terminal-gone')
+      const lines = read()
+      if (!lines) return finish('unconfirmed', cause)
+      if (menu(lines)) return finish('unconfirmed', 'menu-appeared')
+      const box = input(lines)
+      if (!box) return finish('unconfirmed', cause)
+      if (round === 0 && holds !== undefined && currentOwned(lines)?.text !== holds) return finish('unconfirmed', cause)
+      if (!box.text) {
+        // Empty before a single Backspace: the message is not in the box, and where it went is not known. Nothing to take out.
+        if (round === 0) return finish('unconfirmed', cause)
+        mark('withdrawn')
+        io.onBlocked?.('withdrawn')
+        return finish('blocked', cause)
+      }
+      if (Date.now() >= until) break
+      if (left > 0) {
+        const n = Math.min(left, WITHDRAW_ROUND)
+        if (!io.write(BACKSPACE.repeat(n))) return finish('unconfirmed', cause)
+        left -= n
+      }
+      // Its own short waits (never longer than a look after Enter): the send's budget may be spent already (a 'deadline' is taken out after it).
+      await io.sleep(Math.min(left > 0 ? 150 : 300, checkMs))
+    }
+    return finish('unconfirmed', cause)
+  }
   }
 }

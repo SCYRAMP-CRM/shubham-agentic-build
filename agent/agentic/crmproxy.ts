@@ -72,6 +72,11 @@ export interface CrmProxy {
   /** Forwards one request of the page to the CRM, with the session; `sub` is the path after /crm-proxy/. */
   handle(req: IncomingMessage, res: ServerResponse, sub: string, search: string): Promise<void>
   /**
+   * Order o9465: the same, on a signed-in person's OWN CRM session (their sign-in to this app, auth.viewerCrm), never this PC's: Goals and the CRM
+   * page for someone Settings › Access opened them to. The CRM itself decides what that person may see and do.
+   */
+  handleAs(login: { url: string; cookie: string }, req: IncomingMessage, res: ServerResponse, sub: string, search: string): Promise<void>
+  /**
    * F-126: one call from this agent itself (the CRM files), with the session and, for a change, the CSRF pair (mended once, as in `handle`). `sub` is the path on the CRM, e.g. "org/files?all=true".
    * Throws a CrmNotSignedIn when nobody is signed in. The answer is the CRM's, untouched; the caller reads it.
    */
@@ -102,21 +107,88 @@ async function bodyOf(req: IncomingMessage): Promise<Buffer | undefined> {
 export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
   const fetchFn = o.fetch ?? fetch
   const now = o.now ?? Date.now
-  /** The CSRF token the CRM gave this session (its double-submit pair, middleware/csrf.js): kept in memory only. */
-  let csrf: { cookie: string; token: string } | null = null
+  /**
+   * The CSRF token the CRM gave each session (its double-submit pair, middleware/csrf.js), by the session's cookie: kept in memory only. This PC's
+   * session and (order o9465) the people's own sessions each keep theirs; the oldest goes when there are too many.
+   */
+  const csrf = new Map<string, string>()
 
-  async function csrfFor(login: Login, force = false): Promise<string | null> {
-    if (!force && csrf && csrf.cookie === login.cookie) return csrf.token
+  async function csrfFor(login: { url: string; cookie: string }, force = false): Promise<string | null> {
+    const kept = csrf.get(login.cookie)
+    if (!force && kept) return kept
     try {
       const r = await fetchFn(`${login.url}/v1/auth/csrf-token`, { headers: { cookie: login.cookie, accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })
       const body: unknown = await r.json().catch(() => null)
       const token = isObject(body) ? text(body.csrfToken) : null
       if (r.status !== 200 || !token || !/^[A-Za-z0-9_-]{16,256}$/.test(token)) return null
-      csrf = { cookie: login.cookie, token }
+      csrf.delete(login.cookie)
+      csrf.set(login.cookie, token)
+      while (csrf.size > 64) csrf.delete(csrf.keys().next().value as string)
       return token
     } catch {
       return null
     }
+  }
+
+  /** One request of the page, forwarded to the CRM with this session (this PC's, or a person's own). */
+  async function forward(login: { url: string; cookie: string }, req: IncomingMessage, res: ServerResponse, sub: string, search: string): Promise<void> {
+    const method = (req.method ?? 'GET').toUpperCase()
+    if (method === 'OPTIONS') {
+      res.writeHead(204, { 'Cache-Control': 'no-store' })
+      return void res.end()
+    }
+    if (!['GET', 'HEAD', ...MUTATES].includes(method)) throw apiError(405, `The CRM proxy doesn't forward ${method}`)
+
+    // Only a path on the CRM: never another host, whatever the page asks for.
+    const base = new URL(login.url)
+    const target = new URL(`/${sub.replace(/^\/+/, '')}${search}`, base)
+    if (target.origin !== base.origin) throw apiError(400, 'That is not a path on the CRM')
+
+    const body = MUTATES.has(method) ? await bodyOf(req) : undefined
+    const headers: Record<string, string> = {}
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (v === undefined || NOT_FORWARDED.has(k.toLowerCase()) || k.toLowerCase().startsWith('sec-')) continue
+      headers[k] = Array.isArray(v) ? v.join(', ') : v
+    }
+
+    const send = async (force: boolean) => {
+      const h: Record<string, string> = { ...headers, cookie: login.cookie }
+      if (MUTATES.has(method)) {
+        const token = await csrfFor(login, force)
+        if (token) {
+          h.cookie = `${login.cookie}; crm_csrf=${token}`
+          h['x-csrf-token'] = token
+        }
+      }
+      return fetchFn(target, { method, headers: h, body, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS) })
+    }
+
+    let upstream: Response
+    try {
+      upstream = await send(false)
+      // A rejected CSRF pair is mended once: ask for a new token and send it again.
+      if (MUTATES.has(method) && upstream.status === 403) {
+        const peek = await upstream.clone().text().catch(() => '')
+        if (/csrf/i.test(peek)) upstream = await send(true)
+      }
+    } catch (e) {
+      const code = (e as { cause?: { code?: string } }).cause?.code ?? (e as { name?: string }).name ?? 'error'
+      throw apiError(502, `Couldn't reach the CRM at ${base.host}: ${code}`)
+    }
+
+    const out: Record<string, string> = { 'Cache-Control': 'no-store' }
+    upstream.headers.forEach((v, k) => {
+      const key = k.toLowerCase()
+      if (NOT_RETURNED.has(key) || key.startsWith('access-control-') || key === 'cache-control') return
+      out[k] = v
+    })
+    res.writeHead(upstream.status, out)
+    if (!upstream.body || method === 'HEAD') return void res.end()
+    Readable.fromWeb(upstream.body as never).pipe(res)
+    await new Promise<void>(resolve => {
+      res.once('close', resolve)
+      res.once('finish', resolve)
+    })
   }
 
   return {
@@ -157,63 +229,12 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
     async handle(req, res, sub, search) {
       const login = readLogin(o.file, now())
       if (!login) throw apiError(401, 'The CRM is not signed in on this PC: sign in from the CRM page, or Devices')
-      const method = (req.method ?? 'GET').toUpperCase()
-      if (method === 'OPTIONS') {
-        res.writeHead(204, { 'Cache-Control': 'no-store' })
-        return void res.end()
-      }
-      if (!['GET', 'HEAD', ...MUTATES].includes(method)) throw apiError(405, `The CRM proxy doesn't forward ${method}`)
+      return forward(login, req, res, sub, search)
+    },
 
-      // Only a path on the CRM: never another host, whatever the page asks for.
-      const base = new URL(login.url)
-      const target = new URL(`/${sub.replace(/^\/+/, '')}${search}`, base)
-      if (target.origin !== base.origin) throw apiError(400, 'That is not a path on the CRM')
-
-      const body = MUTATES.has(method) ? await bodyOf(req) : undefined
-      const headers: Record<string, string> = {}
-      for (const [k, v] of Object.entries(req.headers)) {
-        if (v === undefined || NOT_FORWARDED.has(k.toLowerCase()) || k.toLowerCase().startsWith('sec-')) continue
-        headers[k] = Array.isArray(v) ? v.join(', ') : v
-      }
-
-      const send = async (force: boolean) => {
-        const h: Record<string, string> = { ...headers, cookie: login.cookie }
-        if (MUTATES.has(method)) {
-          const token = await csrfFor(login, force)
-          if (token) {
-            h.cookie = `${login.cookie}; crm_csrf=${token}`
-            h['x-csrf-token'] = token
-          }
-        }
-        return fetchFn(target, { method, headers: h, body, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS) })
-      }
-
-      let upstream: Response
-      try {
-        upstream = await send(false)
-        // A rejected CSRF pair is mended once: ask for a new token and send it again.
-        if (MUTATES.has(method) && upstream.status === 403) {
-          const peek = await upstream.clone().text().catch(() => '')
-          if (/csrf/i.test(peek)) upstream = await send(true)
-        }
-      } catch (e) {
-        const code = (e as { cause?: { code?: string } }).cause?.code ?? (e as { name?: string }).name ?? 'error'
-        throw apiError(502, `Couldn't reach the CRM at ${base.host}: ${code}`)
-      }
-
-      const out: Record<string, string> = { 'Cache-Control': 'no-store' }
-      upstream.headers.forEach((v, k) => {
-        const key = k.toLowerCase()
-        if (NOT_RETURNED.has(key) || key.startsWith('access-control-') || key === 'cache-control') return
-        out[k] = v
-      })
-      res.writeHead(upstream.status, out)
-      if (!upstream.body || method === 'HEAD') return void res.end()
-      Readable.fromWeb(upstream.body as never).pipe(res)
-      await new Promise<void>(resolve => {
-        res.once('close', resolve)
-        res.once('finish', resolve)
-      })
+    async handleAs(login, req, res, sub, search) {
+      if (!/^https?:\/\//.test(login.url) || !login.cookie) throw apiError(401, 'Your CRM sign-in here has ended: sign in again.')
+      return forward({ url: trimUrl(login.url), cookie: login.cookie }, req, res, sub, search)
     },
   }
 }

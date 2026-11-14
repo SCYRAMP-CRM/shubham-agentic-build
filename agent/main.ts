@@ -33,6 +33,7 @@ import { createCoordinator, type Coordinator } from './update/coordinator.ts'
 import { createUpdateState } from './update/state.ts'
 import { createBridge } from './claude/bridge.ts'
 import { createAuth } from './auth/index.ts'
+import { createFeatureAccess } from './auth/feature-access.ts'
 import { CRM_URL, CrmError, trimUrl } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
@@ -294,6 +295,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
   // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
   const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), crmUrl: trimUrl(process.env.SAD_CRM_URL || CRM_URL), log: log.child('auth') })
+  // Order o9465: Settings › Access (what is open to whom), beside auth.json; the agentic mount says who has shares once it is up.
+  const featureAccess = createFeatureAccess({ dir: paths.agent, isAdmin: c => auth.isAdmin(c), directory: () => auth.directory(), log: log.child('access') })
   // F-008: other PCs' passwords remembered for Control (only as H1, never handed out).
   const saved = createSavedPasswords(paths.savedPasswords, log.child('saved'))
   // F-018: the Agentic Workflow section (floors, agents and their Claude chats), at /agentic.
@@ -338,6 +341,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).
     credential: () => claude.credentialEnv(),
     auth,
+    featureAccess,
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
     claude: process.env.SAD_TEST_CLAUDE || undefined,
     projectsDir: testClaudeHome ? path.join(testClaudeHome, 'projects') : undefined,
@@ -1191,7 +1195,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: process.env.WA_BACKEND_DIR ?? path.join(paths.root, 'whatsapp-backend') }), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()

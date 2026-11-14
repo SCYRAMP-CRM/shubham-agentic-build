@@ -1,3 +1,5 @@
+import type { AuthStatus } from '../../shared/auth.ts'
+import type { FeatureAccess } from './feature-access.ts'
 import type { Auth } from './index.ts'
 import { authError, type Caller } from './types.ts'
 
@@ -14,6 +16,8 @@ export interface AuthRouteRequest {
   caller: Caller
   /** The page came over https: the cookie then carries Secure. */
   secure: boolean
+  /** Order o9465: Settings › Access (what is open to whom); left out (tests, an older wiring), every status says nothing of it. */
+  access?: FeatureAccess
 }
 
 export interface AuthAnswer {
@@ -25,15 +29,20 @@ export interface AuthAnswer {
 /** The answer, or null when this is not an auth route. */
 export async function authRoute(auth: Auth, r: AuthRouteRequest): Promise<AuthAnswer | null> {
   const { method, rest, caller } = r
-  if (method === 'GET' && rest === '/status') return { status: 200, data: auth.status(caller) }
+  // Order o9465: every status carries the features this person's page shows (null: every one, the owner's).
+  const withFeatures = (s: AuthStatus): AuthStatus => (r.access ? { ...s, features: r.access.features({ ...caller, person: s.person }) } : s)
+  if (method === 'GET' && rest === '/status') return { status: 200, data: withFeatures(auth.status(caller)) }
   if (method === 'POST' && rest === '/sign-in') {
     const done = await auth.signIn(caller, r.body, r.secure)
-    return { status: 200, data: done.status, setCookie: done.cookie }
+    return { status: 200, data: withFeatures(done.status), setCookie: done.cookie }
   }
   if (method === 'POST' && rest === '/sign-out') {
     const out = auth.signOut(caller)
-    return { status: 200, data: out.status, setCookie: out.cookie }
+    return { status: 200, data: withFeatures(out.status), setCookie: out.cookie }
   }
+  // Order o9465: Settings › Access, the owner's only (the module refuses everyone else).
+  if (r.access && method === 'GET' && rest === '/access') return { status: 200, data: r.access.view(caller) }
+  if (r.access && method === 'PUT' && rest === '/access') return { status: 200, data: r.access.set(caller, r.body) }
   if (method === 'GET' && rest === '/me') {
     if (!caller.person) throw authError(401, 'Not signed in.', 'sign-in')
     return { status: 200, data: caller.person }

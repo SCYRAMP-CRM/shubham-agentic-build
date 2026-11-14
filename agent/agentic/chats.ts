@@ -8,6 +8,8 @@ import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/
 import type { DeliveryBlockReason, DeliveryCause, DeliveryMark } from '../../shared/delivery-reason.ts'
 import * as cxs from '../codex/screen.ts'
 import { sendToCodex, type DeliveryReport, type SendOptions, type SendResult } from '../codex/sender.ts'
+import { WIN32_INPUT_REQUEST, type ConsoleInput } from '../codex/console-keys.ts'
+import { isAutomaticInput } from '../../shared/terminal-automatic.ts'
 import { ANY_CLAUDE_CHIP_RE, isOwnedClaudeChip } from './claude-paste.ts'
 import { classifyBox } from './draft-reading.ts'
 import { isDraftKind, MAX_DRAFT_SHOWN, type ClearResult, type DraftKind, type DraftView } from '../../shared/chat-draft.ts'
@@ -399,6 +401,11 @@ export interface ChatPoolOptions {
   /** F-193: the agent-side switch for the live mirror (input-mirror.off, SAD_INPUT_MIRROR=0): true = off, every page keeps the old way. */
   mirrorOff?: () => boolean
   reapEveryMs?: number
+  /**
+   * oeee2, tests: how a message goes into a native Codex chat's console (codex/console-keys.ts), given whether a console on this PC asked for
+   * win32 input mode. Default: asked = 'win32-input'; not asked on Windows = 'ascii'; elsewhere none (UTF-8 is read as it is).
+   */
+  consoleInput?: (c: { sessionId: string; asked: boolean }) => ConsoleInput | undefined
 }
 
 /**
@@ -487,6 +494,19 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   const log = o.log
   let spawnPty = o.spawn ?? null
   const changed = () => o.onChange?.()
+  /**
+   * oeee2: a console on this PC asked for win32 input mode. Every chat here runs in the same Windows console (ConPTY), which reads such keys
+   * whether or not this chat's own request is still in its replay (the replay keeps the last 256 KB: a long chat taken over after a restart
+   * no longer shows the first thing its console printed).
+   */
+  let consoleAsked = false
+  const noteConsole = (data: string) => {
+    if (!consoleAsked && data.includes(WIN32_INPUT_REQUEST)) consoleAsked = true
+  }
+  const consoleOf = (c: Chat): ConsoleInput | undefined => {
+    if (o.consoleInput) return o.consoleInput({ sessionId: c.info.sessionId, asked: consoleAsked })
+    return consoleAsked ? 'win32-input' : process.platform === 'win32' ? 'ascii' : undefined
+  }
 
   const infoOf = (c: Chat): ChatInfo => ({ ...c.info, state: stateNow(c), viewers: c.viewers.size })
 
@@ -940,6 +960,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     chats.set(c.info.sessionId, c)
     keys.set(c.key, c)
     pty.onData(data => {
+      noteConsole(data)
       if (c.silentSince !== undefined) {
         log?.info(`chat ${c.info.sessionId.slice(0, 8)}: terminal output again ${Math.round((Date.now() - c.silentSince) / 1000)} s after a paste that got no echo (it had not been reading its input)`)
         c.silentSince = undefined
@@ -1009,7 +1030,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       beforeInput: opt?.authorize,
       onBlocked: opt?.onBlocked,
       report: r => offsetReport(opt, r, sendStart - began),
-    }, text, { ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
+      // oeee2: characters the console would lose go in as key presses (or stand-ins), and a message that did not go in is taken back out of the box.
+    }, text, { withdraw: true, console: consoleOf(c), ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
     }
     const sending = (c.codexSending ? c.codexSending.then(r => r === 'sent' ? send() : 'blocked' as const) : send())
       .catch(() => 'unconfirmed' as const)
@@ -1368,9 +1390,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const c = chats.get(id)
       if (!c) return false
       c.lastSeen = Date.now()
-      c.inputEpoch = (c.inputEpoch ?? 0) + 1
-      c.typedAt = Date.now()
-      c.lastInput = { at: c.typedAt, kind: inputKind(data), via: 'page' }
+      // oeee2: what xterm sends by itself (the focus report the Windows console asks for whenever a page gains or loses focus, answers to
+      // queries) is not typing: it never cancels a message in flight and is not "he is typing". (14 Nov, 19:35: an order to Lead's Codex,
+      // watched on a page, ended "terminal-input" 18 s after its paste with its text left in the box; which input it was is not logged.)
+      if (!isAutomaticInput(data)) {
+        c.inputEpoch = (c.inputEpoch ?? 0) + 1
+        c.typedAt = Date.now()
+        c.lastInput = { at: c.typedAt, kind: inputKind(data), via: 'page' }
+      }
       const ok = write(c, data)
       c.mirror?.poke()
       return ok
@@ -1669,6 +1696,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         // Long past its start gates (and nobody but a person answers a question that comes later).
         gates: { trust: false, trustTries: 0, resume: false, scan: '', until: 0 },
       }
+      noteConsole(replay)
       // What it was doing, read off what it printed (a menu waiting, the spinner): in slices, as it came.
       for (let i = 0; i < replay.length; i += 16 * 1024) {
         const part = replay.slice(i, i + 16 * 1024)

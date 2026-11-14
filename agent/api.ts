@@ -35,7 +35,9 @@ import type { SwitchAutoRequest, SwitchPreview, SwitchRefreshRequest, SwitchRequ
 import { isBlock, type StableChangeRequest, type StableSettingsRequest } from '../shared/stable-ports.ts'
 import type { Auth } from './auth/index.ts'
 import { authRoute } from './auth/routes.ts'
+import type { FeatureAccess } from './auth/feature-access.ts'
 import { authError, isPageRequest, OPEN, type Caller } from './auth/types.ts'
+import { routeRule } from '../shared/access.ts'
 import { ROUTES } from './config.ts'
 import { loopbackOrigin } from './local-host.ts'
 import type { Logger } from './log.ts'
@@ -154,6 +156,8 @@ export interface ApiOptions {
   mounts?: ApiMount[]
   /** F-118: who is asking (agent/auth/). Left out (tests, an app with nobody to sign in), every request is the open app's, as before. */
   auth?: Auth
+  /** Order o9465: what is open to whom (Settings › Access, agent/auth/feature-access.ts). Left out, a person who is not the owner has what F-118 gave them. */
+  access?: FeatureAccess
   /** F-057, tests: how often a text WebSocket client is pinged, and how long one may stay silent before it is dropped. */
   wsPingMs?: number
   wsDeadMs?: number
@@ -602,6 +606,21 @@ export function startApi(o: ApiOptions): Promise<Api> {
       auth.deny(c, 401, 'sign-in', route)
       throw authError(401, 'Sign in first.', 'sign-in')
     }
+    // Order o9465: Settings › Access, the one check for every route and WebSocket. A signed-in person who is not the owner reaches a route only when
+    // its feature is open to them (shared/access.ts ROUTES; an Agents route also when something is shared with them); that also lets them past the
+    // owner-only wall for that feature's routes. A route that is no feature's stays as before for the PC's own routes (403 admin-only) and is
+    // refused on a mount that decides by person (fail closed).
+    if (o.access && c.person && !auth.isAdmin(c)) {
+      const apiPath = (req.url ?? '').split('?')[0].slice(AGENT_API_PREFIX.length)
+      const method = typeof req.headers.upgrade === 'string' && req.headers.upgrade.toLowerCase() === 'websocket' ? 'WS' : (req.method ?? 'GET')
+      if (o.access.opensRoute(c, method, apiPath)) return
+      if (ownerOnly && !routeRule(method, apiPath)) {
+        auth.deny(c, 403, 'admin-only', route)
+        throw authError(403, 'This is for the owner of this app.', 'admin-only')
+      }
+      auth.deny(c, 403, 'not-allowed', route)
+      throw authError(403, 'This is not open to you. The owner of this app opens pages and features in Settings › Access.', 'not-allowed')
+    }
     if (ownerOnly && c.person && !auth.isAdmin(c)) {
       auth.deny(c, 403, 'admin-only', route)
       throw authError(403, 'This is for the owner of this app.', 'admin-only')
@@ -758,7 +777,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       // Only these two carry a body; sign-out and confirm take none (a bare POST is fine).
       const body = (method === 'POST' && rest === '/auth/sign-in') || method === 'PUT' ? await readJson(req) : undefined
       const secure = typeof req.headers.origin === 'string' && req.headers.origin.startsWith('https:')
-      const answer = await authRoute(o.auth, { method, rest: rest.slice('/auth'.length), query: url.searchParams, body, caller, secure })
+      const answer = await authRoute(o.auth, { method, rest: rest.slice('/auth'.length), query: url.searchParams, body, caller, secure, access: o.access })
       if (answer) {
         const headers: http.OutgoingHttpHeaders = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
         if (answer.setCookie) headers['Set-Cookie'] = answer.setCookie
@@ -946,8 +965,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (keyed !== null) {
       if (req.headers.origin !== undefined) return refuse(socket, 403, 'Not for pages')
       if (!keyed) return refuse(socket, 401, 'Missing or invalid device key')
-      // F-118: the paired phone keeps its device key until it can sign in; unless that was turned off.
-      if (o.auth && !o.auth.phoneExempt() && o.auth.require() !== 'off') return refuse(socket, 401, 'Sign in first.', 'sign-in')
+      // Order oc186: a device key opens only its own voice routes (the mount checks them); the phone's pages need the CRM sign-in.
     } else {
       // The proxy keeps the browser's own Origin on a WebSocket (changeOrigin rewrites Host only).
       if (foreignOrigin(req)) return refuse(socket, 403, 'WebSockets from pages on other sites are refused')

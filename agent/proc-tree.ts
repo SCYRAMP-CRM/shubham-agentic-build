@@ -137,13 +137,15 @@ export function parseTable(text: string): Proc[] {
 
 const SCRIPT =
   "Get-CimInstance Win32_Process | ForEach-Object { '{0},{1},{2},{3}' -f $_.ProcessId, $_.ParentProcessId, $(if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }), $_.Name }"
+/** The longest one read of the table is waited for on Windows (PowerShell into WMI: under a second on an idle PC, 10 to 30 s and more when WMI is busy). */
+export const TABLE_TIMEOUT_MS = 30_000
 
 /** Every process with when it started (Windows; on Linux from /proc, below). */
 export function listProcesses(): Promise<Proc[]> {
   if (process.platform === 'linux') return listProcessesLinux()
   return new Promise((resolve, reject) => {
     if (process.platform !== 'win32') return reject(new Error('the process table is read on Windows and Linux only'))
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', SCRIPT], { windowsHide: true, timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', SCRIPT], { windowsHide: true, timeout: TABLE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(err)
       const table = parseTable(String(stdout))
       if (!table.length) return reject(new Error('the process table came back empty'))

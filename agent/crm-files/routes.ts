@@ -4,6 +4,7 @@ import type { ApiMount } from '../api.ts'
 import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmRemovedProject, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 import type { CrmUploads } from './uploads.ts'
+import type { LocalSync } from './local-sync.ts'
 
 // F-126: the CRM files routes for the page, mounted at /agent-api/agentic/crm-files (shared/crm-files.ts says what each one takes and gives).
 // Every route is a "raw" one so the errors carry their `code` and bytes are streamed, never held whole. The guard (x-sad-token, no foreign Origin) is api.ts's, before any of this runs.
@@ -96,6 +97,11 @@ const METHODS: Record<string, string[]> = {
   'pins/unpin': ['POST'],
   'pins/settings': ['POST'],
   'pins/drop-kept': ['POST'],
+  // oe86a: this PC's synced CRM folder (local-sync.ts): how it stands, and a sync now.
+  sync: ['GET'],
+  'sync/now': ['POST'],
+  'sync/settings': ['POST'],
+  'sync/open': ['POST'],
 }
 
 /** od0b1: the uploads in parts (there only when the agent holds them: uploads.ts). */
@@ -164,7 +170,7 @@ function spoolOf(svc: CrmFilesService): CrmSpool {
   return { entries: svc.spool?.list() ?? [], dir: svc.spool?.dir ?? '' }
 }
 
-export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMount {
+export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads, sync?: LocalSync): ApiMount {
   return {
     prefix: CRM_FILES_PREFIX,
     http: async () => {
@@ -185,6 +191,22 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
           switch (name) {
             case 'status':
               return send(res, 200, await svc.status())
+            case 'sync':
+              if (!sync) throw new CrmFilesError(404, 'notfound', 'This agent keeps no synced folder.')
+              return send(res, 200, sync.status())
+            case 'sync/now':
+              if (!sync) throw new CrmFilesError(404, 'notfound', 'This agent keeps no synced folder.')
+              return send(res, 200, await sync.now())
+            case 'sync/settings': {
+              if (!sync) throw new CrmFilesError(404, 'notfound', 'This agent keeps no synced folder.')
+              const b = await readJson(req)
+              const pick = (k: string) => (Object.hasOwn(b, k) ? (b as Record<string, unknown>)[k] : undefined)
+              return send(res, 200, await sync.setSettings({ on: pick('on') as boolean | undefined, capMb: pick('capMb') as number | undefined, quotaGb: pick('quotaGb') as number | undefined }))
+            }
+            case 'sync/open':
+              if (!sync) throw new CrmFilesError(404, 'notfound', 'This agent keeps no synced folder.')
+              await sync.open()
+              return send(res, 200, { ok: true })
             case 'children': {
               const r = await svc.children(url.searchParams.get('id') || 'root')
               // P1: a big folder is read in parts: the first `limit` children and how many there are in all (no limit: everything, as before).

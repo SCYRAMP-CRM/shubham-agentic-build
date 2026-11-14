@@ -9,7 +9,7 @@ import { CRM_FILES_REASONS, type CrmDriverChoice, type CrmMountStatus, type CrmR
 import { startBridge, type Bridge, type BridgeOptions } from './bridge.ts'
 import { createWinDav } from './mount-win-dav.ts'
 import { createWinNative } from './mount-winfsp-native.ts'
-import { CrmFilesError, type CrmFilesService, type MountDriver } from './service.ts'
+import { CrmFilesError, MARKETING_FOLDER_OFF_FILE, type CrmFilesService, type MountDriver } from './service.ts'
 
 // F-126: the CRM files as a Windows drive (default Y:). The host is crm-fs.exe, our own build of the CRM Files drive (crm-fs/ in the repo; WinFsp underneath). This starts it with a
 // bridge address and a one-run secret in its environment, stops it by its own process id (never by name, never a tree, and never the old build's crm-fs.exe or its X:), and says in plain
@@ -324,7 +324,8 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
       try {
         bridge = await startBridge(o.bridge)
         const c = spawn(o.exe, ['-m', letter], {
-          env: { ...process.env, CRM_MGR_BASE: bridge.base, CRM_MGR_TOKEN: bridge.token },
+          // o9d2a: the host makes the "Marketing Projects" folder as the app's own drive does, unless this setting file (the same one) is there.
+          env: { ...process.env, CRM_MGR_BASE: bridge.base, CRM_MGR_TOKEN: bridge.token, CRM_FS_MARKETING_OFF_FILE: path.join(o.dir, MARKETING_FOLDER_OFF_FILE) },
           stdio: 'ignore',
           windowsHide: true,
         })

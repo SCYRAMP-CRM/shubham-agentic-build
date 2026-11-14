@@ -56,7 +56,7 @@ export const AUTH_IDLE_HOURS = 12
 /** A raised sign-in level reverts unless confirmed within this. */
 export const AUTH_TRIAL_SECONDS = 120
 
-/** How the app asks for sign-in: 'off' = as before (nobody has to); 'remote' = devices arriving over the tailnet; 'all' = this PC's own pages too. */
+/** The saved choice. Order oc186: every choice means a CRM sign-in (nobody signed in sees nothing); 'off' and 'remote' are kept selectable and act as 'all'. */
 export type AuthRequire = 'off' | 'remote' | 'all'
 export const AUTH_REQUIRE: readonly AuthRequire[] = ['off', 'remote', 'all']
 
@@ -100,6 +100,11 @@ export interface AuthStatus {
   mayApprove?: boolean
   /** True when this browser must sign in before the app answers anything else (require says so for `via`). With person null and needsSignIn false the app is open as before: no tabs, no scoping. */
   needsSignIn: boolean
+  /**
+   * Order o9465: the features (shared/access.ts) this person's page shows, as Settings › Access opened them to them. null or missing: every one
+   * (the owner, the open app, or an agent before Access).
+   */
+  features?: string[] | null
 }
 
 export interface AuthSettings {
