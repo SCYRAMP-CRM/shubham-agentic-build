@@ -95,6 +95,8 @@ export interface CrmFsOptions {
   /** Tests: where staging files go (default: <spool>/.staging). */
   stagingDir?: string
   modifyMax?: number
+  /** o4fb7: how long a folder's names are kept while the service's view of the tree is the same (ms, default 4000; 0 = never kept). */
+  listMs?: number
   log?: { info(m: string): void; warn(m: string): void }
 }
 
@@ -133,10 +135,24 @@ export function createCrmFsHandler(service: () => CrmFilesService | null, opt: C
     return s
   }
 
+  // o4fb7: each folder's listing is kept while the service's view of the tree is the same (generation()) and at most LIST_MS. Explorer asks about every file it shows, and every
+  // lookup used to list every folder of its path again, from the top (whose listing alone took 0.36 s on the Server).
+  const LIST_MS = opt.listMs ?? 4_000
+  const lists = new Map<string, { gen: number; at: number; node: CrmNode; kids: [string, CrmNode][] }>()
+  async function listOf(id: string): Promise<{ node: CrmNode; kids: [string, CrmNode][] }> {
+    const s = svc()
+    const hit = lists.get(id)
+    if (hit && LIST_MS > 0 && hit.gen === s.generation() && Date.now() - hit.at < LIST_MS) return hit
+    const r = await s.children(id)
+    const v = { gen: s.generation(), at: Date.now(), node: r.node, kids: [...namesOf(r.children, legalWindowsName, true)].sort((a, b) => byName(a[0], b[0])) }
+    if (lists.size > 2_000) lists.clear()
+    lists.set(id, v)
+    return v
+  }
+
   /** The children of a folder under their Windows names (a Map from name to node), sorted by name. */
   async function kidsOf(id: string): Promise<[string, CrmNode][]> {
-    const { children } = await svc().children(id)
-    return [...namesOf(children, legalWindowsName, true)].sort((a, b) => byName(a[0], b[0]))
+    return (await listOf(id)).kids
   }
 
   // ---- what is kept on this PC (S9b) ----
@@ -157,7 +173,7 @@ export function createCrmFsHandler(service: () => CrmFilesService | null, opt: C
   /** What a path is: a CRM node, a save kept in the spool, a file made in this session, or nothing yet (with its folder); null when its folder is not there. */
   async function lookup(p: string): Promise<Look | null> {
     const parts = p.split('\\').filter(Boolean)
-    let node = (await svc().children('root')).node
+    let node = (await listOf('root')).node
     let parent: CrmNode | null = null
     let name = ''
     for (let i = 0; i < parts.length; i++) {
@@ -387,7 +403,7 @@ export function createCrmFsHandler(service: () => CrmFilesService | null, opt: C
         const k = keptVersion(n.id)
         const size = k ? k.size : (n.size ?? 0)
         if (!truncate && size > modifyMax) throw nt(NT.ACCESS_DENIED, 'That file is too large to change in place; save a whole new file over it.')
-        const s = await newSession({ parent: l.parent ?? (await svc().children('root')).node, name: l.name, node: n, kept: k, fresh: false, size: truncate ? 0 : size, loaded: truncate, dirty: truncate })
+        const s = await newSession({ parent: l.parent ?? (await listOf('root')).node, name: l.name, node: n, kept: k, fresh: false, size: truncate ? 0 : size, loaded: truncate, dirty: truncate })
         return { sid: s.sid, entry: { ...entryOf(l.name, n), size: s.size } }
       }),
 
@@ -458,7 +474,7 @@ export function createCrmFsHandler(service: () => CrmFilesService | null, opt: C
         if (!a || a.kind === 'none') throw nt(NT.OBJECT_NAME_NOT_FOUND)
         const b = await lookup(to)
         if (!b) throw nt(0xc000003a | 0)
-        const destParent = b.parent ?? (await svc().children('root')).node
+        const destParent = b.parent ?? (await listOf('root')).node
         if (destParent.kind === 'root' || destParent.kind === 'category') throw nt(NT.ACCESS_DENIED)
         const destName = b.name
         const destIsDoc = b.kind === 'node' && !b.node.isFolder

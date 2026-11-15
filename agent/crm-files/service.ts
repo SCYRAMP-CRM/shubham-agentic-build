@@ -26,6 +26,9 @@ import { createSpool, type Spool } from './spool.ts'
 import { versionToken, type PinItem } from './offline-pins.ts'
 import { findFiles, type FindAsk, type FindResult } from './find.ts'
 import type { PinsHost } from './pins-host.ts'
+import type { ByteCache } from './byte-cache.ts'
+import { driveType } from '../drive/mime.ts'
+import { writeAtomic } from '../config.ts'
 import type { CrmPinMark } from '../../shared/crm-files.ts'
 
 // F-126: the CRM's files as a tree, for the page, for the Linux mount (in process) and for the Windows host's bridge. The CRM's own RECORDS decide what is a file and where it is
@@ -97,12 +100,16 @@ export interface CrmFilesOptions {
   /** oa2f8: the most one file may be now (the uploads' settings: the CRM's own limit, or the person's number). Left out: CRM_FILES_MAX_UPLOAD. The one-request upload and the drive's saves follow it. */
   maxUpload?: () => number
   /**
-   * o813f: how the bytes of a file are read. 'drive' (left out = this): a file over 100 MB (DRIVE_API_OVER) that the CRM keeps in Google Drive is read through Google's Drive API
-   * (files.get alt=media with the CRM's own Drive token, in ranges), not through the public download link, which answers Google's virus-scan notice instead of such a file; every
-   * other file through the CRM's own download, as before. 'crm': every file through the CRM's own download (GET /org/files/:id/raw), the way before o813f, kept as a setting
-   * (index.ts: `downloadViaFile`, the file DOWNLOAD_VIA_CRM_FILE in the agent's state folder).
+   * o813f / o048b: how the bytes of a file are read.
+   * - 'drive' (left out = this; o048b, Shubham 15 Nov 2026: "Read ALL Drive files through the direct Google Drive API (streaming, Range), with the CRM route as fallback and
+   *   the CRM's per-file permission kept"): EVERY file the CRM keeps in Google Drive is read through Google's Drive API (files.get alt=media with the CRM's own Drive token,
+   *   streamed, by Range requests), once the CRM has said yes for that very file. The CRM's own download (GET /org/files/:id/raw) stays the way for a file whose link is not
+   *   Drive's own, and the fallback when the API is not open (no Drive token for this account, a file the token does not see, a Google Docs file, Google still failing).
+   * - 'drive-big': the way of o813f, kept as a setting: only a file over 100 MB (DRIVE_API_OVER) through the API, every other file through the CRM's own download.
+   * - 'crm': every file through the CRM's own download, the way before o813f, kept as a setting.
+   * (index.ts: `downloadViaFile`, the files DOWNLOAD_VIA_CRM_FILE and DOWNLOAD_API_BIG_ONLY_FILE in the agent's state folder.)
    */
-  downloadVia?: () => 'drive' | 'crm'
+  downloadVia?: () => DownloadVia
   /** ocbbf: "Keep on this PC" (pins-host.ts). A getter: the host is made after the service. Left out: nothing is kept, and no node has a mark. */
   pins?: () => PinsHost | null
   /**
@@ -111,7 +118,22 @@ export interface CrmFilesOptions {
    * MARKETING_FOLDER_OFF_FILE in the agent's state folder).
    */
   marketingFolder?: () => boolean
+  /**
+   * o4fb7: the files' bytes kept on this PC's disk (byte-cache.ts): a file opened again comes from there, and a file the in-app drive reads in many ranges is downloaded once,
+   * not once per range. Left out (tests, older callers): every read goes to the CRM or Google, as before.
+   */
+  bytes?: ByteCache | null
+  /**
+   * o4fb7: where the file sizes learned from Google Drive (for the CRM's records that have none) are kept, so a restart does not ask for them again; with it, the sizes still
+   * unknown are also learned in the background after each listing of the CRM. Left out (tests): kept in memory only, learned only for the folder being listed, as before.
+   */
+  sizesFile?: string
 }
+
+/** o4fb7: a file bigger than this is not kept in the bytes cache (bytes). */
+export const BYTES_CACHE_MAX_FILE = 1024 * 1024 * 1024
+/** o4fb7: how old a listing of the CRM may be and still be answered at once while a fresh one is fetched (ms). */
+const STALE_MS = 5 * 60_000
 
 /**
  * oe692 (Shubham, 14 Nov 2026: "one more folder in the mounted drive called Marketing Projects"): the drive's top folder for the CRM's marketing projects. It is always there
@@ -130,24 +152,47 @@ export function marketingFolderFile(dir: string): () => boolean {
   return () => !existsSync(file)
 }
 
-/** o813f: this file in the agent's state folder sends every download through the CRM's own (the way before o813f; a file over 100 MB fails there). */
+/** o813f / o048b: the ways a file's bytes are read (see CrmFilesOptions.downloadVia). */
+export type DownloadVia = 'drive' | 'drive-big' | 'crm'
+
+/** o813f: this file in the agent's state folder sends every download through the CRM's own (the way before o813f; a file over 100 MB fails there). It wins over the one below. */
 export const DOWNLOAD_VIA_CRM_FILE = 'crm-download-via-crm.on'
 
+/** o048b: this file in the agent's state folder reads only a file over 100 MB through Google's Drive API, every other file through the CRM's own download (the way of o813f). */
+export const DOWNLOAD_API_BIG_ONLY_FILE = 'crm-download-api-big-only.on'
+
 /**
- * o813f (Lead, 12 Nov 2026): ONLY a record over this size (its fileSize in the CRM) is read through Google's Drive API; every other file goes through the CRM's own download, as before.
- * 100 MB in Google's own counting (100 × 1000 × 1000), so Google's virus-scan cut-off is covered.
+ * o813f (Lead, 12 Nov 2026): under the 'drive-big' setting (o048b), ONLY a record over this size (its fileSize in the CRM) is read through Google's Drive API; every other file goes
+ * through the CRM's own download. 100 MB in Google's own counting (100 × 1000 × 1000), so Google's virus-scan cut-off is covered.
  */
 export const DRIVE_API_OVER = 100 * 1000 * 1000
+
+/**
+ * o048b: a ranged read (the in-app drive's 4 MiB blocks) of a file read through Google's Drive API that is no bigger than this (or of unknown size) downloads the file whole into the
+ * bytes cache, once: its other ranges, and every later read, come from that one download and then from this PC's disk. A bigger file is read range by range (o813f), unless a whole
+ * read (the page's download, the WebDAV drive) is already bringing it into the cache.
+ */
+export const WHOLE_DOWNLOAD_UPTO = 100 * 1000 * 1000
+
+/**
+ * o048b: while a file comes into the bytes cache, a range that starts further than this past what has come gets its own ranged request to the API at once: a reader that jumps
+ * (to the end of a PDF for its table, to a video's index) does not wait for the whole download to get there.
+ */
+export const AHEAD_BYTES = 8 * 1024 * 1024
 
 /** o813f: the CRM's Drive token goes only to Google's API, over https (the pretend Google of the tests listens on 127.0.0.1). */
 export function tokenMayGoTo(url: string): boolean {
   return /^https:\/\/www\.googleapis\.com\//.test(url) || /^http:\/\/127\.0\.0\.1:\d{1,5}\//.test(url)
 }
 
-/** o813f: the download setting as the agent reads it: 'crm' while DOWNLOAD_VIA_CRM_FILE is in `dir`, else 'drive' (looked at on every read, so it takes effect at once). */
-export function downloadViaFile(dir: string): () => 'drive' | 'crm' {
-  const file = path.join(dir, DOWNLOAD_VIA_CRM_FILE)
-  return () => (existsSync(file) ? 'crm' : 'drive')
+/**
+ * o813f / o048b: the download setting as the agent reads it: 'crm' while DOWNLOAD_VIA_CRM_FILE is in `dir`, else 'drive-big' while DOWNLOAD_API_BIG_ONLY_FILE is, else 'drive'
+ * (looked at on every read, so it takes effect at once).
+ */
+export function downloadViaFile(dir: string): () => DownloadVia {
+  const crm = path.join(dir, DOWNLOAD_VIA_CRM_FILE)
+  const bigOnly = path.join(dir, DOWNLOAD_API_BIG_ONLY_FILE)
+  return () => (existsSync(crm) ? 'crm' : existsSync(bigOnly) ? 'drive-big' : 'drive')
 }
 
 /**
@@ -166,8 +211,10 @@ export function driveIdOf(url: string): string | null {
 export const DOWNLOAD_WORDS = {
   harmful: 'Google Drive has marked this file as harmful (malware or spam), so it is not downloaded. That is Google’s decision; only the file’s owner can look at it, in Google Drive itself.',
   scanPage:
-    'Google Drive sent its virus-scan notice instead of this file: a file over 100 MB does not come through the CRM’s own download, and the direct Google Drive way was not open for it here (for example, this account has no upload permission in the CRM).',
+    'Google Drive sent its virus-scan notice instead of this file (it does so for a file over 100 MB, and for some kinds of file such as scripts), so it does not come through the CRM’s own download, and the direct Google Drive way was not open for it here (for example, this account has no upload permission in the CRM).',
   broke: 'Google Drive stopped sending this file and did not go on from where it stopped. Try again.',
+  /** o4fb7: any other page of Google's in place of a file (a preview, a sign-in, a "too many downloads" page): refused, never passed on as the file. */
+  googlePage: 'Google Drive sent a web page instead of this file (a preview, a sign-in or a limit page), so it is not opened as the file. Try again later, or open it from the CRM.',
   notShown: 'The CRM does not show this file to this account (it may have been removed), so it is not read.',
 } as const
 
@@ -271,6 +318,11 @@ export interface CrmFilesService {
    * on the PC to match): not one request per project. No sizes are probed (a file's size, when the CRM has none, is learned by its download).
    */
   syncTree(needGroups?: ReadonlySet<string>): Promise<SyncNode[]>
+  /**
+   * o4fb7: a number that changes whenever what the service knows of the tree changes (a new listing of the CRM, or a change made through it). A drive may keep its own
+   * lookups (a folder's names) while it is the same, so asking about every file of a folder does not list the folders of its path again each time.
+   */
+  generation(): number
   /** S7: the .driveignore rules (null when there is no spool). `defaults`: the built-in list of editor and system files (~$*, *.tmp, Thumbs.db, desktop.ini, .DS_Store, node_modules, *.crdownload) is on (the default). */
   ignore: { defaults(): boolean; setDefaults(on: boolean): void; rules: IgnoreRules } | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
@@ -412,6 +464,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   // ---- the listing, reused for a few seconds ---------------------------------------------------------------------------
 
   let snap: Snapshot | null = null
+  /** o4fb7: changes whenever what this knows of the tree changes (a new listing of the CRM, or a change made here): see generation(). */
+  let gen = 0
   let loading: Promise<Snapshot> | null = null
   let lastWrite: boolean | null = null
   let upload: { ok: boolean | null; at: number } = { ok: null, at: 0 }
@@ -419,12 +473,23 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   function invalidate(project?: string) {
     snap = null
+    gen++
     if (project) groupCache.delete(project)
     else groupCache.clear()
   }
 
   async function load(): Promise<Snapshot> {
     if (snap && now() - snap.at < ttl) return snap
+    // o4fb7: a listing a little older than `ttl` is answered at once and a fresh one is fetched behind it, so opening a folder never waits for the CRM's lists (0.3-0.7 s
+    // each time the 10 s ran out); never one older than STALE_MS. A change made here (invalidate) still waits for the fresh one; ttl 0 (tests) always waits.
+    if (snap && ttl > 0 && now() - snap.at < STALE_MS) {
+      void fetchSnapshot().catch(() => undefined)
+      return snap
+    }
+    return fetchSnapshot()
+  }
+
+  function fetchSnapshot(): Promise<Snapshot> {
     loading ??= (async () => {
       // Who may write at all (the CRM's hierarchy grant); a failed call keeps the last answer rather than turning everything read-only for one slow reply.
       let writeCapable = lastWrite ?? false
@@ -481,6 +546,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       // S6: a project the CRM used to list and no longer does (twice, 30 s apart) has its access removed; one that is listed again is back, and its refused saves say so.
       for (const pid of removedIndex?.observe([...projects.values()].map(p => ({ id: p.id, name: p.name }))).returned ?? []) spool?.noteProject(pid, 'Access to this project came back. It is kept here and was not sent by itself: press Try again to send it.')
       snap = s
+      gen++
+      warmSizes(s)
       return s
     })().finally(() => (loading = null))
     return loading
@@ -531,7 +598,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   // a failed ask is not repeated for 10 minutes. No Drive link, no token, or no answer: the size stays unknown (no size is shown, never 0 bytes from us).
   const driveSizes = new Map<string, { key: string; size: number }>()
   const driveSizeMiss = new Map<string, { key: string; at: number }>()
-  const SIZE_AT_ONCE = 3
+  const SIZE_AT_ONCE = 8
   const SIZE_MISS_MS = 10 * 60 * 1000
   let sizeSlots = 0
   const sizeWaiting: (() => void)[] = []
@@ -567,7 +634,10 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       try {
         const size = await driveSizeOf(driveId)
         if (size === null) driveSizeMiss.set(f.id, { key: f.fileKey, at: now() })
-        else driveSizes.set(f.id, { key: f.fileKey, size })
+        else {
+          driveSizes.set(f.id, { key: f.fileKey, size })
+          saveSizes()
+        }
       } catch {
         driveSizeMiss.set(f.id, { key: f.fileKey, at: now() })
       } finally {
@@ -578,6 +648,44 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     sizing.set(f.id, run)
     return run
   }
+  // o4fb7: the sizes learned are kept on disk (o.sizesFile), so a restart does not ask Google for them all again; and each time the CRM's list comes in, the sizes still unknown
+  // are learned in the background, one at a time, so a folder seldom waits for them when it is opened. Neither without a sizes file (tests).
+  if (o.sizesFile) {
+    try {
+      const j = JSON.parse(readFileSync(o.sizesFile, 'utf8')) as Record<string, { key?: unknown; size?: unknown }>
+      for (const [id, v] of Object.entries(j)) if (v && typeof v.key === 'string' && typeof v.size === 'number' && Number.isSafeInteger(v.size) && v.size >= 0) driveSizes.set(id, { key: v.key, size: v.size })
+    } catch {
+      // none yet
+    }
+  }
+  let sizesSaving: ReturnType<typeof setTimeout> | null = null
+  function saveSizes() {
+    if (!o.sizesFile || sizesSaving) return
+    sizesSaving = setTimeout(() => {
+      sizesSaving = null
+      try {
+        writeAtomic(o.sizesFile!, JSON.stringify(Object.fromEntries(driveSizes)))
+      } catch (e) {
+        o.log?.warn(`crm files: the learned sizes could not be kept (${e instanceof Error ? e.message : String(e)})`)
+      }
+    }, 2_000)
+    sizesSaving.unref?.()
+  }
+  let warming = false
+  function warmSizes(s: Snapshot) {
+    if (!o.sizesFile || warming) return
+    const todo = s.files.filter(f => sizeOf(f) === null && driveIdOf(f.fileUrl) !== null)
+    if (todo.length === 0) return
+    warming = true
+    void (async () => {
+      try {
+        for (const f of todo) await sizeAsk(f)
+      } finally {
+        warming = false
+      }
+    })()
+  }
+
   /** Asks for the sizes of the files of one folder that have none on record: waits for them at most `budgetMs`; the rest go on in the background (the next listing has them). */
   async function learnSizes(files: RawFile[], budgetMs = 1500): Promise<void> {
     const todo = files.filter(f => sizeOf(f) === null)
@@ -606,7 +714,21 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   }
 
   // ---- oe692: the Marketing Projects folder ---------------------------------------------------------------------------------
-  const marketingOn = (): boolean => o.marketingFolder?.() ?? true
+  /**
+   * Whether the folder is on. o4fb7 (15 Nov 2026): looked at ONCE per stretch of code, not once per file. A listing asks it for every CRM file: the top folder asked twice per file,
+   * 6000 checks of the setting file on disk for 3000 files. The Server's top listing took 0.32-0.38 s when warm, against 4 ms for a small category; 6000 such checks took 75 ms
+   * in a quiet process alone. The value is read again after any wait (the next microtask), so a changed setting still applies to the next listing at once.
+   */
+  let marketingNow: boolean | null = null
+  const marketingOn = (): boolean => {
+    if (marketingNow === null) {
+      marketingNow = o.marketingFolder?.() ?? true
+      queueMicrotask(() => {
+        marketingNow = null
+      })
+    }
+    return marketingNow
+  }
   /** The top folder a project sits in on the drive: "Marketing Projects" for a marketing project (while that folder is on), else "projects". */
   const homeOf = (p: RawProject): { id: string; name: string } => (p.marketing && marketingOn() ? { id: MARKETING_ID, name: MARKETING_FOLDER } : { id: catId('projects'), name: 'projects' })
   /** A CRM category (a file's `folder` tag) with the folder's own name, in any case, is shown inside it rather than as a second top folder of the same name. */
@@ -1059,9 +1181,58 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   // is never sent, and the CRM's download is not tried instead. The CRM still decides what may be read: the file must be in the CRM's own list for this account (findFile, which also
   // hides projects it may not open), the Drive id is the one in the link the CRM keeps for THAT record (driveIdOf), and the CRM must say yes for that very file just before (crmLetsOpen).
   // The token: from the CRM (org/upload/gdrive-token), in this process's memory only, sent only to Google's API over https (tokenMayGoTo); never logged, stored, answered or shown.
+  // o048b (Shubham, 15 Nov 2026): the same way, under the same conditions, for EVERY file the CRM keeps in Google Drive, not only one over 100 MB: Google streams it at once and
+  // answers a range (the CRM's own download fetches the whole file from Google before its first byte, ignores a range, and sent Google's page in place of some small files).
 
-  /** The Drive id to read this record by, through the API: only a record over DRIVE_API_OVER whose link is Drive's own, and only while the setting says so. Null = the CRM's own download. */
-  const apiDriveId = (f: RawFile): string | null => ((o.downloadVia?.() ?? 'drive') === 'drive' && f.fileSize !== null && f.fileSize > DRIVE_API_OVER ? driveIdOf(f.fileUrl) : null)
+  /**
+   * The Drive id to read this record by, through the API; null = the CRM's own download. o048b: every record whose link is Drive's own; under the 'drive-big' setting only one
+   * over DRIVE_API_OVER (o813f); under 'crm' none.
+   */
+  const apiDriveId = (f: RawFile): string | null => {
+    const via = o.downloadVia?.() ?? 'drive'
+    if (via === 'crm' || (via === 'drive-big' && !(f.fileSize !== null && f.fileSize > DRIVE_API_OVER))) return null
+    return driveIdOf(f.fileUrl)
+  }
+
+  // ---- o4fb7: the bytes cache ---------------------------------------------------------------------------------------------
+  /** A file's place in the bytes cache: its id and its CRM version (a new version is a new place; the CRM's own size, not a learned one, so the key stays put). */
+  const cacheKey = (f: RawFile) => `${f.id}|${versionToken({ fileKey: f.fileKey, modifiedAt: f.updatedAt ?? f.createdAt, size: f.fileSize, versions: f.versions })}`
+  /** Kept in the cache: a file the cache may hold (its size unknown or under the bound). */
+  const cacheable = (f: RawFile) => !!o.bytes && (f.fileSize === null || f.fileSize <= BYTES_CACHE_MAX_FILE)
+  const tooBigToKeep = (e: unknown) => (e as { tooBig?: unknown })?.tooBig === true
+  /**
+   * o048b: the cache places whose download came through the CRM's own because the API was not open for that file (the latest 256): a range far ahead of such a download waits
+   * for it, as a ranged read through the CRM's download would fetch the whole file again.
+   */
+  const throughCrm = new Set<string>()
+  const markThroughCrm = (key: string) => {
+    throughCrm.delete(key)
+    throughCrm.add(key)
+    if (throughCrm.size > 256) throughCrm.delete(throughCrm.values().next().value as string)
+  }
+  /**
+   * The whole of a file, as one download for the cache: through Google's Drive API where it is read that way (o048b: every Drive file; once the CRM said yes for it), else, or when
+   * the API is not open for it, the CRM's own download with its checks (Google's notice or page in place of a file is refused in words).
+   */
+  const sourceOf = (f: RawFile) => async (): Promise<{ chunks: AsyncIterable<Buffer>; size: number | null }> => {
+    const driveId = apiDriveId(f)
+    if (driveId) {
+      await crmLetsOpen(f)
+      const viaApi = await driveWhole(driveId, f)
+      if (viaApi) return { chunks: viaApi.stream as AsyncIterable<Buffer>, size: viaApi.size }
+      markThroughCrm(cacheKey(f))
+    }
+    let r: Response
+    try {
+      r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/raw`)
+    } catch (e) {
+      if ((e as Error)?.name === 'CrmNotSignedIn') throw new CrmFilesError(409, 'crm-signin', CRM_FILES_REASONS.signedOut)
+      throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
+    }
+    if (!r.ok || !r.body) throw await refusal(r, 'this file')
+    const len = Number(r.headers.get('content-length'))
+    return { chunks: crmChunks(r.body, f), size: r.headers.has('content-length') && Number.isSafeInteger(len) && len >= 0 ? len : f.fileSize }
+  }
   const pause = (ms: number) => new Promise(r => setTimeout(r, ms))
 
   /**
@@ -1133,7 +1304,11 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       await more(2048)
       if (!/html/i.test(f.fileType ?? '') && /^\s*(?:<!doctype html|<html)/i.test(Buffer.concat(head).subarray(0, 512).toString('latin1'))) {
         await more(256 * 1024)
-        if (SCAN_NOTICE.test(Buffer.concat(head).toString('utf8'))) throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.scanPage)
+        const page = Buffer.concat(head).toString('utf8')
+        if (SCAN_NOTICE.test(page)) throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.scanPage)
+        // o4fb7: any other page of Google's (a preview, a sign-in, a limit) for a file that is not a web page itself: refused, never handed on as the file
+        // (a 5.9 MB .pptx came as 1.1 MB of Google's HTML on 14 Nov). A file whose own name says it is a web page is passed on as it is.
+        if (!/\.(?:html?|xhtml|svg|xml)$/i.test(f.fileName) && /google/i.test(page)) throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.googlePage)
       }
       if (headLen) yield Buffer.concat(head)
       if (!ended) yield* chunks
@@ -1334,6 +1509,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   async function refreshed(id: string): Promise<CrmNode> {
     snap = null
+    gen++
     return nodeOf(id)
   }
 
@@ -1504,6 +1680,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     },
     pinTree,
     syncTree,
+    generation: () => gen,
     ignore: spool
       ? {
           rules,
@@ -1562,9 +1739,24 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     async file(id) {
       const g = id.startsWith('gone:readme:') || id.startsWith('kept:') ? goneFile(id) : null
       if (g) return { stream: g.path ? createReadStream(g.path) : Readable.from([g.bytes ?? Buffer.alloc(0)]), size: g.node.size ?? 0, type: g.node.type ?? 'application/octet-stream', name: g.node.name }
-      // The CRM's own list for this account says which file this is (findFile); o813f: one over 100 MB that it keeps in Google Drive comes through Google's Drive API, once the CRM
-      // has said yes for this very file.
+      // The CRM's own list for this account says which file this is (findFile); o813f / o048b: one it keeps in Google Drive comes through Google's Drive API, once the CRM has said
+      // yes for this very file.
       const { f } = await findFile(id)
+      // o4fb7: a file opened before (this very version) comes from this PC's disk; one opened now is kept while it streams (one download, however many read it at once).
+      if (cacheable(f)) {
+        const key = cacheKey(f)
+        const type = f.fileType && f.fileType !== 'application/octet-stream' ? f.fileType : driveType(f.fileName).type
+        const kept = o.bytes!.get(key)
+        if (kept) return { stream: createReadStream(kept.path), size: kept.size, type, name: f.fileName }
+        const filling = o.bytes!.fill(key, sourceOf(f))
+        try {
+          await filling.started
+          const stream = o.bytes!.stream(key)
+          if (stream) return { stream, size: filling.size() ?? f.fileSize, type, name: f.fileName }
+        } catch (e) {
+          if (!tooBigToKeep(e)) throw e
+        }
+      }
       const driveId = apiDriveId(f)
       if (driveId) {
         await crmLetsOpen(f)
@@ -1620,12 +1812,47 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         if (kept) return kept
         throw e
       }
-      // o813f: a file over 100 MB that the CRM keeps in Google Drive: one ranged request to Google's Drive API, once the CRM has said yes for this very file.
+      // o813f / o048b: a file the CRM keeps in Google Drive is read through Google's Drive API (ranged requests, or one whole download below), once the CRM has said yes for this
+      // very file.
       const driveId = length > 0 ? apiDriveId(f) : null
+      // o4fb7: the bytes cache. A file kept from before (this very version) is read from the disk at once. Otherwise the whole file is fetched ONCE into the cache and every range
+      // is read from it as soon as its bytes are there (the in-app drive reads in 4 MiB ranges): always for a file through the CRM's own download, which ignores a range and sent
+      // the whole file for each (a 40 MB file was fetched ten times); o048b: for a file through the API up to WHOLE_DOWNLOAD_UPTO (or of unknown size). A bigger one is read
+      // range by range (o813f) unless a whole read is already bringing it in, and a range far past what a download has brought gets its own ranged request at once.
+      let waitForDownload: (() => Promise<Buffer | null>) | null = null
+      if (length > 0 && cacheable(f)) {
+        const bytes = o.bytes!
+        const key = cacheKey(f)
+        let fromCache = bytes.get(key) !== null
+        if (!fromCache) {
+          let filling = bytes.going(key)
+          if (!filling && (!driveId || f.fileSize === null || f.fileSize <= WHOLE_DOWNLOAD_UPTO)) filling = bytes.fill(key, sourceOf(f))
+          if (filling) {
+            try {
+              await filling.started
+              fromCache = !driveId || throughCrm.has(key) || start <= filling.written() + AHEAD_BYTES
+              // A range far ahead is asked of the API below; should the API not give it, it waits for this download after all.
+              if (!fromCache) waitForDownload = () => bytes.read(key, start, length)
+            } catch (e) {
+              if (!tooBigToKeep(e)) {
+                const kept = await fromKeptCopy()
+                if (kept) return kept
+                throw e
+              }
+            }
+          }
+        }
+        if (fromCache) {
+          const b = await bytes.read(key, start, length)
+          if (b) return b
+        }
+      }
       if (driveId) {
         await crmLetsOpen(f)
         const viaApi = await drivePart(driveId, start, length)
         if (viaApi) return viaApi
+        const fromDownload = await waitForDownload?.()
+        if (fromDownload) return fromDownload
       }
       let r: Response
       try {

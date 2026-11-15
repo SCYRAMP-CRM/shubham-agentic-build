@@ -276,6 +276,9 @@ export function createFastSession(deps: FastDeps): FastSession {
         const st = host.state()
         if (st === 'paused' || st === 'unavailable') return send(c, { t: 'error', id: f.id, status: 503, message: host.status().reason ?? 'The Assistant is not available right now.' })
         c.asks.push(t)
+        // o0de2: one line for each ask taken, never its words: the log can tell "the page never asked" from "it asked and the process never
+        // answered" (14 Nov's live talk left no line until a turn ended, so neither could be told).
+        deps.log?.info(`fast Assistant: ask ${f.id} from ${who(c)} (${f.via}, ${f.text.length} characters${f.heard ? `, ${f.heard.length} heard` : ''})`)
         // No process yet (it idled out, or the start is still going): it is woken, and this ask waits for it rather than being refused.
         if (st === 'off' && !c.opening) void open(c)
         // A new ask cuts the old one off (the host ends it with done {cancelled}).

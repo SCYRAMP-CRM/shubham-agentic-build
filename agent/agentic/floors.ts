@@ -86,7 +86,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     homePc: typeof a.homePc === 'string' && a.homePc.trim() ? a.homePc.trim().slice(0, 64) : null,
     homePcName: typeof a.homePc === 'string' && a.homePc.trim() && typeof a.homePcName === 'string' && a.homePcName.trim() ? a.homePcName.trim().slice(0, NAME_MAX) : null,
     // F-086: the hub's own mark (see ensureDuty); a page can neither set nor clear it (patch() puts the old one back).
-    duty: a.duty === 'orchestrator' ? 'orchestrator' : null,
+    duty: a.duty === 'orchestrator' || a.duty === 'person-assistant' ? a.duty : null,
     model: isModel(a.model) ? a.model : '',
     effort: isEffort(a.effort) ? a.effort : '',
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
@@ -233,8 +233,25 @@ export interface FloorStore {
   setCodexThread(floorId: string, agentId: string, thread: string | null): Floor
   /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
   setHome(floorId: string, agentId: string, home: { id: string; name: string } | null): Floor
+  /** F-162 slice B: sets a person's own Assistant's duty ('person-assistant') on its boss. Only own-assistant.ts calls this, never a page. */
+  setPersonAssistantDuty(floorId: string, agentId: string): Floor
   /** The floor and agent a chat belongs to: how a tool call knows who is calling. */
   bySession(sessionId: string): { floor: Floor; agent: FloorAgent } | null
+  /**
+   * Order o7e6d S1 (Agent 3's H1): what this store's load found, read only, as copies: its file missing, a corrupt one set aside (the store
+   * started empty), a shape it does not read (kept as it is, read as empty), the floors quarantined at load and every session of theirs.
+   * Nothing here hydrates, repairs, validates, commits or writes anything; a store made from a seed reports nothing.
+   */
+  loadStatus(): FloorLoadStatus
+}
+
+/** Order o7e6d S1 (H1): FloorStore.loadStatus. */
+export interface FloorLoadStatus {
+  missing: boolean
+  corrupt: boolean
+  unsupported: boolean
+  quarantinedFloors: string[]
+  quarantinedSessions: string[]
 }
 
 /**
@@ -337,6 +354,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
   const executionDefaults = () => opts.executionDefaults?.() ?? { engine: defaultEngine() }
   const quarantined = new Set<string>(), quarantinedSessions = new Set<string>()
   let privateCommits: PrivateExecutionCommit[] = [], metadataUnsupported = false, writeUncertain = false
+  /** Order o7e6d S1 (H1): what load() found (loadStatus reports it; nothing reads it to decide anything here). Set before load() runs. */
+  const loadFacts = { missing: false, corrupt: false, unsupported: false }
   let floors: Floor[] = opts.seed ? clone(opts.seed) : load()
   // F-086: the migration runs at the start; what it changed is written with the next change at the latest (and at once if it can be).
   if (!quarantined.size && !metadataUnsupported && ensureDuty(floors) && !opts.readOnly) {
@@ -352,15 +371,20 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     try {
       text = readFileSync(file, 'utf8')
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        loadFacts.missing = true
+        return []
+      }
       throw e
     }
     let data: unknown
     try { data = JSON.parse(text) } catch {
+      loadFacts.corrupt = true
       renameSync(file, `${file}.corrupt-${Date.now()}`)
       return []
     }
     // Unsupported schema/profile is not corrupt JSON. Preserve every original byte; never erase/default it.
+    if (!(isObject(data) && Array.isArray(data.floors))) loadFacts.unsupported = true
     const list = isObject(data) && Array.isArray(data.floors) ? data.floors : []
     const loaded: Floor[] = []
     for (const raw of list) {
@@ -895,6 +919,18 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       return clone(find(floorId))
     },
 
+    setPersonAssistantDuty(floorId, agentId) {
+      assertWritable()
+      const floor = find(floorId)
+      const agent = agentOf(floor, agentId)
+      if (!agent.owner?.id) throw apiError(409, 'Only a person\'s own Assistant takes this duty.')
+      if (agent.duty === 'person-assistant') return clone(floor)
+      agent.duty = 'person-assistant'
+      floor.updatedAt = now()
+      save()
+      return clone(floor)
+    },
+
     setHome(floorId, agentId, home) {
       assertWritable()
       const floor = find(floorId)
@@ -920,5 +956,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       }
       return null
     },
+
+    loadStatus: () => ({ ...loadFacts, quarantinedFloors: [...quarantined], quarantinedSessions: [...quarantinedSessions] }),
   }
 }

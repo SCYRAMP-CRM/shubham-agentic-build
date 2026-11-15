@@ -7,7 +7,7 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { IDENTITY_MS, listProcesses, type Proc } from '../proc-tree.ts'
 import { pcmMs, pcmToWav } from './wav.ts'
-import { clean, promptFor, whisperLang } from './words.ts'
+import { cleanWords, promptFor, whisperLang } from './words.ts'
 
 // F-080: Whisper on this PC, through whisper.cpp's own server program (ggml-org's official Windows
 // build), kept OUTSIDE the app and outside git: %LOCALAPPDATA%\shubham-agentic\speech-bin\whisper\Release
@@ -68,6 +68,11 @@ export interface Transcript {
   text: string
   /** What Whisper said before cleaning. */
   raw: string
+  /**
+   * o0de2 round 3: all of what Whisper said was one of its known inventions on silence or noise ("Thank you.", "you", "[BLANK_AUDIO]"), so
+   * the text is empty: this is what it was (words.ts cleanWords). Left out otherwise.
+   */
+  dropped?: string
   /** Audio length and time taken, ms. */
   audioMs: number
   ms: number
@@ -355,7 +360,8 @@ export function createEngine(d: EngineDeps = {}): Engine {
     const j = (await r.json().catch(() => ({}))) as { text?: unknown; error?: unknown }
     if (typeof j.text !== 'string') throw SpeechError(`Whisper gave no text${typeof j.error === 'string' ? `: ${j.error}` : ''}`, 502)
     touch()
-    return { text: clean(j.text), raw: j.text, audioMs: pcmMs(pcm), ms: now() - t0 }
+    const c = cleanWords(j.text)
+    return { text: c.text, raw: j.text, ...(c.dropped ? { dropped: c.dropped } : {}), audioMs: pcmMs(pcm), ms: now() - t0 }
   }
 
   return {
@@ -373,10 +379,13 @@ export function createEngine(d: EngineDeps = {}): Engine {
       }
       if (pcm.length < 3200) return Promise.resolve({ text: '', raw: '', audioMs, ms: 0 }) // < 0.1 s
       // F-221: one line per job, numbers only (never the words): how long it waited (the queue, and a load), how long Whisper ran, whether it
-      // was a guess, dropped before it started (its page went away), or written for a page that had gone by then.
+      // was a guess, dropped before it started (its page went away), or written for a page that had gone by then. o0de2: also the language it
+      // was asked for (auto: Whisper detects it first) and how many characters of words came back (0: Whisper heard none, or never ran), so a
+      // "nothing happens" can be told from the log: no words, or words the page never asked.
       const yn = (b: boolean | undefined) => (b ? 'yes' : 'no')
-      const note = (wait: number, run: number, f: { dropped?: boolean; closed?: boolean; failed?: boolean } = {}) =>
-        log?.info(`speech: whisper job audio=${audioMs}ms wait=${Math.max(0, wait)}ms run=${Math.max(0, run)}ms guess=${yn(o.guess)} dropped=${yn(f.dropped)} closed=${yn(f.closed)} failed=${yn(f.failed)}`)
+      const lang = whisperLang(o.lang)
+      const note = (wait: number, run: number, f: { dropped?: boolean; closed?: boolean; failed?: boolean } = {}, chars = 0) =>
+        log?.info(`speech: whisper job audio=${audioMs}ms wait=${Math.max(0, wait)}ms run=${Math.max(0, run)}ms guess=${yn(o.guess)} dropped=${yn(f.dropped)} closed=${yn(f.closed)} failed=${yn(f.failed)} lang=${lang} chars=${chars}`)
       const dropped = () => SpeechError('The page went away before Whisper started on it', 499)
       const { signal } = job
       const asked = now()
@@ -417,7 +426,7 @@ export function createEngine(d: EngineDeps = {}): Engine {
         const t = now()
         try {
           const r = await infer(pcm, o)
-          note(now() - asked - r.ms, r.ms, { closed: signal?.aborted })
+          note(now() - asked - r.ms, r.ms, { closed: signal?.aborted }, r.text.length)
           return r
         } catch (e) {
           note(t - asked, now() - t, { closed: signal?.aborted, failed: true })

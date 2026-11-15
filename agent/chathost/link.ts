@@ -66,7 +66,9 @@ export function adoptable(c: HostChat) {
       managed = { execution, bridgeRunId: c.meta.bridgeRunId }
     } catch { return null }
   }
-  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows, engine: c.meta.engine === 'codex' ? ('codex' as const) : ('claude' as const), ...(managed ?? {}) }
+  // Order o7e6d: the policy the chat was started under, as the host kept it (any value, even a wrong type, is passed on: the pool then refuses it).
+  const policy = Object.hasOwn(c.meta, 'policy') ? (typeof c.meta.policy === 'string' ? c.meta.policy : 'unknown') : undefined
+  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows, engine: c.meta.engine === 'codex' ? ('codex' as const) : ('claude' as const), ...(managed ?? {}), ...(policy !== undefined ? { policy } : {}) }
 }
 
 export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {

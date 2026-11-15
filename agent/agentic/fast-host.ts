@@ -76,6 +76,8 @@ export interface BriefContext {
 
 export interface FastDeps {
   now(): number
+  /** Usage (agent/usage): each turn's cumulative cost for this claude process. The totals only: no text, no token. Optional. */
+  onCost?(r: { launchId: string; sessionId: string; totalCostUsd: number; at: number }): void
   spawn(file: string, args: string[], o: { cwd: string; env: NodeJS.ProcessEnv }): ChildProcess
   /** The claude command: [file, ...leading args], or null when it is not installed. */
   claude(): string[] | null
@@ -569,6 +571,8 @@ export function createFastHost(deps: FastDeps): FastHost {
       p.lastCost = total
       costUsd += cost
     }
+    // Usage: the process's running total (cumulative), once per turn that reports one.
+    if (Number.isFinite(total)) deps.onCost?.({ launchId: p.initId, sessionId: p.sid, totalCostUsd: total, at: deps.now() })
     const ms = Number.isFinite(Number(m.duration_ms)) ? Number(m.duration_ms) : undefined
     p.blocks = new Map()
     p.msgStreamed = false

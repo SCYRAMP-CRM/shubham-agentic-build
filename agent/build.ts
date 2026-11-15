@@ -73,6 +73,14 @@ export interface ChatHostGate {
   retire(): Promise<void>
 }
 
+/**
+ * Order o7e6d S1 (Lead's GO for the Update guard): what holds an Update on this PC now, read only. Each string is one reason, in words; an empty
+ * list: nothing holds it. It only answers: it never clears, changes, bypasses or retries anything, and it starts nothing.
+ */
+export interface UpdateGuard {
+  blockers(): string[]
+}
+
 export interface BuildOptions {
   /** The folder this agent runs from (the repo or build root). */
   root: string
@@ -89,6 +97,13 @@ export interface BuildOptions {
   publishCommand?: (devDir: string, req: PublishRequest) => { file: string; args: string[] }
   /** F-075: set once the agent runs its chats in the chat host. */
   chatHostGate?: { current: ChatHostGate | null }
+  /**
+   * Order o7e6d S1: asked when an Update is pressed (or the automatic one commits), before anything else it does, and again at each later step
+   * before anything more is cut: at each look of its wait for busy chats, after the automatic update's quiet wait, right before the chat host
+   * is retired, right after, and right before the restart. Supplied (main.ts supplies it from the start), a holder whose `current` is still null
+   * holds every Update ('the update guard is not ready'); left out (a caller that does not integrate it), nothing is asked, as before.
+   */
+  updateGuard?: { current: UpdateGuard | null }
   /** Tests: how long an update waits for idle chats before it asks (10 min), and how often it looks (5 s). */
   hostWaitMs?: number
   hostPollMs?: number
@@ -390,10 +405,50 @@ export function createBuild(o: BuildOptions): Build {
     }
   }
 
+  /**
+   * Order o7e6d S1: why an Update can't go now (empty: nothing holds it). Fail closed: a supplied holder with no guard in it yet, a guard that
+   * throws, and an answer that is not a list of words all hold it. No holder supplied at all: nothing is asked (as before).
+   */
+  function heldBy(): string[] {
+    const holder = o.updateGuard
+    if (!holder) return []
+    const guard = holder.current
+    if (!guard) return ['the update guard is not ready']
+    let answer: unknown
+    try {
+      answer = guard.blockers()
+    } catch {
+      return ['the update guard could not answer']
+    }
+    if (!Array.isArray(answer) || !answer.every(x => typeof x === 'string' && x.trim() !== '')) return ['the update guard gave an answer it does not understand']
+    return answer as string[]
+  }
+
+  /** Order o7e6d S1: the wait for busy chats ends because the Update is held now: no timer is left, and nothing goes later by itself. */
+  function stopWaiting(why: string[]) {
+    if (hostTimer) clearInterval(hostTimer)
+    hostTimer = null
+    hostWait = null
+    log?.warn(`updating: held while it waited for the chats, so the update stops here and nothing was cut; press Update again once nothing holds it: ${why.join('; ')}`)
+  }
+
   function go(retire: ChatHostGate | null, strict = false, hold?: UpdateHold) {
     if (hostTimer) clearInterval(hostTimer)
     hostTimer = null
     hostWait = null
+    /**
+     * Order o7e6d S1: is the update held at this step? Then it stops here for good: nothing after this step is done, and it is never resumed by
+     * itself (a new press, or the automatic update's next look, starts again from the beginning); the automatic update hears why (onAbort). Not
+     * atomic: a hold found after the chat host was retired can't undo that (its chats were saved and ended, and come back resumed at the next
+     * start of the app); only what is still to come (the restart) is not done.
+     */
+    const heldAt = (step: string): boolean => {
+      const why = heldBy()
+      if (!why.length) return false
+      log?.warn(`updating: held ${step}, so the update stops here: ${why.join('; ')}`)
+      hold?.onAbort(`the update is held (${why.join('; ')})`)
+      return true
+    }
     // Answer first; then go, and Start.cmd (or the guard) takes it from here.
     void (async () => {
       if (hold) {
@@ -403,8 +458,10 @@ export function createBuild(o: BuildOptions): Build {
           log?.warn(`updating: the automatic update stops here, the app was not quiet: ${why}`)
           return hold.onAbort(why)
         }
+        if (heldAt('after its last look')) return
       }
       if (retire) {
+        if (heldAt('before the chat host was retired (nothing was cut)')) return
         try {
           log?.info('updating: the chat host changes with this build; its chats are saved and ended, and come back resumed')
           await retire.retire()
@@ -416,15 +473,32 @@ export function createBuild(o: BuildOptions): Build {
             return hold?.onAbort('the chat host could not be retired')
           }
         }
+        if (heldAt('after the chat host\'s retire (its chats may already be saved and ended; they come back resumed at the next start; the app is not restarted)')) return
       }
       // An automatic update has no answer to send first: it restarts at once, so the window after the last look stays as short as it can.
-      if (hold) return o.restart(UPDATE_EXIT_CODE)
-      setTimeout(() => o.restart(UPDATE_EXIT_CODE), 300).unref()
-    })()
+      if (hold) {
+        if (heldAt('right before the restart')) return
+        return o.restart(UPDATE_EXIT_CODE)
+      }
+      setTimeout(() => {
+        try {
+          if (heldAt('right before the restart')) return
+          o.restart(UPDATE_EXIT_CODE)
+        } catch (e) {
+          log?.warn(`updating: the restart failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }, 300).unref()
+    })().catch((e: unknown) => log?.warn(`updating: stopped by an error, nothing more was done: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   function startUpdate(body?: unknown, via: UpdatePermit['via'] = 'admin', hold?: UpdateHold) {
     if (!update.can) throw apiError(409, update.cannot ?? "This PC can't update itself")
+    // Order o7e6d S1: before force, the wait for busy chats, the chat host or the restart: nothing has been started or cut yet. Force never passes it.
+    const holding = heldBy()
+    if (holding.length) {
+      log?.warn(`updating: held, nothing was started: ${holding.join('; ')}`)
+      throw Object.assign(apiError(409, `The update is held: ${holding.join('; ')}.`), { code: 'update-held' })
+    }
     const g = o.chatHostGate?.current ?? null
     const force = via === 'admin' && isObject(body) && body.force === true
     if (via === 'auto') {
@@ -442,12 +516,21 @@ export function createBuild(o: BuildOptions): Build {
           hostWait = { since: Date.now(), ask: false }
           log?.info(`updating: the chat host changes with this build and ${g.busy()} chat(s) are busy; waiting for them to be idle`)
           hostTimer = setInterval(() => {
-            const gate = o.chatHostGate?.current
-            if (!hostWait || !gate) return
-            if (gate.busy() === 0) return go(gate)
-            if (!hostWait.ask && Date.now() - hostWait.since >= (o.hostWaitMs ?? 10 * 60_000)) {
-              hostWait.ask = true
-              log?.info('updating: the chats are still busy after the wait; asking on the Build page')
+            try {
+              if (!hostWait) return
+              // Order o7e6d S1: held while it waits: the wait ends here for good (never resumed by itself); the person presses Update again.
+              const late = heldBy()
+              if (late.length) return stopWaiting(late)
+              const gate = o.chatHostGate?.current
+              if (!gate) return
+              if (gate.busy() === 0) return go(gate)
+              if (!hostWait.ask && Date.now() - hostWait.since >= (o.hostWaitMs ?? 10 * 60_000)) {
+                hostWait.ask = true
+                log?.info('updating: the chats are still busy after the wait; asking on the Build page')
+              }
+            } catch (e) {
+              // Never a throw out of a timer (it would end the app): the wait stops, nothing is cut.
+              stopWaiting([`its look failed: ${e instanceof Error ? e.message : String(e)}`])
             }
           }, o.hostPollMs ?? 5000)
           hostTimer.unref()

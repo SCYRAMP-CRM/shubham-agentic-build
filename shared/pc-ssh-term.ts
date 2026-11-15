@@ -9,6 +9,11 @@
  * - Only to the tailnet: the host is a Tailscale address (100.64.0.0/10) or name (*.ts.net); the user a plain login name. ssh asks Shubham himself to
  *   confirm a PC's key the first time (the page shows the key the Server already knows for that PC, to compare).
  * - The session ends when the page closes it (or the tab, or the sign-in ends); the ssh process is ended then by its own handle (exact PID).
+ *
+ * Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): his Assistant reads
+ * and types in these sessions too (the MCP tools ssh_open / ssh_read / ssh_type / ssh_close; shared/ssh-assist.ts holds the safety rules). A session
+ * the Assistant opened lives on the Server (no page needed) until it is closed, he ends it, or nobody types in it for 30 minutes; his SSH tab lists
+ * it and shows it live ({attach} below). What the Assistant may not type waits as an "ask" card on that page for his own tap.
  */
 import { cleanTailnetIp, cleanTailnetName } from './pc-ports.ts'
 
@@ -31,21 +36,65 @@ export interface SshTargetAnswer {
   from: 'saved' | 'guess' | null
 }
 
-/** POST /pc-ssh/pcs/<id>/session: a one-use ticket for the terminal socket, and the host keys the Server already knows for that address. */
+/**
+ * POST /pc-ssh/pcs/<id>/session {user, host, port} (a new session) or {attach: <session id>} (show one that is open, like the Assistant's): a one-use
+ * ticket for the terminal socket, the session's id, and the host keys the Server already knows for that address.
+ */
 export interface SshSessionAnswer {
   ticket: string
   expiresAt: string
   target: SshTarget
+  /** Order o68f0: the session this ticket opens or shows. */
+  session: string
   /** Fingerprints the Server's known_hosts has for this host and port ("SHA256:…"); [] = ssh will ask to confirm the PC's key. */
   knownForPort: string[]
   /** Fingerprints it has for the same host on port 22 (often the same key): what to compare ssh's question with. */
   knownForHost: string[]
 }
 
-/** The page → the agent, text frames: keys, and the terminal's size. */
-export type SshTermClientMessage = { t: 'in'; d: string } | { t: 'size'; cols: number; rows: number }
-/** The agent → the page: what ssh printed; and once, when it ends, why. */
-export type SshTermServerMessage = { t: 'out'; d: string } | { t: 'exit'; code: number | null; reason: string }
+/** Order o68f0: an ask card: a command of the Assistant's that waits for the person's own tap (it deletes recursively, shuts down...). */
+export interface SshAsk {
+  id: string
+  /** The command, as it would be typed. */
+  text: string
+  /** Why it waits ("deletes files and folders recursively"). */
+  why: string
+  expiresAt: string
+  state: 'waiting' | 'ran' | 'declined' | 'expired' | 'refused'
+}
+
+/** Order o68f0: GET /pc-ssh/pcs/<id>/sessions: the open sessions to that PC the caller may see (the Assistant's among them). */
+export interface SshOpenSession {
+  id: string
+  /** Who opened it: the page (his own Open terminal) or the Assistant. */
+  by: 'page' | 'assistant'
+  line: string
+  startedAt: string
+  /** How many pages show it now. */
+  viewers: number
+  asks: SshAsk[]
+}
+
+/** The page → the agent, text frames: keys, the terminal's size; order o68f0: his answer to an ask card, and ending the session. */
+export type SshTermClientMessage =
+  | { t: 'in'; d: string }
+  | { t: 'size'; cols: number; rows: number }
+  | { t: 'answer'; id: string; yes: boolean }
+  | { t: 'close' }
+  /** Order o68f0, slice 2: the Assistant typing through the screen (ui_control on ref s1): one line or one key, by ssh_type's rules. */
+  | { t: 'assist'; id: string; text?: string; enter?: boolean; key?: string }
+/**
+ * The agent → the page: what ssh printed; and once, when it ends, why. Order o68f0: an ask card and its outcome, and a note when the Assistant typed
+ * (never what it typed: its echo is on the screen anyway).
+ */
+export type SshTermServerMessage =
+  | { t: 'out'; d: string }
+  | { t: 'exit'; code: number | null; reason: string }
+  | { t: 'ask'; ask: SshAsk }
+  | { t: 'asked'; id: string; state: SshAsk['state'] }
+  | { t: 'note'; by: 'assistant'; what: string }
+  /** Order o68f0, slice 2: what came of an 'assist' (the session's words), or why it was refused. */
+  | { t: 'assisted'; id: string; ok: boolean; words?: string; error?: string }
 
 /** A login name ssh takes as one argument and never as an option: starts with a letter or digit; letters, digits, . _ - only. */
 export const cleanLogin = (v: unknown): string | null => (typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? v : null)

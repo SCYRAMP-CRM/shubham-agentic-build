@@ -1,6 +1,7 @@
-﻿import type { IncomingMessage, ServerResponse } from 'node:http'
+﻿import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
+import type { Caller } from '../auth/types.ts'
 import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmRemovedProject, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 import type { CrmUploads } from './uploads.ts'
@@ -170,9 +171,22 @@ function spoolOf(svc: CrmFilesService): CrmSpool {
   return { entries: svc.spool?.list() ?? [], dir: svc.spool?.dir ?? '' }
 }
 
-export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads, sync?: LocalSync): ApiMount {
+/** Order oc186 (slice 2): a signed-in person who is not the owner gets their own CRM files service (theirs alone; see crm-files/index.ts). */
+export interface CrmFilesStaff {
+  serviceFor(caller: Caller, headers: IncomingHttpHeaders): CrmFilesService | null
+}
+
+/**
+ * Order oc186 (slice 2): what a signed-in person who is not the owner may ask: the CRM's own files, changed with THEIR CRM session (the CRM decides).
+ * Everything that is this PC's own (the drive, auto-mount, the waiting copies, the copies kept here, the uploads and their folder, the synced folder) is the owner's.
+ */
+const STAFF_NAMES = new Set(['status', 'children', 'search', 'node', 'file', 'versions', 'upload', 'version', 'folder', 'rename', 'move'])
+
+export function crmFilesMount(pcSvc: CrmFilesService, uploads?: CrmUploads, sync?: LocalSync, staff?: CrmFilesStaff): ApiMount {
   return {
     prefix: CRM_FILES_PREFIX,
+    // Order oc186: open to any signed-in person (api.ts still refuses a logged-out page); the owner-only names are refused in the handler below.
+    scoped: true,
     http: async () => {
       throw Object.assign(new Error('No such CRM files call'), { status: 404 })
     },
@@ -181,11 +195,19 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads, sync?:
       const isUpload = !!uploads && Object.hasOwn(UPLOAD_METHODS, name)
       const allowed = Object.hasOwn(METHODS, name) ? METHODS[name] : isUpload ? UPLOAD_METHODS[name] : undefined
       if (!allowed) return null
-      return async (req, res) => {
+      return async (req, res, caller) => {
         try {
           const method = (req.method ?? 'GET').toUpperCase()
           if (method === 'DELETE') return send(res, 405, { error: CRM_FILES_REASONS.noDelete, code: 'nodelete' satisfies CrmFilesErrorCode })
           if (!allowed.includes(method)) return send(res, 405, { error: `${method} is not allowed on ${name}`, code: 'failed' satisfies CrmFilesErrorCode })
+          // Order oc186: the owner (and the PC's own program) is the PC's files; another signed-in person is their own CRM's, and only for the names in STAFF_NAMES.
+          let svc = pcSvc
+          if (caller?.person && caller.person.canSeeAll !== true) {
+            if (!STAFF_NAMES.has(name)) return send(res, 403, { error: 'This is for the owner of this app.', code: 'admin-only' })
+            const own = staff?.serviceFor(caller, req.headers) ?? null
+            if (!own) return send(res, 401, { error: CRM_FILES_REASONS.signedOut, code: 'crm-signin' satisfies CrmFilesErrorCode })
+            svc = own
+          }
           if (uploads && isUpload) return await uploadRoute(uploads, name, req, res, url)
 
           switch (name) {

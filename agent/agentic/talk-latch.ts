@@ -66,6 +66,8 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   show_media: 'read',
   show_screen: 'read',
   show_crm_file: 'read',
+  // Order o68f0: reading an SSH terminal is a read; opening, typing and closing act on a PC (refused below).
+  ssh_read: 'read',
   // Harmless writes: his notes and the app's memory (a task is never deleted on spoken words: see latchVerdict).
   task_add: 'note',
   task_update: 'note',
@@ -91,6 +93,9 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   app_set_effort: 'refuse',
   agent_hire: 'refuse',
   browser_open: 'refuse',
+  ssh_open: 'refuse',
+  ssh_type: 'refuse',
+  ssh_close: 'refuse',
 }
 
 /** What a held message tells the Orchestrator (his page shows the card with its order). */

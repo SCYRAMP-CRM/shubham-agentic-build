@@ -31,16 +31,25 @@ const INVENTED = [
   /^\s*(?:you|\.+)\s*$/i,
 ]
 
-/** What Whisper said, cleaned: tags and timestamps out, names fixed, inventions dropped (empty string). */
-export function clean(text: string): string {
+/**
+ * What Whisper said, cleaned: tags and timestamps out, names fixed, inventions dropped (empty text). `dropped` (o0de2 round 3): the whole
+ * text was one of the inventions, and this is what it was, so a caller can still tell what was heard: live talk takes a dropped "Thank you."
+ * after an answer as his "thank you" (nothing to answer), not as a turn with no words at all.
+ */
+export function cleanWords(text: string): { text: string; dropped?: string } {
   let t = text
     .replace(/\[\d\d:\d\d[:.\d]*\s*-->\s*\d\d:\d\d[:.\d]*\]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-  if (INVENTED.some(r => r.test(t))) return ''
+  if (INVENTED.some(r => r.test(t))) return { text: '', dropped: t }
   t = t.replace(/\[(?:blank_audio|music|silence|inaudible)\]/gi, ' ').replace(/\s+/g, ' ').trim()
   for (const [r, to] of FIXES) t = t.replace(r, to)
-  return t
+  return { text: t }
+}
+
+/** What Whisper said, cleaned (cleanWords' text). */
+export function clean(text: string): string {
+  return cleanWords(text).text
 }
 
 /** The Whisper language for a BCP-47 tag from Settings (en-IN -> en); 'auto' lets Whisper choose. */

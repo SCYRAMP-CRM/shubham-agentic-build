@@ -3,10 +3,13 @@ import path from 'node:path'
 import {
   FEATURES,
   OWNER_ONLY,
+  choiceKey,
   choiceOpens,
   cleanChoice,
   featureOf,
+  isPcId,
   openTo,
+  perPcKey,
   routeRule,
   type AccessChange,
   type AccessChoice,
@@ -36,8 +39,11 @@ export interface FeatureAccessOptions {
 }
 
 export interface FeatureAccess {
-  /** Whether a feature is open to this caller (the owner: every one). */
-  allows(c: Caller, feature: string): boolean
+  /**
+   * Whether a feature is open to this caller (the owner: every one). Order o68f0: a feature chosen per PC ('pc-ssh') is open on that PC when `pcId`
+   * is given (or the key is '<feature>@<pcId>'), and without it when it is open on at least one PC (what the gate and the menu need).
+   */
+  allows(c: Caller, feature: string, pcId?: string): boolean
   /**
    * Whether this route is open to this caller: the owner always; a signed-in person when the route's feature is open to them (or, for an Agents
    * route, when something is shared with them); false for a route that is no feature's. Callers with no person (the open app, the PC's programs)
@@ -70,10 +76,11 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
       const out: Record<string, AccessChoice> = {}
       if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
         for (const [k, v] of Object.entries((raw as { choices?: unknown }).choices ?? {})) {
-          const f = featureOf(k)
+          // Order o68f0: a per-PC feature's choices are '<key>@<pcId>' (choiceKey reads both kinds).
+          const ck = choiceKey(k)
           const c = cleanChoice(v)
           // A feature that is locked (or no longer exists) is never open, whatever the file says.
-          if (f && !f.locked && c) out[k] = c
+          if (ck && !ck.feature.locked && c) out[k] = c
         }
       }
       return out
@@ -85,11 +92,21 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
 
   const choiceOf = (key: string): AccessChoice => choices[key] ?? OWNER_ONLY
 
-  function allows(c: Caller, feature: string): boolean {
+  function allows(c: Caller, feature: string, pcId?: string): boolean {
     if (!c.person || o.isAdmin(c)) return true
+    const at = feature.indexOf('@')
+    if (at >= 0) return pcId === undefined && allows(c, feature.slice(0, at), feature.slice(at + 1))
     const f = featureOf(feature)
     if (!f || f.locked) return false
-    if (!choiceOpens(choiceOf(f.key), c.person.id)) return false
+    const person = c.person.id
+    if (f.perPc) {
+      // Order o68f0: that PC's own choice; with no PC named, open on at least one.
+      const open =
+        pcId !== undefined
+          ? isPcId(pcId) && choiceOpens(choiceOf(perPcKey(f.key, pcId)), person)
+          : Object.entries(choices).some(([k, ch]) => choiceKey(k)?.feature === f && choiceOpens(ch, person))
+      if (!open) return false
+    } else if (pcId !== undefined || !choiceOpens(choiceOf(f.key), person)) return false
     // A PC control tab needs the PC control page open too.
     return !f.needs || allows(c, f.needs)
   }
@@ -149,15 +166,21 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     const f = typeof b.feature === 'string' ? featureOf(b.feature) : undefined
     if (!f) throw authError(400, 'There is no such feature.', 'not-allowed')
     if (f.locked) throw authError(400, `${f.label} stays yours: ${f.locked}`, 'not-allowed')
+    // Order o68f0: a feature chosen per PC takes the PC ({feature, pcId, choice}); any other takes none.
+    let key = f.key
+    if (f.perPc) {
+      if (!isPcId(b.pcId)) throw authError(400, `${f.label} is chosen for each PC: say which PC.`, 'not-allowed')
+      key = perPcKey(f.key, b.pcId)
+    } else if (b.pcId !== undefined) throw authError(400, `${f.label} is not chosen per PC.`, 'not-allowed')
     const to = cleanChoice(b.choice)
     if (!to) throw authError(400, 'Choose Only me, Chosen people (CRM members) or Everyone signed in.', 'not-allowed')
-    const from = choiceOf(f.key)
+    const from = choiceOf(key)
     const next = { ...choices }
-    if (to.mode === 'owner') delete next[f.key]
-    else next[f.key] = to
+    if (to.mode === 'owner') delete next[key]
+    else next[key] = to
     writeAtomic(file, `${JSON.stringify({ version: 1, choices: next }, null, 2)}\n`, 0o600)
     choices = next
-    const change: AccessChange = { at: new Date(now()).toISOString(), by: { id: c.person!.id, name: c.person!.name || c.person!.username }, feature: f.key, from, to }
+    const change: AccessChange = { at: new Date(now()).toISOString(), by: { id: c.person!.id, name: c.person!.name || c.person!.username }, feature: f.key, ...(f.perPc ? { pcId: b.pcId as string } : {}), from, to }
     try {
       mkdirSync(o.dir, { recursive: true })
       // A log grown past its size starts again beside the old one (kept as access-log.old.jsonl).
@@ -173,7 +196,7 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     } catch (e) {
       o.log?.warn(`the access change could not be logged: ${e instanceof Error ? e.message : String(e)}`)
     }
-    o.log?.info(`access: ${f.key} ${from.mode} -> ${to.mode}${to.mode === 'people' ? ` (${to.people.length} people)` : ''} by ${change.by.name}`)
+    o.log?.info(`access: ${key} ${from.mode} -> ${to.mode}${to.mode === 'people' ? ` (${to.people.length} people)` : ''} by ${change.by.name}`)
     return view(c)
   }
 

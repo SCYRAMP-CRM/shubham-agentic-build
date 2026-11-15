@@ -20,12 +20,14 @@ import type { OpenCodeProvider } from '../../shared/opencode.ts'
 import { openCodeSelection } from '../../shared/opencode.ts'
 import type { OpenCodeCredential } from '../opencode/crm.ts'
 import { freeModel } from '../opencode/free-model.ts'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { createUsage, buildIdOf, type Usage } from '../usage/usage.ts'
+import { claudeConfigDir, ownStatusLineCommand } from '../usage/own-status-line.ts'
 import {
   AGENTIC_PREFIX,
   AGENTS_OFF_STATUS,
@@ -33,6 +35,7 @@ import {
   AGENT_MODELS,
   HOME_OFFLINE_STATUS,
   isOrchestratorAgent,
+  isPersonAssistant,
   AGENT_ULTRACODES,
   NO_DEFAULTS,
   type AgentEffort,
@@ -75,7 +78,7 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
-import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type PtySpawn, type StartChat } from './chats.ts'
+import { createChatPool, findClaude, type ChatInfo, type ChatPool, type ChatPoolOptions, type PtySpawn, type StartChat } from './chats.ts'
 import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
@@ -124,6 +127,10 @@ import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from './floors.ts'
+import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
+import { appCommand, STAFF_OWNER_RE, STAFF_POLICY, STAFF_TOOLS, STAFF_TOOLS_STAMP, staffBrief, staffMcpConfig, staffSettings, staffToolAllowed, staffUsageEnv } from './staff-policy.ts'
+import { staffMayScreen } from '../../shared/staff-screen.ts'
+import { createFenceStore } from './staff-fence.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
 import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexEffort, type CodexStatus } from '../../shared/codex.ts'
 import type { CodexManager } from '../codex/index.ts'
@@ -183,6 +190,8 @@ import { createBrowserHost } from '../browser/host.ts'
 import { browserMount } from '../browser/mount.ts'
 import { BROWSER_PRIVATE_NOTE } from '../../shared/browser.ts'
 import { phoneAnswer } from '../../shared/phone-private.ts'
+import { sshAnswer } from '../../shared/ssh-assist.ts'
+import { sshWords, type SshAssist } from '../pc-ssh-term.ts'
 import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
@@ -275,6 +284,11 @@ const NEEDS_SERVER = new Set([
   // Order o528e: the CRM files, through the Server's own CRM sign-in, shown by the Server.
   'crm_files',
   'show_crm_file',
+  // Order o68f0: the SSH terminals run on the Server (its ssh client and key).
+  'ssh_open',
+  'ssh_read',
+  'ssh_type',
+  'ssh_close',
   // Order o5dc4: the Browser runs on the Server.
   'browser_open',
   'browser_read',
@@ -370,6 +384,8 @@ export interface AgenticOptions {
   featureAccess?: FeatureAccess
   /** Canonical self + registered devices, including offline devices. Never starts chats. */
   pcControlDevices?: () => Array<{ id: string; name: string; online: boolean }>
+  /** Order o68f0: the Server's SSH terminals for the overlay Assistant (pc-ssh-term.ts SshAssist); null where there are none (a member, tests). */
+  ssh?: () => SshAssist | null
   /** <state>/agent/agentic */
   dir: string
   /** F-134: Codex on this PC (the CRM's Codex login, the home, the chats). Left out (tests, older callers): agents set to Codex are refused with a plain sentence. */
@@ -525,6 +541,12 @@ export interface Agentic {
   routeKeys(): string[]
   /** Separately audited profile routes: explicit per-chat owner rules live in this module. */
   executionRouteKeys(): string[]
+  /**
+   * Order o7e6d (H2): every staff Assistant run that is not safe (here without the staff policy, here with an unknown one, or on another PC).
+   * Read only. An activation preflight: it must be empty before staff access is switched on. (No HTTP route yet: the route table's rules are
+   * Agent 7's access.ts.)
+   */
+  staffPreflight(): { sessionId: string; floor: string; agent: string; pc: string; why: StaffUnsafe }[]
   /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
   serve(meta: Record<string, unknown>): (stream: Duplex) => void
   /**
@@ -544,6 +566,12 @@ export interface Agentic {
   resumeChat(sessionId: string, text?: string): Promise<boolean>
   /** F-075: chats in the middle of something (running or asking) on this PC. */
   busyChats(): number
+  /**
+   * Order o7e6d S1 (Lead's GO for the Update guard): what holds an Update of this PC now, in words; empty: nothing. Read only. The staff fence
+   * record's own problems (bad, a write that may not have landed, a fence held only in memory): an Update would end and reopen chats with
+   * nothing sound on disk to say which runs are fenced. Only a person clears them (GET /staff/preflight names them).
+   */
+  updateBlockers(): string[]
   /**
    * F-173a: what the automatic update looks at, read-only (nothing here starts, stops or types anything). Each one may throw:
    * the coordinator treats that as unknown and not quiet.
@@ -634,6 +662,43 @@ interface Replica {
   marks: Record<string, FileMark>
 }
 
+/**
+ * Order o7e6d: why a run (or the fence record) is not safe: an activation blocker (staffPreflight). 'no-policy': a staff Assistant's run without
+ * the staff policy (bound to one now, or started for one); 'unknown-policy'; 'origin-unknown': where it came from is not proven ordinary (S1
+ * lineage); 'fenced': on record from an earlier finding; 'fence-closed': fenced because the fence record can't be trusted (F1); 'other-pc'.
+ */
+export type StaffUnsafe = 'no-policy' | 'unknown-policy' | 'origin-unknown' | 'fenced' | 'fence-closed' | 'other-pc' | 'fence-store-bad' | 'fence-store-dirty' | 'fence-not-durable'
+
+/**
+ * Order o7e6d S1 (Agent 3's M3): the Server's own class of one of its agents, judged with the Server's sign-in: 'staff' (a person's own
+ * Assistant whose person is not an administrator), 'admin' (an administrator's), 'other'. Sent to the members in the state frame, PC link only.
+ */
+export type StaffClass = 'staff' | 'admin' | 'other'
+const STAFF_CLASSES: readonly string[] = ['staff', 'admin', 'other']
+/** One key per (floor, agent): agent ids are a page's to choose, so never joined by a character they could hold. */
+const classKey = (floorId: string, agentId: string) => JSON.stringify([floorId, agentId])
+/** The classes a state frame carries: a list of [floor id, agent id, class]; anything else (none, an older Server, one bad row): null. */
+export function parseStaffClasses(raw: unknown): Map<string, StaffClass> | null {
+  if (!Array.isArray(raw)) return null
+  const out = new Map<string, StaffClass>()
+  for (const row of raw) {
+    if (!Array.isArray(row) || row.length !== 3 || typeof row[0] !== 'string' || typeof row[1] !== 'string' || typeof row[2] !== 'string' || !STAFF_CLASSES.includes(row[2])) return null
+    out.set(classKey(row[0], row[1]), row[2] as StaffClass)
+  }
+  return out
+}
+/** Floors a member can take from a state frame: a list of objects, each with an id and a list of agents that each have an id. */
+const wellFormedFloors = (v: unknown): v is Floor[] =>
+  Array.isArray(v) && v.every(f => typeof f === 'object' && f !== null && typeof (f as Floor).id === 'string' && Array.isArray((f as Floor).agents) && (f as Floor).agents.every(a => typeof a === 'object' && a !== null && typeof a.id === 'string'))
+const classesFingerprint = (rows: [string, string, StaffClass][] | null) => (rows ? rows.map(r => r.join('\u0000')).sort().join('\u0001') : 'none')
+
+/** Order o7e6d S1: the staff fence record's problems as the Update guard words them (Agentic.updateBlockers). */
+const STAFF_FENCE_WORDS: Record<string, string> = {
+  'fence-store-bad': "the staff fence record can't be read (agent/agentic/staff/fenced.json); a person has to look at it",
+  'fence-store-dirty': 'a write of the staff fence record may not have landed (agent/agentic/staff/fenced.poison is there); a person has to look at it',
+  'fence-not-durable': 'a staff fence could not be written to disk (it is held in memory only)',
+}
+
 export function createAgentic(o: AgenticOptions): Agentic {
   const approvalNativeRuntimes = new Map<string, { fingerprint: string; generation: string }>()
   const log = o.log
@@ -674,7 +739,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const hookScript = fileURLToPath(new URL('./memory-hook.ts', import.meta.url))
   // F-221 (ob98a, T4): the two prompt hooks are named, so the Orchestrator's own settings file (below) carries exactly the same one.
   const memoryPromptHook = [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}"`, timeout: 10 }] }]
-  writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: memoryPromptHook } })}\n`)
+  // Order ofedf: the Claude usage's status line (usage/statusline.mjs) rides in every chat's settings file while usage is on (SAD_CLAUDE_USAGE=0 or
+  // the file claude-usage.off beside the state folder turns it off: the old way, no status line of ours). Its values come from the chat's environment.
+  // Only with sign-in wired (no auth: nobody to file usage under, so the chats keep their settings as before).
+  const usageOn = !!o.auth && process.env.SAD_CLAUDE_USAGE !== '0' && !existsSync(path.join(o.dir, '..', 'claude-usage.off'))
+  const usageHook = fileURLToPath(new URL('../usage/statusline.mjs', import.meta.url))
+  const usageStatusLine = usageOn ? { statusLine: { type: 'command', command: `"${fwd(process.execPath)}" "${fwd(usageHook)}"` } } : {}
+  writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: memoryPromptHook }, ...usageStatusLine })}\n`)
+  // Order ofedf: a chat with no other hook gets a file of its own that only names the usage status line (it is used when the other two are off).
+  const statusOnlyFile = path.join(o.dir, 'hooks-statusline.json')
+  if (usageOn) writeAtomic(statusOnlyFile, `${json({ ...usageStatusLine })}\n`)
   // 12 Nov (Agent 12, Lead's yes): while the memory layer is off, every NEW Claude chat still gets the PROMPT REPORT: the same script with
   // --report-only, which only tells the agent which prompt claude took (the send confirmation, o655f, and the order-reply carrier), prints
   // nothing, gives up after 2 s and always exits 0. The memory layer's own switch is not touched. Off for new chats: SAD_PROMPT_HOOK=0 or the
@@ -683,8 +757,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // to start it (real rig, 12 Nov: with a 3 s limit claude printed "hook ... timed out" under the prompt). The script's own 2 s cap is the wait.
   const promptHookFile = path.join(o.dir, 'prompt-hook.json')
   const reportPromptHook = [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}" --report-only`, timeout: 10 }] }]
-  writeAtomic(promptHookFile, `${json({ hooks: { UserPromptSubmit: reportPromptHook } })}\n`)
+  writeAtomic(promptHookFile, `${json({ hooks: { UserPromptSubmit: reportPromptHook }, ...usageStatusLine })}\n`)
   const promptHookOff = () => process.env.SAD_PROMPT_HOOK === '0' || existsSync(path.join(o.dir, '..', 'prompt-hook.off'))
+  // Order o7e6d (o4002): a person's own Assistant (staff-policy.ts) has a folder of its own here: its settings file, its MCP files and each
+  // person's empty room (its working folder). The settings file is written at each of its starts, from fixed app-owned commands with absolute
+  // paths (the prompt report and the usage status line, each only while on; Lead's decision of 15 Nov); a write that fails stops the start.
+  const staffDir = path.join(o.dir, 'staff')
+  // S1 (Lead's F1): the durable fence, read here, before the chat host's chats are taken over (staff-fence.ts).
+  const staffFence = createFenceStore(staffDir, { log })
+  const staffSettingsFile = path.join(staffDir, 'settings.json')
+  function staffSettingsNow(): string {
+    const reportCommand = promptHookOff() ? undefined : appCommand(process.execPath, hookScript, '--report-only')
+    const statusLineCommand = usageOn ? appCommand(process.execPath, usageHook) : undefined
+    writeAtomic(staffSettingsFile, `${json(staffSettings({ reportCommand, statusLineCommand }))}\n`)
+    return staffSettingsFile
+  }
   // One answer per chat start: two reads in one start must agree even if the file appears in between (the pool read `settings` twice before
   // F-221 T4 made it one call); the next start (a later tick) looks again.
   let promptHookPick: string | undefined | null = null
@@ -706,14 +793,38 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const voiceLocks = createLockRecord(path.join(o.dir, 'voice-lock.json'), log)
   /** The chat whose start the settings below just gave the voice lock (startHere notes it once the start went through). */
   let voiceLockGiven: string | null = null
+  /**
+   * Order ofedf: the usage status line's values for one Claude chat's process: its folder, a fresh launch id (per spawn), the person who
+   * made the chat (the floor agent's owner; empty when there is none, so nothing is filed), and the PC's own status line, if any, to chain.
+   */
+  function usageEnv(s: StartChat): Record<string, string> {
+    // Assistant order ob7d3: the owner is read on every PC, a member PC included (its floors are the replicas), so a person's own Assistant files under them.
+    const at = allFloors().flatMap(f => (f.id === s.floorId ? f.agents.filter(a => a.id === s.agentId).map(a => ({ f, a })) : []))[0]
+    // Order o7e6d: a staff chat's usage goes under its person, whose id must fit the status line's own rule (else it is not started), and its
+    // status line chains nothing: no SAD_STATUSLINE_CHAIN at all (chats.ts also takes away any it might have had).
+    if (s.policy) return staffUsageEnv({ dir: usage ? usage.snapshotDir : '', launch: randomBytes(16).toString('hex'), person: at?.a.owner?.id ?? '' })
+    const own = ownStatusLineCommand(claudeConfigDir(), usageHook)
+    return {
+      SAD_USAGE_DIR: usage ? usage.snapshotDir : '',
+      SAD_USAGE_LAUNCH: randomBytes(16).toString('hex'),
+      SAD_USAGE_USER: at?.a.owner?.id ?? '',
+      SAD_USAGE_ORG: '',
+      SAD_USAGE_SUB: '',
+      SAD_STATUSLINE_CHAIN: own ? Buffer.from(own, 'utf8').toString('base64') : '',
+    }
+  }
   /** What a Claude chat starts with (chats.ts asks once per start, never for Codex or Codex in Claude Code). */
   function chatSettings(s: StartChat): string | undefined {
-    const base = o.memory?.start ? hooksFile : promptHookSettings()
+    // Order o7e6d: a staff chat gets its own file (never the memory's recall, the voice lock or a coding chat's file); a failed write throws.
+    if (s.policy) return staffSettingsNow()
+    const picked = o.memory?.start ? hooksFile : promptHookSettings()
+    // Order ofedf: with no hook of the other kinds, a chat still gets the usage status line (its own file) while usage is on.
+    const base = picked ?? (usageOn ? statusOnlyFile : undefined)
     const at = mode() === 'member' ? undefined : allFloors().flatMap(f => (f.id === s.floorId ? f.agents.filter(a => a.id === s.agentId).map(a => ({ f, a })) : []))[0]
     if (!at || !isOrchestratorAgent(at.f.name, at.a) || !LATCH_NAME.test(s.sessionId)) return base
     const prompt = base === hooksFile ? memoryPromptHook : base === promptHookFile ? reportPromptHook : null
     try {
-      writeAtomic(orchestratorHooksFile, `${json({ hooks: { ...(prompt ? { UserPromptSubmit: prompt } : {}), PreToolUse: [lockHook(process.execPath, latchHookScript, latchDir, s.sessionId)] } })}\n`)
+      writeAtomic(orchestratorHooksFile, `${json({ hooks: { ...(prompt ? { UserPromptSubmit: prompt } : {}), PreToolUse: [lockHook(process.execPath, latchHookScript, latchDir, s.sessionId)] }, ...usageStatusLine })}\n`)
     } catch (e) {
       // Started the old way: its app tools are still held by the hub, and the page does not offer the direct line (caps say 'app-tools').
       log?.warn(`voice lock: could not write ${orchestratorHooksFile}; the Orchestrator starts without it: ${message(e)}`)
@@ -840,7 +951,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     bindSession: (f, a, s) => storeFor(f).bindSession(f, a, s),
     setCodexThread: (f, a, t) => storeFor(f).setCodexThread(f, a, t),
     setHome: (f, a, h) => storeFor(f).setHome(f, a, h),
+    setPersonAssistantDuty: (f, a) => storeFor(f).setPersonAssistantDuty(f, a),
     bySession: sid => bySession(sid),
+    // Order o7e6d S1 (H1): the main store's load facts (this PC's own floors); the PC Control store's are read where they are needed.
+    loadStatus: () => pickFloors().loadStatus(),
   }
   // F-118: every floor and chat that has no owner is sbskrrt's (the one-time move; it is idempotent, so a chat some older path
   // made without an owner is covered at the next start too). A member keeps no floors of its own: this changes nothing there.
@@ -902,10 +1016,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const accountsPlatforms = createAccountsPlatforms({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   const codebaseImport = createCodebaseImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
-  const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
+  const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log, viewerSession: o.auth ? h => o.auth!.viewerCrm(h) : undefined })
   // Order o5dc4: the Browser: one headless Chrome/Edge on this PC, started only when asked (agent/browser/host.ts), its own profile under <agentic>/browser.
   const browser = createBrowserHost({ dir: path.join(o.dir, 'browser'), log: line => o.log?.info(line) })
   void crmFiles.resume().catch(() => undefined)
+  // Order ofedf: the Claude usage, reported to the CRM the way the old app did (usage/usage.ts): every Claude chat's cost per person, per hour,
+  // and Claude's own 5-hour and week limits per account, each sent with the person's own CRM login. Off with the status line (SAD_CLAUDE_USAGE=0).
+  const usage: Usage | null = o.auth && usageOn ? createUsage({ dir: o.dir, auth: o.auth, proxy: crmProxy, build: () => { const v = o.currentBuild?.(); return v ? { id: buildIdOf(v), label: os.hostname().slice(0, 120) } : null }, log: o.log, onError: m => o.log?.warn(m) }) : null
+  if (usage && !process.env.NODE_TEST_CONTEXT) usage.start()
   // F-211 stage 1 (orders obd04, o7472): every floor chat's conversation goes, one way, into the CRM drive's project "Conversations" as plain JSONL parts and a manifest
   // (conversations.ts). Only the hub (or a PC on its own) sends: it holds every PC's copy (F-021). Its own uploads engine (its own waiting folder: the page's uploads list never
   // shows these), and these files are never shared by link. Off: SAD_CONV_DRIVE=0, or <state>/agent/conversations-drive.off; never by itself inside a test run.
@@ -989,7 +1107,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const remote = new Map<string, { name: string; live: Record<string, ChatState> }>()
   const subs = new Map<string, Duplex>()
   let replica: Replica = loadReplica()
-  let sub: { token: object; stream: Duplex } | null = null
+  /** `gen`: this subscription's generation (one more at each new stream), so a judgement or a freshness of an older one never counts for it. */
+  let sub: { token: object; stream: Duplex; gen: number } | null = null
+  let subGen = 0
+  /**
+   * Order o7e6d S1 (Agent 3's M1, Lead's S-a decision): the copy of the Server's floors is FRESH only once a well-formed `state` frame was
+   * taken from the CURRENT subscription stream, of the Server this PC is joined to now, over the link it is joined by now (its token), in this
+   * generation: an open stream is not freshness, and the copy read from replica.json at the start never is. With it, the Server's own classes
+   * of its agents (staff / admin / other, judged with the Server's sign-in; M3), sent in that same frame over the PC link only. Cleared at once
+   * when that stream closes or errs, the subscription is dropped, the link changes or this PC stops being a member, and by a frame it can't use.
+   */
+  let fresh: { stream: Duplex; token: object; hubId: string; gen: number; classes: Map<string, StaffClass> | null } | null = null
+  /** The Server's classes from the last frame taken (fresh or not): only ever a hint that ADDS a fence (M3), never one that lifts it. */
+  let lastClasses: Map<string, StaffClass> | null = null
+  /** The current subscription's stream, over the link this PC is joined by now (M2): only its frames change anything here. */
+  function currentStream(link: LinkPeer, stream: Duplex): boolean {
+    if (mode() !== 'member' || !sub || sub.stream !== stream || sub.token !== link.token) return false
+    const h = team?.hub()
+    return !!h && h.id === link.id && !!h.link && h.link.token === link.token
+  }
+  function replicaIsFresh(): boolean {
+    const f = fresh
+    if (mode() !== 'member' || !f || !sub || f.stream !== sub.stream || f.gen !== sub.gen || f.token !== sub.token) return false
+    const h = team?.hub()
+    return !!h && h.id === f.hubId && !!h.link && h.link.token === f.token
+  }
   let subscribing = false
   // F-127: when this member lost its Server (null while it has it), and the debounce after which new chats are made here.
   let downSince: number | null = null
@@ -1458,6 +1600,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-051: recall in every prompt, once the memory layer is on (main.ts). Else the prompt report (12 Nov), unless it is switched off:
     // asked each time a chat starts, so the switch is looked at then. F-221 (T4): the Orchestrator's chat gets its own file, with the voice lock.
     settings: chatSettings,
+    // Order ofedf: the usage status line's values for each Claude chat's process (none when usage is off).
+    chatEnv: usage ? usageEnv : undefined,
     onChange: () => {
       noteOpen()
       sawChats(chats.states())
@@ -1533,6 +1677,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       launch: request => {
         const floor = floorOf(request.scope.floorId), agent = workflowExecutionAgent(floor.id, request.scope.agentId)
+        // Order o7e6d: never a bridge launch of a staff Assistant (blocked here, before the bridge; its proof is not touched).
+        if (isStaffAssistant(agent)) throw executionHttpError('execution-forbidden', 'open')
         assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
         const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
         prepareClaudeConfig(cwd, claudeJson)
@@ -1623,6 +1769,144 @@ export function createAgentic(o: AgenticOptions): Agentic {
       runtimeBinding:runtime?.execution,runId:runtime?.bridgeRunId,
       admitted:(expected,runId)=>executionService?.runtime.matches(expected,runId)===true})
   }
+  /**
+   * Order o7e6d: whose own Assistant runs under the staff policy. A person's own Assistant (F-162, duty 'person-assistant', set only by
+   * own-assistant.ts) whose person is not an administrator of this app: the same rule as the ui_* case (Agent 7). An administrator's own
+   * "My Assistant" (Shubham's, if he makes one) is an owner's chat and keeps the owner's launch and tools; the hub's Orchestrator and every
+   * worker are untouched. With sign-in off (no auth) everyone is the owner, so no Assistant is staff there.
+   */
+  const isStaffAssistant = (agent: FloorAgent) => isPersonAssistant(agent) && !access.isAdmin(access.asChat(agent))
+  /**
+   * Lead (15 Nov): a running chat once found unsafe stays fenced for as long as THAT run lasts (by its start time), whatever its floor says
+   * later: its agent deleted, moved, its session bound elsewhere or its duty changed. A new run (after a stop) is judged afresh.
+   */
+  const staffFenced = new Map<string, string>()
+  /** The runs taken over from the chat host by this agent (session → that run's start time): the ones a failed-closed fence store fences. */
+  const adoptedRuns = new Map<string, string>()
+  /** Agent 3's M5: a floor of a store this PC holds itself: on the hub every floor (its own and its PC Control); on a member its own floors and its own PC Control store. */
+  const isOwnStore = (f: Floor) => mode() !== 'member' || isLocalFloor(f.id) || controlFloors.store.get(f.id) !== null
+  /** The run's own floor (its exact origin) is in a store this PC holds: judged here, so it never waits for a fresh copy of the Server's floors. */
+  const originInOwnStore = (run: ChatInfo) => {
+    const floor = lineageFloors().find(f => f.id === run.floorId)
+    return !!floor && isOwnStore(floor)
+  }
+  /** The floors the lineage looks in: every floor this PC knows (a member's own PC Control store too). */
+  function lineageFloors(): Floor[] {
+    const list = allFloors()
+    if (mode() !== 'member') return list
+    const have = new Set(list.map(f => f.id))
+    return [...list, ...controlFloors.store.list().filter(f => !have.has(f.id))]
+  }
+  /**
+   * Order o7e6d S1: one agent's class for the lineage. Of a store this PC holds (M5): judged here with this PC's sign-in, definite. Of a member's
+   * copy of the Server's floors (M3): the Server's own class from the current fresh frame, else none (null), because a member's sign-in can't
+   * say who is the Server's administrator (with sign-in off it calls everyone one). `staffHint`: a staff Assistant by ANY source (the class, the
+   * class of the last frame, this PC's own reading of the copy): it may only add a fence, never lift one.
+   */
+  function classOf(floor: Floor, agent: FloorAgent): { cls: StaffClass | null; staffHint: boolean } {
+    if (isOwnStore(floor)) {
+      const cls: StaffClass = isStaffAssistant(agent) ? 'staff' : access.isAdmin(access.asChat(agent)) ? 'admin' : 'other'
+      return { cls, staffHint: cls === 'staff' }
+    }
+    const key = classKey(floor.id, agent.id)
+    const cls = replicaIsFresh() ? fresh?.classes?.get(key) ?? null : null
+    return { cls, staffHint: cls === 'staff' || lastClasses?.get(key) === 'staff' || isStaffAssistant(agent) }
+  }
+  /**
+   * Order o7e6d S1 lineage (Lead's bounded GO with Agent 3's B1, B2 and M3-M5): where a run came from, by the agent it was started for
+   * (ChatInfo.floorId and agentId: set at its start, kept by the chat host, never changed by a floor edit). Agent ids are a page's to choose and
+   * are unique only within one floor, so every agent anywhere with that id is looked at, and ANY staff Assistant among them makes it 'staff'.
+   * It is 'ordinary' only for its exact pair (that floor, that agent), or with no exact pair for the one agent anywhere with that id (an agent
+   * moved to another floor), and only when that agent is an administrator's. None found, several, someone else's, or a copy of the Server's
+   * floors with no class from the Server now: 'unknown'. `settled` (M4): decided from definite facts only, about an agent that was FOUND (a
+   * store this PC holds, or the Server's class from a fresh frame): a definite staff Assistant, or a found agent that is someone else's. An
+   * origin not found or ambiguous is never settled, on any PC. Anything not settled is never recorded. Throws when a lookup fails.
+   */
+  function lineageOf(run: ChatInfo): { origin: 'staff' | 'ordinary' | 'unknown'; settled: boolean } {
+    const seen: { floor: Floor; cls: StaffClass | null; staffHint: boolean }[] = []
+    for (const floor of lineageFloors()) for (const agent of floor.agents) if (agent.id === run.agentId) seen.push({ floor, ...classOf(floor, agent) })
+    const exact = seen.filter(s => s.floor.id === run.floorId)
+    // B2: any staff Assistant with that id, wherever. Settled only when a definite class says so; a hint from anything else fences this check only.
+    const definiteStaff = seen.some(s => s.cls === 'staff')
+    if (definiteStaff || seen.some(s => s.staffHint)) return { origin: 'staff', settled: definiteStaff }
+    // H1: its own floor not found while what this PC's stores knew at their load is degraded: no other agent with its id stands in for it.
+    const degraded = exact.length === 0 && originKnowledgeDegraded(run)
+    const pick = exact.length === 1 ? exact[0] : exact.length === 0 && seen.length === 1 && !degraded ? seen[0] : null
+    // None found, or several (Agent 3's source trace, Lead): unknown, and NEVER recorded, on any PC, whatever state the stores are in now. The
+    // lineage is immutable and re-derived at every check, so a record adds no safety here; it would only outlive a store that was missing or
+    // replaced for a while (an auto-recreated PC Control store, a floors file made new): with its original back, the run is ordinary again.
+    if (!pick) return { origin: 'unknown', settled: false }
+    // The Server's floors without the Server's class now (not fresh, an older Server, a malformed list): unknown for this check only (M3).
+    if (pick.cls === null) return { origin: 'unknown', settled: false }
+    return { origin: pick.cls === 'admin' ? 'ordinary' : 'unknown', settled: true }
+  }
+  /**
+   * Order o7e6d S1 (Agent 3's H1): could this PC's own stores have lost the run's floor at their load (FloorStore.loadStatus, read only)? On
+   * any PC: the run's floor quarantined at load, or its session one of a quarantined floor's (main store or PC Control), or a corrupt file set
+   * aside or a shape not read in either store. On the hub also its floors file missing. (A member's own floors file is often missing: no floors
+   * made there; and a PC Control file is missing wherever PC Control was never set up: neither alone counts.) A found origin is judged as found
+   * whatever another floor's state; only a run whose own floor is not found is affected: no other agent with its id stands in for it (an origin
+   * not found is never recorded anyway, degraded or not).
+   */
+  function originKnowledgeDegraded(run: ChatInfo): boolean {
+    const main = pickFloors().loadStatus(), control = controlFloors.store.loadStatus()
+    for (const st of [main, control]) {
+      if (st.quarantinedFloors.includes(run.floorId) || st.quarantinedSessions.includes(run.sessionId)) return true
+      if (st.corrupt || st.unsupported) return true
+    }
+    return mode() !== 'member' && main.missing
+  }
+  /** S-a: when a lineage lookup last failed for a session (its warning is written at most once a minute). */
+  const lineageWarned = new Map<string, number>()
+  /**
+   * Order o7e6d S1 (Lead's GO, Agent 3's B3): the ONE check every way into a run of this PC asks: its keys, words and drafts (the pool below),
+   * its tools and recall (callTool, staffGate, /mcp/tools, /mcp/recall), its files (refuseStaffFiles), a lease or take-over (isStaffSid), an
+   * open, a restart and the preflight. Fenced: a run on record (this agent's memory, or fenced.json: that exact run); with a record that can't
+   * be trusted (F1) every run taken over without the staff policy; a run of a policy this build does not know; a run without the staff policy
+   * whose session is bound now to a staff Assistant, or whose lineage is not proven ordinary (lineageOf). A run under the staff policy is not
+   * fenced: the policy holds it. A settled finding is kept for that run (memory and the record on disk), so it outlives an Update, a rebind or
+   * a deleted floor. S-a (M4): a finding that is not settled (a member PC's copy of the Server's floors not fresh, no class from the Server) and
+   * a lookup that fails fence this check only: nothing is recorded, and the next check looks again. Only a settled finding (a store this PC
+   * holds, the Server's class from a fresh frame) or an explicit unknown policy is recorded. `record` false (the preflight): nothing is recorded
+   * at all. Nothing is ever stopped here.
+   */
+  function runFenced(sid: string, record = true): boolean {
+    const run = nativeChats.info(sid)
+    if (!run) { staffFenced.delete(sid); return false }
+    if (staffFenced.get(sid) === run.startedAt || staffFence.has(sid, run.startedAt)) return true
+    if (run.policy === STAFF_POLICY) return false
+    // F1: a fence record that can't be trusted (bad, or a write that may not have landed) fences every chat taken over without the staff policy,
+    // the owner's too, until it is stopped and opened again (not recorded: it follows the record's state).
+    if (staffFence.failClosed() && adoptedRuns.get(sid) === run.startedAt) return true
+    let fence = true, settled = true
+    try {
+      if (run.policy === undefined) {
+        // Its session bound now to a staff Assistant (by any source: only ever adds the fence; recorded only on a definite class), else its lineage.
+        const at = bySession(sid)
+        const bound = at ? classOf(at.floor, at.agent) : null
+        if (bound && (bound.cls === 'staff' || bound.staffHint)) settled = bound.cls === 'staff'
+        else {
+          const lineage = lineageOf(run)
+          fence = lineage.origin !== 'ordinary'
+          settled = lineage.settled
+        }
+      }
+    } catch (e) {
+      const now = Date.now()
+      if (now - (lineageWarned.get(sid) ?? 0) >= 60_000) {
+        lineageWarned.set(sid, now)
+        log?.warn(`staff policy: where chat ${sid.slice(0, 8)} came from could not be read now (${message(e)}); it is fenced for this check only, nothing is recorded`)
+      }
+      return true
+    }
+    if (fence && settled && record) {
+      staffFenced.set(sid, run.startedAt)
+      staffFence.add(sid, run.startedAt)
+    }
+    return fence
+  }
+  /** A staff Assistant's session (its binding now), or a run of it here that is fenced: a lease, a take-over and the MCP routes ask this. */
+  const isStaffSid = (sid: string) => { const at = bySession(sid); return (!!at && isStaffAssistant(at.agent)) || runFenced(sid) }
   const chats: ChatPool = { ...nativeChats,
     beforeAdopt: async info => {
       const at = bySession(info.sessionId)
@@ -1634,14 +1918,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     },
     start: options => { assertLegacySid(options.sessionId); switchFences.assertWritable(options.sessionId); return nativeChats.start(options) },
-    input: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.input(sid, data),
-    press: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.press(sid, data),
-    type: (sid, text, options) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
-    deliver: async (sid, text, options) => !runtimeSidAllowed(sid) || switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed',
+    input: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.input(sid, data),
+    press: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.press(sid, data),
+    type: (sid, text, options) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.type(sid, text, options),
+    deliver: async (sid, text, options) => {
+      // o7e6d: a fenced run takes no message (runFenced).
+      if (runFenced(sid)) { options?.onBlocked?.('staff-runtime'); return 'blocked' }
+      return !runtimeSidAllowed(sid) || switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed'
+    },
+    clearDraft: sid => (!runFenced(sid) && nativeChats.clearDraft ? nativeChats.clearDraft(sid) : Promise.resolve({ result: 'unsupported' as const, draft: null })),
+    draftMirror: (sid, client) => (!runFenced(sid) ? nativeChats.draftMirror?.(sid, client) ?? null : null),
     attach: (sid, viewer) => runtimeSidAllowed(sid) || ownBridgeSid(sid) ? nativeChats.attach(sid, viewer) : null,
     resize: (sid, cols, rows) => { if (runtimeSidAllowed(sid)) nativeChats.resize(sid, cols, rows) },
     kill: (sid, why) => (runtimeSidAllowed(sid) || ownBridgeSid(sid)) && nativeChats.kill(sid, why),
-    typeWhenReady: (sid, text, options) => { assertLegacySid(sid); switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
+    typeWhenReady: (sid, text, options) => { assertLegacySid(sid); switchFences.assertWritable(sid); if (!runFenced(sid)) nativeChats.typeWhenReady(sid, text, options) },
     adopt: (info, pty, replay) => {
       try {
         const at = bySession(info.sessionId)
@@ -1653,7 +1943,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         } else assertLegacySid(info.sessionId)
       } catch (error) { blockedLegacyAdoption = true; throw error }
       const result = nativeChats.adopt(info, pty, replay)
+      adoptedRuns.set(info.sessionId, result.startedAt)
       if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery')
+      // Order o7e6d (P1, Lead 15 Nov; S1 lineage): a chat the host kept that is fenced (a staff Assistant's run without the staff policy, a policy
+      // this build does not know, a run whose lineage is not proven ordinary) is QUARANTINED, never ended because a host was taken over: it takes
+      // no input and no tool (runFenced), and stays as it is until an explicit stop; the next open starts it afresh.
+      else if (runFenced(info.sessionId)) {
+        log?.warn(`staff policy: chat ${info.sessionId.slice(0, 8)} was taken over without the staff policy; it is quarantined (no input, no tools) until it is stopped (a staff Assistant's run, an unknown policy, or where it came from is not proven ordinary)`)
+      }
       return result
     },
   }
@@ -1676,6 +1973,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ? Promise.resolve(existsSync(path.join(o.dir, 'codex-claude', 'capability.json')) ? executionService?.runtime.ensure() : undefined)
         .then(() => o.chatHost!.adopt(chats))
         .then(r => {
+          // S1: the host's own complete list of its chats, just read: a fence record of a run that is not on it (ended) or whose session now runs
+          // as a newer run goes; one it lists but this agent couldn't take over stays. (Only here: never on a lost link, a timeout or a floor change.)
+          const hostRuns = new Map<string, string | null>()
+          for (const sid of r.adopted) hostRuns.set(sid, nativeChats.info(sid)?.startedAt ?? null)
+          for (const sid of r.skipped ?? []) hostRuns.set(sid, null)
+          staffFence.reconcile(hostRuns)
           hostAdopted = true
           // F-134: a Codex chat the host kept running holds the Codex login file: it counts as one of the chats that keep it.
           for (const c of chats.live()) if (c.engine === 'codex') o.codex?.adopt(c.sessionId)
@@ -1962,6 +2265,181 @@ export function createAgentic(o: AgenticOptions): Agentic {
     })()
   }
 
+  // ---------------------------------------------------------------------------------------
+  // Order o7e6d (o4002): a person's own Assistant (F-162, duty 'person-assistant') runs under the staff policy (staff-policy.ts), or not at all
+
+  function staffError(words: string) {
+    return Object.assign(apiError(409, words), { code: 'staff-policy' })
+  }
+
+  /**
+   * Where and as what a person's own Assistant may run: on this PC when it is the hub or alone (a member PC can't show its launch), as native
+   * Claude only (no Codex, OpenCode, Codex in Claude Code or other managed execution), at home here, for a person whose id fits. Else refused.
+   */
+  function assertStaffStart(floor: Floor, agent: FloorAgent) {
+    if (mode() === 'member') throw staffError("A person's own Assistant runs on the Server only.")
+    if (isPcControl(floor)) throw staffError("A person's own Assistant is not a PC-control chat.")
+    if (executionIdentityOf(agent, defaultsNow()).profile !== 'claude-native-v1') throw staffError("A person's own Assistant runs only as native Claude (not Codex, OpenCode or Codex in Claude Code).")
+    if (agent.homePc && agent.homePc !== self().id) throw staffError(`This Assistant's home is ${homeName(agent, agent.homePc)}; a person's own Assistant runs on the Server only.`)
+    if (!STAFF_OWNER_RE.test(agent.owner?.id ?? '')) throw staffError("This Assistant's person can't be named, so it was not started.")
+  }
+
+  /**
+   * P1 (Lead, 15 Nov): a run of a staff Assistant that is not under the staff policy (an older build's, an unknown policy) is never used and never
+   * stopped by an open: the open is refused while it runs (it is quarantined: no input, no tools). An explicit stop (terminate) replaces it; the
+   * next open starts it under the policy. One running on another PC can't be checked here and is refused too.
+   */
+  function staffRefuseOld(sid: string) {
+    const w = whereAll()[sid]
+    if (!w) return
+    if (w.id !== self().id) throw staffError(`This Assistant's chat runs on ${w.name}, where its restrictions can't be checked. Stop it there first.`)
+    if (chats.info(sid)?.policy === STAFF_POLICY) return
+    log?.warn(`staff policy: chat ${sid.slice(0, 8)} of a person's own Assistant runs without it; the open is refused until it is stopped`)
+    throw staffError("Restart required: this Assistant's chat is running without its restrictions (an older start). It takes no messages and no tools until it is stopped; stop it, then open it again.")
+  }
+
+  /**
+   * Plan A (Lead's GO, 15 Nov): on a member PC, is this a staff Assistant of the Server's that has never run (no home; its session, if bound,
+   * runs nowhere: not in this PC's pool, not anywhere this PC knows of)? Then its open from this PC's page goes to the Server (forwardFirstOpen).
+   * Anything else keeps the old ways: home on the Server (run-on there), running there (answered as there), home elsewhere (refused).
+   */
+  function staffFreshHere(floorId: string, agentId: string): boolean {
+    const agent = agentOf(floorOf(floorId), agentId)
+    if (!isStaffAssistant(agent) || agent.homePc) return false
+    const sid = agent.sessionId
+    return !sid || (!whereAll()[sid] && !chats.info(sid))
+  }
+
+  /** Opens of one Assistant now on their way from this PC's pages: a second one waits for the first, never a second forward (or start). */
+  const staffForwarding = new Map<string, Promise<ChatOpened>>()
+
+  /**
+   * Plan A: the member PC passes the page's open of a never-run staff Assistant to the Server, which alone decides: it checks the person, that the
+   * Assistant is theirs, Settings › Access and the native staff launch before it binds a session or starts anything (fromMember, checkRule,
+   * openChat). On this PC: no spawn, no session bound, no lease, no home. Over the link in use NOW, pinned: the Server is first asked whether it
+   * runs the staff policy; no link, another link by the time it is asked to open, an unknown answer, an older Server or a timeout all refuse the
+   * open, and nothing is ever started here instead.
+   * Pinned by what the link IS, never by the wrapper object (Lead's object review): team.hub() hands out a new LinkPeer at every read (main.ts
+   * linkPeer), the same link in a new wrapper, so the pin is the Server's id and the link's incarnation (LinkPeer.token, the Mux under it; a new
+   * one after a reconnect). After the probe both must still be the same, and the open goes over the link read first.
+   */
+  async function forwardFirstOpen(floorId: string, agentId: string, r: MountRequest): Promise<ChatOpened> {
+    const key = `${floorId}/${agentId}`
+    const pending = staffForwarding.get(key)
+    if (pending) return { ...(await pending), started: false, resumed: false }
+    const run = (async (): Promise<ChatOpened> => {
+      const hub = team?.hub() ?? null
+      const link = hub?.link ?? null
+      if (!hub || !link || !link.token || link.id !== hub.id) throw staffError("The Server can't be reached from this PC now, and a person's own Assistant opens only there. Nothing was started.")
+      const pinned = { id: hub.id, token: link.token }
+      const probe = await request<{ version?: unknown; policy?: unknown }>(link, 'staff-policy', {}, 10_000).catch(() => null)
+      if (!probe || probe.version !== 1 || probe.policy !== STAFF_POLICY) throw staffError("The Server can't open a person's own Assistant with its restrictions (it may need the Update). Nothing was started.")
+      const now = team?.hub() ?? null
+      if (!now || now.id !== pinned.id || !now.link || now.link.id !== pinned.id || !now.link.token || now.link.token !== pinned.token) throw staffError('The connection to the Server changed before the Assistant could be opened there. Nothing was started; try again.')
+      const opened = await request<ChatOpened>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/chat`, query: '', body: {}, by: callerOf(r).person }, 60_000)
+      log?.info(`staff policy: the first open of ${agentOf(floorOf(floorId), agentId).name} was passed to ${hub.name}`)
+      return { ...opened, on: opened.on ?? hub.name }
+    })()
+    staffForwarding.set(key, run)
+    try {
+      return await run
+    } finally {
+      if (staffForwarding.get(key) === run) staffForwarding.delete(key)
+    }
+  }
+
+  /** Opens of one staff Assistant in flight on this PC (two pages, a member's forward): a second waits for the first; it is started once. */
+  const staffOpening = new Map<string, Promise<ChatOpened>>()
+
+  /**
+   * H2 (Agent 3's review): the staff Assistants' runs that are not safe, wherever they run: here without the staff policy (quarantined), here
+   * with a policy this build does not know, or on another PC (nothing there is checked). Read only: nothing is stopped or changed. Before staff
+   * access is switched on this must be empty (an activation preflight blocker); each one goes by an explicit, approved stop.
+   */
+  function staffPreflight(): { sessionId: string; floor: string; agent: string; pc: string; why: StaffUnsafe }[] {
+    const out: ReturnType<typeof staffPreflight> = []
+    // S1: the fence record itself (bad, dirty, or a fence held only in memory): a row each, an activation blocker like any unsafe run.
+    for (const why of staffFence.problems()) out.push({ sessionId: '', floor: '', agent: '', pc: self().name, why: why as StaffUnsafe })
+    for (const [sid, w] of Object.entries(whereAll())) {
+      let at: { floor: Floor; agent: FloorAgent } | null = null
+      try { at = bySession(sid) } catch { at = null }
+      const row = { sessionId: sid, floor: at?.floor.name ?? '', agent: at?.agent.name ?? '', pc: w.name }
+      if (w.id !== self().id) {
+        // Another PC's run: nothing there is checked from here. H2 (Agent 3): it is listed unless the agent its session is bound to here has a
+        // DEFINITE administrator class (a store this PC holds, or the Server's class from a fresh frame) and no staff hint from any source;
+        // unbound, someone else's, no class, or a lookup that fails: listed.
+        let safe = false
+        try {
+          const c = at ? classOf(at.floor, at.agent) : null
+          safe = !!c && c.cls === 'admin' && !c.staffHint
+        } catch { /* listed */ }
+        if (!safe) out.push({ ...row, why: 'other-pc' })
+        continue
+      }
+      // This PC's own runs: every fenced one (S1, B3: the same check as every way in), read only (nothing is recorded by the preflight).
+      const run = chats.info(sid)
+      if (run && runFenced(sid, false)) out.push({ ...row, why: fencedWhy(sid, run, at) })
+    }
+    return out
+  }
+
+  /** Why a run of this PC is fenced, for the preflight (read only; a reason that can't be read now is 'origin-unknown'). */
+  function fencedWhy(sid: string, run: ChatInfo, at: { floor: Floor; agent: FloorAgent } | null): StaffUnsafe {
+    if (run.policy !== undefined && run.policy !== STAFF_POLICY) return 'unknown-policy'
+    try {
+      if (at && classOf(at.floor, at.agent).staffHint) return 'no-policy'
+      const lineage = lineageOf(run)
+      if (lineage.origin === 'staff') return 'no-policy'
+      if (lineage.origin === 'unknown') return 'origin-unknown'
+      return staffFence.failClosed() && adoptedRuns.get(sid) === run.startedAt ? 'fence-closed' : 'fenced'
+    } catch {
+      return 'origin-unknown'
+    }
+  }
+
+  /** The person's own empty room, its working folder: the same at every start and resume, never the floor's folder, a repo or the owner's. */
+  function staffRoom(agent: FloorAgent) {
+    return path.join(staffDir, 'rooms', agent.owner!.id.toLowerCase())
+  }
+
+  /** A staff chat's start (from startHere): its room, its own brief, MCP file and settings; model and effort from Settings › Chats only. */
+  function staffStartHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, nativeExecutable?: string): boolean {
+    assertStaffStart(floor, agent)
+    if (nativeExecutable) throw staffError("A person's own Assistant runs only as native Claude.")
+    const room = staffRoom(agent)
+    // Its conversation lives under its room. One found anywhere else (H3: an older run's, made outside the restrictions) is never moved or
+    // copied: it stays exactly where it is, and this build refuses to resume it (restart required: a new conversation for this Assistant).
+    const found = findClaudeTranscript(sid, projectsDir)
+    if (found && path.resolve(found).toLowerCase() !== path.resolve(transcriptPath(room, sid, projectsDir)).toLowerCase()) {
+      log?.warn(`staff policy: chat ${sid.slice(0, 8)}'s conversation was made outside the staff restrictions; it is left where it is and not resumed`)
+      throw staffError("This Assistant's conversation was started without its restrictions, so it can't be resumed under them. It needs a new conversation (restart required); the old one is kept as it is.")
+    }
+    const resume = !!found
+    mkdirSync(room, { recursive: true })
+    if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
+    try {
+      const done = prepareClaudeConfig(room, claudeJson)
+      if (done.length) log?.info(`answered in ${claudeJson} so the chat opens on its prompt: ${done.join(', ')}`)
+    } catch (e) {
+      log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
+    }
+    const person = agent.owner!.name || agent.owner!.username || 'its person'
+    const briefPath = writeBrief(briefsDir, sid, staffBrief({ agent: agent.name, person, md: agent.md, server: MCP_SERVER_NAME }))
+    const mcpFile = path.join(staffDir, 'mcp', `${sid}.json`)
+    writeAtomic(mcpFile, `${json(staffMcpConfig(MCP_SERVER_NAME, process.execPath, shim))}\n`)
+    const dflt = defaultsNow()
+    voiceLockGiven = null
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd: room, briefPath, mcpConfig: mcpFile, strictMcp: true, model: dflt.model, effort: dflt.effort || undefined, resume, cols: size.cols, rows: size.rows, policy: STAFF_POLICY })
+    voiceLockGiven = null
+    launched.set(sid, { effort: dflt.effort, at: new Date().toISOString(), ultracode: false })
+    heartbeat.opened(sid)
+    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+    startCause.delete(sid)
+    log?.info(`chat ${sid.slice(0, 8)}: ${agent.name} started under the staff policy (${STAFF_POLICY})`)
+    if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
+    return resume
+  }
+
   /** Starts the agent's chat on this PC (its lease already got). */
   async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<boolean> {
     executionGuard?.()
@@ -1969,6 +2447,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     assertPcControlTarget(floor, self().id, size)
     // F-221 (T4 review): held before it starts, whoever starts it, when a spoken line holds it (heldStart).
     heldStart(sid)
+    // Order o7e6d: a staff Assistant starts only under the staff policy, never by any of the ways below.
+    if (isStaffAssistant(agent)) return staffStartHere(floor, agent, sid, size, nativeExecutable)
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
       const selection = openCodeSelection(agent, dflt)
@@ -2163,6 +2643,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * when it is elsewhere and `takeOver` wasn't asked. Answers where it was taken from.
    */
   async function lease(sid: string, who: { id: string; name: string }, takeOver: boolean, agentName: string): Promise<string | undefined> {
+    // Order o7e6d (plan C, Lead's GO): a staff Assistant's session is held by this PC (the Server) only. Judged by this PC's own facts (its floors,
+    // its fenced runs), never by what the asking PC says, and before anything is held, stopped or made anyone's home: an older member build, which
+    // needs this lease before it starts a chat, can never start one there.
+    if (who.id !== self().id && isStaffSid(sid)) throw staffError("A person's own Assistant runs on the Server only; no other PC may hold it.")
     const bound = bySession(sid)
     if (bound) requireLegacyExecution(bound.agent, defaultsNow())
     const pinned = bySession(sid)
@@ -2190,11 +2674,33 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-021 on the hub: its members' standing streams
 
   let pushTimer: NodeJS.Timeout | null = null
+  /** The classes in the last state pushed (memberTick pushes again when this PC's sign-in changes them). */
+  let classesPushed = ''
+  /**
+   * Order o7e6d S1 (Agent 3's M3, Lead): this hub's own class of every agent it keeps (its floors and PC Control slots), judged with ITS
+   * sign-in, for the members: computed at every state it sends, over the PC link only (never on a floor, never to a page). null when it can't
+   * be judged now: a member then treats what it would decide as unknown, fenced for each check only.
+   */
+  let classesWarned = 0
+  function hubStaffClasses(list: Floor[]): [string, string, StaffClass][] | null {
+    try {
+      return list.flatMap(f => f.agents.map(a => [f.id, a.id, isStaffAssistant(a) ? 'staff' : access.isAdmin(access.asChat(a)) ? 'admin' : 'other'] as [string, string, StaffClass]))
+    } catch (e) {
+      if (Date.now() - classesWarned >= 60_000) {
+        classesWarned = Date.now()
+        log?.warn(`staff policy: this Server's classes of its agents could not be judged now (${message(e)}); the members fence what they would decide`)
+      }
+      return null
+    }
+  }
   function pushState() {
     if (mode() !== 'hub' || !subs.size || pushTimer) return
     pushTimer = setTimeout(() => {
       pushTimer = null
-      const state = { t: 'state', floors: floors.list(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
+      const list = floors.list()
+      const staffClasses = hubStaffClasses(list)
+      classesPushed = classesFingerprint(staffClasses)
+      const state = { t: 'state', floors: list, staffClasses, pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -2312,7 +2818,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     void reconcileSwitchFences().catch(error => log?.warn('Engine-switch recovery remains fenced: ' + message(error)))
     if (mode() !== 'member') {
       downSince = null
+      fresh = null
       if (sub) dropSub()
+      // Order o7e6d S1 (M3, Lead): the classes the members get follow this PC's sign-in too (an administrator added or removed), not only its
+      // floors: a change of them is pushed like a change of the floors.
+      if (mode() === 'hub' && subs.size && classesFingerprint(hubStaffClasses(floors.list())) !== classesPushed) pushState()
       return
     }
     const link = team!.hub()?.link ?? null
@@ -2326,12 +2836,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     link.open({ op: 'subscribe' }).then(
       stream => {
         subscribing = false
-        sub = { token: link.token, stream }
+        sub = { token: link.token, stream, gen: ++subGen }
         replica.engineSwitchContinuity = undefined
         downSince = null
         writeLine(stream, { t: 'hello', ...liveReport(), marks: marksHere() })
-        readLines(stream, raw => onHubEvent(link, raw))
+        readLines(stream, raw => onHubEvent(link, raw, stream))
         const gone = () => {
+          if (fresh?.stream === stream) fresh = null
           if (sub?.stream !== stream) return
           sub = null
           downSince = Date.now()
@@ -2354,13 +2865,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function dropSub() {
     const s = sub
     sub = null
+    fresh = null
     downSince = Date.now()
     s?.stream.destroy()
     emitWhere()
   }
 
-  function onHubEvent(link: LinkPeer, raw: unknown) {
+  function onHubEvent(link: LinkPeer, raw: unknown, stream: Duplex) {
+    // Order o7e6d S1 (Agent 3's M2): only a frame of the CURRENT subscription's stream, over the link this PC is joined by now, changes anything
+    // here. A frame of an older stream (buffered before a drop or a reconnect) changes nothing, of any kind: before, a late `state` of an old
+    // stream could overwrite a newer copy, and replica.json, with older floors.
+    if (!currentStream(link, stream)) return
     if (!isObject(raw)) return
+    if (raw.t === 'state' && !wellFormedFloors(raw.floors)) {
+      // Not floors this PC can take: nothing is taken, and the copy it has is no longer fresh.
+      fresh = null
+      return
+    }
     if (raw.t === 'state' && Array.isArray(raw.floors)) {
       replica = {
         engineSwitchContinuity: isObject(raw.engineSwitchContinuity) && raw.engineSwitchContinuity.version === 1 && raw.engineSwitchContinuity.failClosed === true && raw.engineSwitchContinuity.homePcPreparation === true
@@ -2372,6 +2893,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {},
         marks: isObject(raw.marks) ? (raw.marks as Record<string, FileMark>) : {},
       }
+      // M1/M3: taken from the current stream, so the copy is fresh for this generation, with the Server's classes from this same frame (none from
+      // an older Server, or a malformed list: then whatever they would decide is unknown, fenced for each check only).
+      const classes = parseStaffClasses(raw.staffClasses)
+      fresh = { stream, token: link.token, hubId: link.id, gen: sub!.gen, classes }
+      if (classes) lastClasses = classes
       saveReplica()
       emitFloors()
       emitWhere()
@@ -2403,6 +2929,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     assertPcControlTarget(floor, self().id, req)
     if (sid) switchFences.assertWritable(sid)
     await requirePeerEngine(link, agent)
+    // Order o7e6d: a staff Assistant never runs on a member PC: one running here is an unsafe older run (fenced), never handed back.
+    if (isStaffAssistant(agent) && sid && chats.info(sid)) throw staffError("Restart required: this Assistant's chat runs on this PC, where its restrictions can't be checked. Stop it, then open it on the Server.")
+    // S1, B3: a run here that is fenced is never handed out as if it were safe (nor leased).
+    if (sid && chats.info(sid) && runFenced(sid)) throw fencedOpenError(sid)
     if (sid && chats.info(sid)) {
       requireRunningEngine(engineFor(agent), chats.info(sid)!.engine)
       const proof = await request<{ engine?: RuntimeEngine }>(link, 'lease', { sessionId: sid, takeOver: false, expectedEngine: engineFor(agent) })
@@ -2410,8 +2940,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
       switchFences.assertWritable(sid)
       return { sessionId: sid, started: false, resumed: false, engine: chats.info(sid)!.engine }
     }
+    // Order o7e6d: a staff Assistant already running on the Server is reached there (this page follows it there): never leased or taken over here.
+    if (isStaffAssistant(agent) && sid) {
+      const w = whereAll()[sid]
+      if (w && w.id === team?.hub()?.id) return { sessionId: sid, started: false, resumed: false, engine: 'claude', on: w.name }
+    }
     const atHome = await resumeAtHome(floor, agent, sid, req)
     if (atHome) return atHome
+    // Order o7e6d (Lead's routing ask): a staff Assistant whose home is the Server was just opened there (resumeAtHome: run-on), and a never-run one
+    // is passed to the Server by the page's route (forwardFirstOpen). Any other way from here would start it on this PC (its home is another PC,
+    // or this open came another way), so it is refused HERE, before a session is bound or a lease taken: its home is never pinned to this PC.
+    if (isStaffAssistant(agent)) throw staffError("A person's own Assistant runs on the Server only, and this one can't be opened there from this PC now. Nothing was started.")
     if (!sid) {
       sid = randomUUID()
       const r = isPcControl(floor)
@@ -2759,6 +3298,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   async function openOnPeer(link: LinkPeer, floor: Floor, agent: FloorAgent, text?: string): Promise<ChatOpened> {
+    // Order o7e6d: a staff Assistant never on another PC (its launch can't be shown here).
+    if (isStaffAssistant(agent)) throw staffError("A person's own Assistant runs on the Server only.")
     requireLegacyExecution(agent, defaultsNow())
     const expectedEngine = engineFor(agent)
     if (isPcControl(floor)) { assertPcControlTarget(floor, link.id, {}); await requirePcControlPeer(link) }
@@ -2794,8 +3335,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { ...via, on: name }
   }
 
-  /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
+  /**
+   * Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. Order o7e6d (Lead's first-open GO): two opens of
+   * one staff Assistant at once (two pages, a member's forward and a page here) start it once: the second waits for the first's answer.
+   */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
+    let staffKey: string | null = null
+    try {
+      if (isStaffAssistant(agentOf(floorOf(floorId), agentId))) staffKey = `${floorId}/${agentId}`
+    } catch {
+      // No such floor or agent: the open itself says so.
+    }
+    if (!staffKey) return openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable)
+    const key = staffKey
+    const pending = staffOpening.get(key)
+    if (pending) return { ...(await pending), started: false, resumed: false }
+    const run = openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable)
+    staffOpening.set(key, run)
+    try {
+      return await run
+    } finally {
+      if (staffOpening.get(key) === run) staffOpening.delete(key)
+    }
+  }
+
+  async function openChatOnce(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
     requireHostAdoption()
     executionGuard?.()
     const managed = floorOf(floorId)
@@ -2806,11 +3370,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
     if (mode() === 'member') {
       if (!isLocalFloor(floorId)) return openOnMember(floorId, agentId, req)
+      // Order o7e6d: a staff Assistant never starts on a member PC (one on the Server's floors is opened there, just above).
+      if (isStaffAssistant(agentOf(floorOf(floorId), agentId))) throw staffError("A person's own Assistant runs on the Server only.")
       if (engineFor(agentOf(floorOf(floorId), agentId)) === 'claude') needClaudeHere()
     }
     let floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
+    // Order o7e6d: a staff Assistant opens here, under the staff policy only; while a run of it without the policy is up here, or any run of it on
+    // another PC, the open is refused (P1). (A take-over open is how a member's page reaches it at its home, the Server: run-on, here.)
+    if (isStaffAssistant(agent)) {
+      assertStaffStart(floor, agent)
+      if (sid) staffRefuseOld(sid)
+    }
+    // S1, B3: the chat bound to it runs here fenced (its lineage, an earlier finding, an untrusted record): it is never handed out as if it were
+    // safe; an explicit stop replaces it, then the open starts it afresh.
+    if (sid && chats.info(sid) && runFenced(sid)) throw fencedOpenError(sid)
     if (sid && chats.info(sid)) {
       const actual = chats.info(sid)!.engine
       requireRunningEngine(engineFor(agent), actual)
@@ -2850,6 +3425,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = floors.bySession(sid)
     if (at) requireLegacyExecution(at.agent, defaultsNow())
     if (!at || !chats.info(sid)) return false
+    // Order o7e6d (P1; S1, B3): a quarantined chat (runFenced: a staff Assistant's run without the staff policy, a policy this build does not
+    // know, a run whose lineage is not proven ordinary) is never stopped by an automatic restart (a subscription switch, a tool-list refresh):
+    // only an explicit stop replaces it.
+    if (runFenced(sid)) {
+      log?.warn(`staff policy: chat ${sid.slice(0, 8)} is quarantined; it is not restarted (stop it, then open it)`)
+      return false
+    }
     if (chats.info(sid)?.engine === 'opencode') {
       await openCode.abort(sid)
       chats.kill(sid, 'restart')
@@ -3136,6 +3718,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // Nothing was typed by the confirmed sender. Send the old direct way, joining the unsent text.
         log?.info(`chat ${c.sessionId.slice(0, 8)}: the box holds unsent text; the message is typed the old direct way after it (no receipt)`)
         if (c.id === self().id) {
+          refuseFencedHere(c.sessionId)
           await mirrorYields(c.sessionId)
           return chats.type(c.sessionId, body)
         }
@@ -3151,6 +3734,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       throw Object.assign(apiError(409, 'Delivery is not confirmed; the one pending message may already have been submitted, may still complete, or may remain in the composer. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
     }
     if (c.id === self().id) {
+      // A message the caller wanted confirmed (an agent's message, a broadcast) that the old way sends directly: a fenced chat refuses it as the
+      // confirmed way would. Every other caller (tune, effort, a direct send, the Assistant's lines) keeps its own answer for a chat that takes nothing.
+      if (opt.confirmed === true) refuseFencedHere(c.sessionId)
       await mirrorYields(c.sessionId)
       return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
     }
@@ -3159,6 +3745,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(e => lostAnswer(e, opt))
     if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
     return r === true
+  }
+
+  /**
+   * Order o7e6d S1 (Lead's decision (1)b): a MESSAGE (the caller asked for a confirmed delivery) that the old way types directly into a chat of
+   * THIS PC that is fenced (runFenced) is refused the way the confirmed way refuses it: 409 code delivery-blocked with the staff-runtime words,
+   * before anything is typed. Before, chats.type (which the fence refuses) only returned false and the agent tools said "That chat stopped
+   * before the message reached it", which is not true: the chat runs and takes nothing. Unfenced chats, the other PCs' paths and every caller
+   * that did not ask for a confirmed delivery (tune, effort, a direct send, the Assistant's lines: each keeps its own answer) are unchanged.
+   */
+  function refuseFencedHere(sid: string) {
+    if (!runFenced(sid)) return
+    logDeliveryBlock(sid, 'staff-runtime')
+    throw Object.assign(apiError(409, `${deliveryBlockWords('staff-runtime')} [staff-runtime]`), { code: 'delivery-blocked' })
   }
 
   /** o4743: the running chat a draft question is about, after the access check (the same as typing in it); where it runs is `pcId`. */
@@ -3956,6 +4555,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   })()
   const FAST_LABELS: Record<string, string> = { ui_control: 'Opening that', ui_screen: 'Looking at the screen', app_chats: 'Checking the chats', floor_roster: 'Checking the floor', app_read_chat: 'Reading that chat', app_read_conversation: 'Reading that chat', memory_search: 'Searching', memory_read: 'Searching', memory_recent: 'Searching', task_list: 'Checking your tasks', task_add: 'Adding a task', watchdog_status: 'Checking the chats', approvals_waiting: 'Checking Approvals', hand_off: 'Asking', order_status: 'Checking on it' }
   let fastSession: FastSession | undefined
+  // Order ofedf (usage): who has the Assistant socket open now (a count per person). A turn's cost is filed under the one person connected; with two or more, or none, it is not filed (the reporter says so).
+  const fastPeople = new Map<string, number>()
+  const fastOwner = (): string | null => (fastPeople.size === 1 ? [...fastPeople.keys()][0] : null)
   /** Orders the Orchestrator's stop ended: GET /voice/ask/<orderId> says "It was stopped." (the order itself is gone once its reply is delivered). */
   const cancelledOrders = new Set<string>()
   /** The answers of handed-off orders, kept an hour for GET /voice/ask/<orderId> (the order itself is gone once its reply is delivered). */
@@ -4012,6 +4614,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
           names: () => fastNames,
           toolLabel: name => FAST_LABELS[name] ?? 'One moment',
           onState: st => fastSession?.hostState(st),
+          // Order ofedf (usage): the turn's running cost, filed under the one person whose Assistant is open (agent/usage; totals only, no text).
+          onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: '' }),
           context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
           memory: readMemory,
           kill: async (pid, startedAt) => {
@@ -4415,16 +5019,71 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  /** Order o7e6d: a tool call a staff Assistant may not make (nothing was done). */
+  function staffDenied(name: string) {
+    log?.info(`staff policy: tool ${String(name).slice(0, 60)} refused`)
+    return Object.assign(apiError(403, 'This Assistant only talks, reads its own chats and looks at its own page; that tool is not open to it.'), { code: 'staff-policy' })
+  }
+
+  /**
+   * Order o7e6d (o4002): a staff Assistant (isStaffAssistant), and any chat started under a policy, gets the staff tools only, deny by default:
+   * only from a chat running in THIS PC's own pool that was started under the staff policy (never a member's chat, an older run, an unknown
+   * policy), and only the four tools by exact name (staff-policy.ts). It decides before every other rule of the call; the CLI's allow-list only
+   * mirrors it. An administrator's own Assistant, the Orchestrator and the workers are not touched.
+   */
+  function staffGate(sid: string, agent: FloorAgent, name: string) {
+    const run = sid ? chats.info(sid) : null
+    // A fenced run stays fenced even when its agent is now someone else's or no staff Assistant (Lead, 15 Nov); S1, B3: the one check (runFenced).
+    if (!isStaffAssistant(agent) && !run?.policy && !(sid && runFenced(sid))) return
+    if (run?.policy !== STAFF_POLICY) throw fencedToolError(sid, name, agent)
+    if (!staffToolAllowed(name)) throw staffDenied(name)
+  }
+
+  /** Order o7e6d S1: the open of an agent whose chat runs here fenced is refused (409, code staff-policy); nothing is stopped or started. */
+  function fencedOpenError(sid: string) {
+    log?.warn(`staff policy: chat ${sid.slice(0, 8)} runs here fenced; the open is refused until it is stopped`)
+    return staffError("Restart required: this chat is running fenced (where it came from can't be proven safe, or it was started without the restrictions it needs). It takes no messages and no tools until it is stopped; stop it, then open it again.")
+  }
+
+  /** Order o7e6d: the refusal of a tool to a fenced run (403, code staff-policy): a staff Assistant's in its own words, any other plainly. */
+  function fencedToolError(sid: string, name: string, agent: FloorAgent | null) {
+    let staff = false
+    try {
+      const a = agent ?? bySession(sid)?.agent
+      staff = !!a && isStaffAssistant(a)
+    } catch { /* the plain words */ }
+    log?.warn(`staff policy: chat ${sid.slice(0, 8)} asked for ${String(name).slice(0, 60)} while fenced (no staff policy where one is needed, or where it came from is not proven); refused`)
+    return Object.assign(apiError(403, staff ? "This Assistant's chat was not started with its restrictions, so its tools are off. Open it again." : "This chat is fenced (where it came from can't be proven safe), so its tools are off. Stop it, then open it again."), { code: 'staff-policy' })
+  }
+
+  /** Order o7e6d: what a staff Assistant's read tools show is that person's own chats only (own-assistant.ts ownAssistantMayUse); null: not a staff chat. */
+  function staffPerson(sid: string, agent: FloorAgent): string | null {
+    return sid && chats.info(sid)?.policy === STAFF_POLICY ? agent.owner?.id ?? '' : null
+  }
+
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
     if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
     // Order o5007: the old-app reader's process: its four read-only tools on the old app's folder, nothing else (old-reader.ts).
     if (oldHost?.keyOwns(key)) return oldCall(oldFiles, name, rawArgs)
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
-    if (mode() === 'member' && !isLocalSession(me.sessionId)) return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
-      if (['send_to_chat', 'app_send_to_chat', 'broadcast_to_chats'].includes(name) && [502, 504].includes(error?.status)) throw Object.assign(apiError(409, 'Delivery is not confirmed after the connection failed; pending messages may already be submitted or may still complete. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
-      throw error
-    })
+    // Order o7e6d: a chat started under a policy is held to it here too, before anything is passed on (staffGate decides for this pool's chats).
+    if (me.policy && (me.policy !== STAFF_POLICY || !staffToolAllowed(name))) throw staffDenied(name)
+    if (mode() === 'member' && !isLocalSession(me.sessionId)) {
+      // S1, B3 (Lead's C): passed to the Server, in this order, each before any request: the Server out of reach (503 hub-offline, as ever); this
+      // PC's copy of the Server's floors not fresh yet, for a run whose origin is not in a store this PC holds (the same retryable 503: try again
+      // in a moment); then the one check (runFenced): a fenced run is refused (403); only then is it passed on (the Server can't see a member's
+      // run). A run whose origin is this PC's own (its floors, its PC Control) never waits for freshness.
+      const link = needHub()
+      if (!originInOwnStore(me) && !replicaIsFresh()) throw Object.assign(apiError(503, `${team?.hub()?.name ?? 'The Server'} has just been reached again and its floors are not known fresh here yet, so this chat's tools wait; try again in a moment.`), { code: 'hub-offline' })
+      if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
+      return request<string>(link, 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
+        if (['send_to_chat', 'app_send_to_chat', 'broadcast_to_chats'].includes(name) && [502, 504].includes(error?.status)) throw Object.assign(apiError(409, 'Delivery is not confirmed after the connection failed; pending messages may already be submitted or may still complete. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
+        throw error
+      })
+    }
+    // S1, B3: this PC's own chat: the one check, judged here (no Server needed); staffGate asks it again inside the tool.
+    if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
     return toolFor(me.sessionId, name, rawArgs)
   }
 
@@ -4437,6 +5096,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const mine = as ?? floors.bySession(sid)
     if (!mine) throw apiError(409, "This chat isn't an agent on a floor any more.")
     const { floor, agent } = mine
+    // Order o7e6d: deny by default for a person's own Assistant and every chat with a policy, before any other rule (staffGate).
+    staffGate(sid, agent, name)
     const args = isObject(rawArgs) ? rawArgs : {}
     const tag = `${agent.name}, chat ${sid.slice(0, 8)}`
     // F-118: a chat does what its OWNER may. The owner of the app (every chat there was before) is unchanged.
@@ -4545,6 +5206,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         requireHostAdoption()
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
         access.needChat(me, a, 'owner', toolWhere)
+        // Order o7e6d (H1, Agent 3's review): a staff Assistant opens only as native Claude under the staff policy: no profile asked for, none it
+        // has itself (its own codex-in-claude-v1 would take the managed branch below, select/seal/commit, before any later refusal), no other PC.
+        // Refused here, before that branch: nothing is selected, sealed, committed or launched (openChat checks the rest).
+        if (isStaffAssistant(a) && (args.executionProfile !== undefined || args.restoreHistory !== undefined || executionIdentityOf(a, defaultsNow()).profile !== 'claude-native-v1' || (typeof args.pc === 'string' && args.pc.trim() !== '' && args.pc !== self().id && args.pc.trim().toLowerCase() !== self().name.toLowerCase()))) throw staffError("A person's own Assistant opens on the Server only, as native Claude.")
         const explicitProfile = args.executionProfile
         if (args.restoreHistory !== undefined && (args.restoreHistory !== true || explicitProfile !== 'codex-native-v1')) throw executionHttpError('execution-invalid', 'selection')
         if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1' && explicitProfile !== 'codex-native-v1') throw executionHttpError('execution-invalid', 'open')
@@ -4619,15 +5284,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'list_chats': {
         const byId = new Map(floor.agents.map(a => [a.id, a]))
+        // o7e6d: a staff Assistant sees its person's own chats only (never one shared with them).
+        const person = staffPerson(sid, agent)
         const others = Object.entries(whereAll())
           .filter(([s]) => s !== sid)
           .map(([s, w]) => ({ s, w, at: floors.bySession(s) }))
-          .filter(x => x.at?.floor.id === floor.id && access.rights(me, x.at.agent) !== null)
+          .filter(x => x.at?.floor.id === floor.id && access.rights(me, x.at.agent) !== null && (person === null || ownAssistantMayUse(x.at.agent.owner?.id, person)))
           .map(({ s, w, at }) => ({ sessionId: s, agent: at!.agent.name, role: byId.get(at!.agent.id)?.role ?? '', doing: w.state, pc: w.name }))
         return json({ floor: floor.name, you: agent.name, chats: others })
       }
-      case 'floor_roster':
-        return json(rosterOf({ ...floor, agents: floor.agents.filter(a => a.id === agent.id || access.rights(me, a) !== null) }, agent))
+      case 'floor_roster': {
+        // o7e6d: a staff Assistant sees its person's own agents only.
+        const person = staffPerson(sid, agent)
+        return json(rosterOf({ ...floor, agents: floor.agents.filter(a => a.id === agent.id || (access.rights(me, a) !== null && (person === null || ownAssistantMayUse(a.owner?.id, person)))) }, agent))
+      }
       case 'watchdog_status':
         return json(watchdogView())
       // Order o16d2: a picture or a video shown in this chat (media.ts). The answer is the JSON line the page draws it from (shared/media.ts).
@@ -4641,6 +5311,52 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json({ media: await mediaShelf.share(args, { sessionId: sid, agent: agent.name }), shown: 'It is in the chat now, as a picture or a video he can open, play and save.' })
       }
       // Order o3963: a button for a PC's Control screen (shared/screen-bubble.ts). Only names the PC: nothing connects until his tap opens the screen.
+      // Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): the overlay
+      // Assistant reads and types in an SSH terminal on the Server (pc-ssh-term.ts SshAssist, by the rules of shared/ssh-assist.ts: never at a secret
+      // or host-key question; what deletes recursively, shuts down, deletes a user or wipes a disk waits as a card for his own tap). For now the
+      // owner of the app's Assistant on every PC, in his scope; slice 3: a person's own Assistant only on the PCs SSH is open to that person on (Settings ›
+      // Access, 'pc-ssh@<pcId>'), in that person's own scope (their sessions only). Every answer carries the private mark.
+      case 'ssh_open':
+      case 'ssh_read':
+      case 'ssh_type':
+      case 'ssh_close': {
+        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, 'Only the overlay Assistant uses SSH terminals; ask it (it is the sparkle button in the app).')
+        const admin = access.isAdmin(me)
+        if (!admin && !me.person) throw authError(403, 'SSH terminals are for a signed-in person’s own Assistant.', 'admin-only')
+        const ssh = o.ssh?.() ?? null
+        if (!ssh) throw apiError(503, 'SSH terminals are not available here (they run on the Server).')
+        const as = admin ? { scope: '@owner', who: `${agent.name} on ${floor.name} (the Assistant)` } : { scope: `person:${me.person!.id.toLowerCase()}`, who: `${agent.name} on ${floor.name} (the Assistant of ${me.person!.username})` }
+        /** A person who is not the owner: only on a PC SSH is open to them on, checked at every call (it can be taken away). */
+        const mayOnPc = (id: string) => {
+          if (admin || o.featureAccess?.allows(me, 'pc-ssh', id) === true) return
+          o.auth?.deny(me, 403, 'not-allowed', toolWhere, sid)
+          throw authError(403, 'SSH to that PC is not open to the person this Assistant belongs to. The owner of this app opens it, PC by PC, in Settings › Access.', 'not-allowed')
+        }
+        const pcs = controlDeviceCatalogue()
+        const pcId = (): string | undefined => {
+          const want = typeof args.pc === 'string' ? args.pc.trim() : ''
+          if (!want) return undefined
+          const pc = pcs.find(p => p.id === want) ?? pcs.find(p => p.name.toLowerCase() === want.toLowerCase())
+          if (!pc) throw apiError(404, `There is no PC called "${want}". The PCs are: ${pcs.map(p => p.name).join(', ') || 'none'}.`)
+          mayOnPc(pc.id)
+          return pc.id
+        }
+        const pick = () => {
+          const p = { session: typeof args.session === 'string' ? args.session : undefined, pcId: pcId() }
+          // A session named by its id: its PC is checked too.
+          if (!admin && p.session !== undefined && p.pcId === undefined) mayOnPc(ssh.read(as, { session: p.session }, 1).pcId)
+          return p
+        }
+        const lines = typeof args.lines === 'number' ? args.lines : 40
+        if (name === 'ssh_open') {
+          const id = pcId()
+          if (!id) throw apiError(400, 'Say which PC: pc is its name (like Z800) or its id.')
+          return sshAnswer(sshWords(await ssh.open(as, id, { user: args.user, host: args.host, port: args.port })))
+        }
+        if (name === 'ssh_read') return sshAnswer(sshWords(ssh.read(as, pick(), lines)))
+        if (name === 'ssh_close') return sshAnswer(sshWords(ssh.close(as, pick())))
+        return sshAnswer(sshWords(await ssh.type(as, pick(), { text: args.text, enter: args.enter, key: args.key, wait: args.wait, lines: args.lines })))
+      }
       case 'show_screen': {
         const want = typeof args.pc === 'string' ? args.pc.trim() : ''
         if (!want) throw apiError(400, 'Say which PC: pc is its name (like Server) or its id.')
@@ -4687,6 +5403,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'read_chat': {
         const c = siblingOf(floor, args.sessionId)
         mayOn(c.sessionId, 'view')
+        // o7e6d: a staff Assistant reads its person's own chats only.
+        const person = staffPerson(sid, agent)
+        if (person !== null && !ownAssistantMayUse(bySession(c.sessionId)?.agent.owner?.id, person)) throw staffDenied(name)
         return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
       }
       case 'send_to_chat': {
@@ -4835,7 +5554,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'ui_control':
       case 'ui_modules':
       case 'ui_invoke': {
-        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves the screen; ask it (it is the sparkle button in the app).")
+        // F-162 slice B: a person's own Assistant too; its calls reach only that person's own pages (the bridge scopes by the chat's owner).
+        if (!isOrchestratorAgent(floor.name, agent) && !isPersonAssistant(agent)) throw apiError(403, "Only the overlay assistant moves the screen; ask it (it is the sparkle button in the app).")
+        // o7e6d: a staff member's own Assistant (not the owner) looks at the screen only (ui_screen), and only the app's main pages.
+        const staff = isPersonAssistant(agent) && !access.isAdmin(access.asChat(agent))
+        if (staff && name !== 'ui_screen') throw apiError(403, 'Your Assistant can only look at the screen (ui_screen).')
         // "Goals on mobile: use the API" (Settings › Assistant, on unless turned off): on a phone the CRM Goals page is not driven. What opens
         // it, or its handlers, is refused here; the page refuses a press or typing while it is on the Goals page (told to by goalsApi).
         if (name === 'ui_invoke') {
@@ -4854,6 +5577,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           goalsApi ? { ...args, goalsApi: true } : args,
           undefined,
           as,
+          staff ? staffMayScreen : undefined,
         )
         return typeof out === 'string' ? out : json(out)
       }
@@ -5365,6 +6089,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     res.end(body)
   }
 
+  /**
+   * Order o7e6d (Lead, 15 Nov: chat-only scope): a staff Assistant takes no file and serves none. The raw file routes skip the route runner: an
+   * upload writes a file and answers its path on the PC (a line that could then reach the CLI), a download looks files up here or on another PC.
+   * So for a staff Assistant (isStaffAssistant), a chat of it running under a policy, or a fenced run of it, both are refused before any body is
+   * read, any file written or looked up, or anything passed to another PC, whoever asks, the owner too. Every other chat exactly as before.
+   */
+  function refuseStaffFiles(agent: FloorAgent) {
+    const sid = agent.sessionId
+    const run = sid ? chats.info(sid) : null
+    if (isStaffAssistant(agent) || run?.policy !== undefined) throw staffError("A person's own Assistant takes plain messages only: no file is sent to it or served from it.")
+    // S1, B3: the chat bound to it now is a fenced run (its lineage, an earlier finding, an untrusted record): no file either.
+    if (sid && runFenced(sid)) throw staffError("This chat is fenced (where it came from can't be proven safe): no file is sent to it or served from it. Stop it, then open it again.")
+  }
+
   /** POST …/agents/:id/attach?name=photo.jpg, the file as the body: kept on the chat's PC; answers where. */
   async function attachUpload(req: IncomingMessage, res: ServerResponse, floorId: string, agentId: string, url: URL) {
     if (req.method !== 'POST') throw apiError(405, 'POST the file')
@@ -5509,6 +6247,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function humanTarget(r: ProofRequest | undefined, agent: FloorAgent, need: 'type' | 'owner' = 'type') {
     const caller = requireCrmHuman(o.auth, r)
     if (r) r.caller = caller
+    // o7e6d (refinement2 line 56): approvals and Send as me are the owner's. A non-admin (a staff Assistant or any other person) is refused here,
+    // before any native write; every approval and cancel recheck after an await calls this again (the typeKeys callbacks).
+    if (!access.isAdmin(caller)) throw authError(403, 'This is for the owner of this app.', 'admin-only')
     access.needChat(caller, agent, need, 'human approval/send')
     const at = agent.sessionId ? whereAll()[agent.sessionId] : null
     if (mode() === 'member' && (at?.id ?? agent.homePc) !== self().id) throw Object.assign(apiError(409, 'Sign in on the Server page to act on a chat running on another PC.'), { code: 'hub-sign-in-required', hubOrigin: null })
@@ -5731,7 +6472,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = agentOf(floorOf(req.floorId), req.agentId)
     const person = humanTarget(rq, at, at.sessionId && whereAll()[at.sessionId] ? 'type' : 'owner')
     const humanAuthority = () => {
-      try { const current = requireCrmHuman(o.auth, rq); return current.sid === person.sid && current.person?.id === person.person?.id }
+      // o7e6d: the owner only, rechecked at the native write (after sayTo's awaits), not just the same person.
+      try { const current = requireCrmHuman(o.auth, rq); return current.sid === person.sid && current.person?.id === person.person?.id && access.isAdmin(current) }
       catch { return false }
     }
     const floor = floorOf(req.floorId)
@@ -6194,6 +6936,30 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { cols: typeof r.cols === 'number' ? r.cols : undefined, rows: typeof r.rows === 'number' ? r.rows : undefined, takeOver: r.takeOver === true, here: r.here === true }
   }
 
+  /**
+   * Order oa09e: his overlay Assistant (the hub's one Orchestrator chat, F-086), found or made HERE from the hub's whole list, never by a page from the list
+   * it was sent. A page whose list lacked it made a new "Assistant" floor at each load: four empty ones on 14 Nov 2026, never opened (it could not see
+   * the ones it made either). The chat with the duty (whatever it is called now) is the answer; with none, the first floor named "Assistant" gets the
+   * chat, else a new floor "Assistant" whose boss becomes it, and save() gives it the duty (ensureDuty). Nothing awaits from the look to the write, so two
+   * pages asking at once get the same chat. `role` and `md` are the page's (its brief); the name is "Assistant", the one ensureDuty knows.
+   */
+  function ensureHubAssistant(raw: unknown, as: ChatOwner): { floor: string; agent: string; created: boolean } {
+    const b = isObject(raw) ? raw : {}
+    const want = { name: 'Assistant', role: typeof b.role === 'string' ? b.role : '', md: typeof b.md === 'string' ? b.md : '' }
+    const list = floors.list().filter(f => !isPcControl(f))
+    for (const f of list) {
+      const a = f.agents.find(x => isOrchestratorAgent(f.name, x))
+      if (a) return { floor: f.id, agent: a.id, created: false }
+    }
+    const named = list.find(f => f.name.trim().toLowerCase() === 'assistant')
+    if (named) return { floor: named.id, agent: floors.addAgent(named.id, want, as).agent.id, created: true }
+    const made = floors.create('Assistant', as)
+    const boss = made.agents.find(a => a.isBoss) ?? made.agents[0]
+    if (!boss) return { floor: made.id, agent: floors.addAgent(made.id, want, as).agent.id, created: true }
+    floors.patch(made.id, { agents: made.agents.map(a => (a.id === boss.id ? { ...a, ...want } : a)) }, as)
+    return { floor: made.id, agent: boss.id, created: true }
+  }
+
   type Handler = (m: string[], r: MountRequest) => unknown
   /** `local`: a member answers it itself; the rest it passes to its hub, which keeps the floors. */
   const routes: [string, RegExp, Handler, 'local'?][] = [
@@ -6276,6 +7042,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
       'local',
     ],
     ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined, access.ownerOf(callerOf(r))) })],
+    // Order oa09e: the overlay asks for its Assistant here (a member passes it on: the hub decides, from its whole list). His only (POLICY).
+    ['POST', /^\/assistant$/, (_, r) => ensureHubAssistant(r.body, access.ownerOf(callerOf(r)))],
+    // Order o7e6d (H2, S1): every unsafe staff Assistant run and the fence record's own problems (staffPreflight), read only, the owner's only
+    // (agent/agentic/access.ts: OWNER; a member's page asks the Server, which sees every PC). Empty, with sign-in on, before staff access opens.
+    ['GET', /^\/staff\/preflight$/, () => ({ unsafe: staffPreflight() })],
+    // F-162 slice A: a person's own Assistant floor ("My Assistant", their boss), made on their first open. Feature 'assistant' (shared/access.ts ROUTES).
+    ['GET', /^\/own-assistant$/, (_, r) => ({ floor: ownAssistantFloor(floors.list(), callerOf(r).person?.id ?? '')?.id ?? null })],
+    [
+      'POST',
+      /^\/own-assistant$/,
+      (_, r) => {
+        const c = callerOf(r)
+        if (!c.person) throw apiError(400, 'Sign in first.')
+        const have = ownAssistantFloor(floors.list(), c.person.id)
+        if (have) return { floor: have.id, created: false }
+        // F-162 slice B: its boss is that person's Assistant (duty 'person-assistant', never the hub's Orchestrator).
+        const made = floors.create(OWN_ASSISTANT_FLOOR, access.ownerOf(c))
+        const boss = made.agents.find(a => a.isBoss) ?? made.agents[0]
+        // Order o7e6d (Lead, 15 Nov): a staff member's new Assistant is native Claude by the Server's own rule, its engine set here, never the PC's
+        // default engine (Codex, OpenCode). Not an administrator's own (it is an owner's chat and follows the defaults as every other does). Only a
+        // new one: an existing Assistant's record is never switched (an incompatible one is refused when it opens, before any seal).
+        if (!access.isAdmin(c)) floors.patch(made.id, { agents: made.agents.map(a => (a.id === boss.id ? { ...a, engine: 'claude' as const } : a)) }, access.ownerOf(c))
+        return { floor: floors.setPersonAssistantDuty(made.id, boss.id).id, created: true }
+      },
+    ],
     [
       'POST',
       /^\/floors\/reorder$/,
@@ -6411,6 +7202,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!executionService) throw executionHttpError('execution-capability-required', 'open', request.openIntentId)
         return executionService.open(executionScope(id, agentId, r), request)
       }
+      // Order o7e6d (plan A, Lead's GO): a never-run staff Assistant of the Server's, opened from this member PC's page, is opened BY the Server.
+      if (mode() === 'member' && !isLocalFloor(id) && staffFreshHere(id, agentId)) return forwardFirstOpen(id, agentId, r)
       return openChat(id, agentId, openRequest(r.body))
     }, 'local'],
     [
@@ -6738,6 +7531,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (typeof key !== 'string' || !key) throw apiError(401, 'Missing x-sad-chat-key')
         const me = chats.byKey(key)
         if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
+        // Order o7e6d: a chat with a policy, or a staff Assistant's quarantined run, is told the staff tools only (none unless it runs under the
+        // staff policy). Its shim does not ask.
+        if (me.policy || isStaffSid(me.sessionId)) return r.query.get('stamp') === '1' ? { version: STAFF_TOOLS_STAMP } : { version: STAFF_TOOLS_STAMP, tools: me.policy === STAFF_POLICY ? STAFF_TOOLS : [] }
         // Only a request that says it is asking for the list (not just checking its stamp) is a chat given the list.
         if (r.query.get('given') === '1') toolsSeen.note(me.sessionId, TOOLS_NOW)
         return r.query.get('stamp') === '1' ? { version: TOOLS_NOW } : { version: TOOLS_NOW, tools: TOOLS }
@@ -6755,6 +7551,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // o655f (Stage 1): claude's UserPromptSubmit hook is the proof that this chat TOOK the prompt (10-110 ms after Enter, with the exact text),
         // so a send waiting on it is confirmed at once: no screen reading. Noted before the recall below, which may take seconds.
         const info = chats.byKey(key)
+        // Order o7e6d (Lead, 15 Nov): a chat with a policy, or a staff Assistant's quarantined run. Its report confirms a send of that chat only
+        // (a staff-policy run), never moves it to another session (no session id is taken from the report), and gets an empty answer BEFORE any
+        // recall: shared memory is never read for it, and its 4-tool gate is not bypassed (memory_* stay refused).
+        if (info && (info.policy || isStaffSid(info.sessionId))) {
+          if (info.policy === STAFF_POLICY) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, null)
+          return { text: '' }
+        }
         if (info) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, typeof r.body.sessionId === 'string' ? r.body.sessionId : null)
         return { text: await callTool(key, 'memory_recall', { prompt: r.body.prompt.slice(0, 20_000) }) }
       },
@@ -6808,6 +7611,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   function executionScope(id: string, agentId: string, r: MountRequest): ExecutionIntentScope {
     const agent = workflowExecutionAgent(id, agentId), caller = callerOf(r)
+    // Order o7e6d: a staff Assistant has no managed execution (open, select, verify, status, capability): refused before any dispatch.
+    if (isStaffAssistant(agent)) throw executionHttpError('execution-forbidden', 'authorization')
     if (!executionService || !caller.person || !agent.homePc) throw executionHttpError('execution-forbidden', 'authorization')
     const ownerId = agent.owner?.id
     if (!ownerId) throw executionHttpError('execution-forbidden', 'authorization')
@@ -7100,6 +7905,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(() => localMcpInventory())
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
+        // Order o7e6d (plan A): a member asks, before it passes a staff Assistant's first open here, whether this Server runs the staff policy.
+        case 'staff-policy':
+          return answer(() => ({ version: 1, policy: STAFF_POLICY }))
         case 'delivery-authorize':
           return answer(raw => humanInputGrants.authorize(from.id, team?.member(from.id)?.token, raw))
         case 'pc-control-capabilities':
@@ -7378,7 +8186,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const typing = () => {
       const at = bySession(sid)
       if (at && !runtimeSidAllowed(sid)) return false
-      return !at || access.rights(caller, at.agent)?.can !== 'view'
+      // o7e6d: the same rule as every other typing path (access.mayType): a non-owner types into their own person-assistant only.
+      // o7e6d: a chat on no floor (moved, deleted or not yet placed) is the owner's to type into only; a non-owner's socket never keeps its keys.
+      return at ? access.mayType(caller, at.agent) : access.isAdmin(caller)
     }
     return (ws: WsSocket) => {
       const current = bySession(sid), running = chats.info(sid)
@@ -7624,6 +8434,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return (req, res, caller) => {
           // F-118: a file into a chat is typing into it.
           access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])), 'type', 'POST attach')
+          // Order o7e6d: never into a staff Assistant (before the body is read, a file written or anything passed on), whoever asks.
+          refuseStaffFiles(agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])))
           requireLegacyExecution(agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])), defaultsNow())
           return attachUpload(req, res, decodeURIComponent(up[1]), decodeURIComponent(up[2]), url)
         }
@@ -7631,6 +8443,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (down)
         return (req, res, caller) => {
           access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(down[1])), decodeURIComponent(down[2])), 'view', 'GET attachment')
+          // Order o7e6d: nor from one (before any file is looked up here or asked of another PC).
+          refuseStaffFiles(agentOf(floorOf(decodeURIComponent(down[1])), decodeURIComponent(down[2])))
           return attachDownload(req, res, decodeURIComponent(down[1]), decodeURIComponent(down[2]), decodeURIComponent(down[3]))
         }
       // Order o16d2: a picture or video an agent showed in its chat: by its unguessable id only (never a path), the owner's only, read only, with Range.
@@ -7699,7 +8513,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // Order o355e: a member PC passes its pages on to the Server's bridge (the Assistant's ui tools run there); the Server keeps its own.
       if (rest === '/ui') return (ws, caller) => (mode() === 'member' ? relayUiPage(ws, caller ?? OPEN) : ui.socket()(ws, uiWho(caller ?? OPEN)))
       // F-086/F-087: the fast Assistant's stream for the web page (shared/fast.ts); no host = off = no such socket.
-      if (rest === '/fast') return fastSession?.socket('web') ?? null
+      if (rest === '/fast') {
+        const h = fastSession?.socket('web')
+        if (!h) return null
+        return (ws, caller) => {
+          const id = caller?.person?.id ?? null
+          if (id) fastPeople.set(id, (fastPeople.get(id) ?? 0) + 1)
+          ws.onClose(() => {
+            if (!id) return
+            const n = (fastPeople.get(id) ?? 1) - 1
+            if (n > 0) fastPeople.set(id, n)
+            else fastPeople.delete(id)
+          })
+          h(ws)
+        }
+      }
       // Order o5007: the old-app reader's stream (the same frames); switched off, its folder not here, or a member PC: no such socket.
       if (rest === OLD_SOCKET) {
         if (!oldSession) startOldReader()
@@ -7740,14 +8568,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     callTool,
     routeKeys: () => routes.map(([m, p]) => policyKey(m, p)),
     executionRouteKeys: () => executionRoutes.map(([m, p]) => policyKey(m, p)),
+    staffPreflight,
     serve,
     restartChat,
     restartCodexChats,
     resumeChat,
     busyChats: () => Object.values(chats.states()).filter(st => st === 'running' || st === 'question').length,
+    updateBlockers: () => staffFence.problems().map(p => STAFF_FENCE_WORDS[p] ?? `the staff fence record has a problem (${p})`),
     quiet: {
       // The host has taken its chats over and recovery has reopened its list: before that "no chat" means "not known yet".
-      ready: () => hostAdopted && recoveryDone,
+      // Order o7e6d S1 (Lead's approval, its own change): and the staff fence record is sound. While it is bad, dirty (a write may not have
+      // landed) or holding a fence only in memory, the automatic Update waits (an Update would end and reopen every chat with nothing on disk
+      // to say which runs were fenced); the coordinator reads this at every look, at its last look and while the build waits. GET
+      // /staff/preflight names the problem; only a person clears it. A sound record: exactly as before.
+      ready: () => hostAdopted && recoveryDone && staffFence.problems().length === 0,
       // Every chat running on a PC this hub sees (its own and each member's), with its state: a chat on another PC is cut from the hub too.
       chats: () => Object.fromEntries(Object.entries(whereAll()).map(([sid, w]) => [sid, { state: w.state, name: floors.bySession(sid)?.agent.name }])),
       drafts: () => chats.live().filter(c => chats.drafting(c.sessionId)).length,
@@ -7778,6 +8612,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       threadWatchers.clear()
       // o13d4: started here as before, and kept: the returned promise waits for it (its pins engine saves into <state>/crm-pins last).
       const crmClosed = crmFiles.close()
+      // Order ofedf: the usage ledger is saved and its timer stops (what is not yet sent waits in the file).
+      void usage?.close().catch(() => undefined)
       // Order o5dc4: the Server's browser stops with the app.
       const browserClosed = browser.close().catch(() => undefined)
       // F-211: what was sent is saved; the parts on their way stay in their waiting folder and go on at the next start.

@@ -42,7 +42,12 @@ function noWidth(ch: string): boolean {
   return (c >= 0x200b && c <= 0x200d) || c === 0x2060 || (c >= 0xfe00 && c <= 0xfe0f) || /^\p{M}$/u.test(ch)
 }
 
-export function createScreen(cols0 = 120, rows0 = 32): Screen {
+/** Order o68f0: the SSH terminal's text (agent/ssh-text.ts) keeps the lines that scroll off the top; a chat's screen has no such use. */
+export interface ScreenOptions {
+  onScrollOff?(line: string): void
+}
+
+export function createScreen(cols0 = 120, rows0 = 32, opts: ScreenOptions = {}): Screen {
   let cols = Math.max(1, cols0)
   let rows = Math.max(1, rows0)
   let cells = grid(cols, rows)
@@ -64,8 +69,9 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
 
   function scrollUp(n: number) {
     for (let i = 0; i < n; i++) {
-      cells.shift()
+      const gone = cells.shift()
       cells.push(blank(cols))
+      if (gone && opts.onScrollOff) opts.onScrollOff(unmark(gone.join('')).replace(/\s+$/, ''))
     }
   }
   function scrollDown(n: number) {

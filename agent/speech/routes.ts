@@ -11,7 +11,10 @@ import { pcmMs, wavToPcm } from './wav.ts'
 //   GET  /speech/status                   {available, why?, model, loaded, busy, voice}   (voice: the PC voice's status, F-221)
 //   POST /speech/warm                     load the model now (the mic was pressed)
 //   POST /speech/transcribe?lang=&before=&words=a,b&guess=1   one utterance, whole, as a raw body: audio/wav
-//                                         (16 kHz mono 16-bit) or application/octet-stream (that PCM) -> {text, raw, audioMs, ms}
+//                                         (16 kHz mono 16-bit) or application/octet-stream (that PCM) -> {text, raw, dropped?, audioMs, ms}
+//                                         o0de2 round 3: `dropped` when ALL of what Whisper wrote was one of its known inventions on
+//                                         silence or noise (words.ts: "Thank you.", "you", "[BLANK_AUDIO]"...): what it was; the text is ''.
+//                                         Live talk takes a dropped "Thank you." as his backchannel, not as a turn with no words.
 //                                         F-221: guess=1 is live talk's guess at his first short pause: when Whisper has anything running
 //                                         or queued, or is loading the model, it is 409 {busy: true} at once, and nothing is queued. A request
 //                                         the page drops (an aborted fetch, a closed tab) before Whisper has started on it (still queued, or

@@ -48,22 +48,26 @@ export interface Feature {
   locked?: string
   /** Another feature this one needs open too (a PC control tab needs the PC control page). */
   needs?: string
+  /**
+   * Order o68f0: chosen for each PC on its own (Settings › Access lists the PCs under it). Its choices are kept as '<key>@<pcId>'; the feature is
+   * open to a person when it is open to them on at least one PC (what the page's menu and the Server's gate need), and each PC's own routes are
+   * checked for that PC (allows(caller, key, pcId)).
+   */
+  perPc?: true
 }
-
-const RUNS_AS_YOU = 'Runs on your own CRM sign-in, so it would show others what you see.'
 
 export const FEATURES: readonly Feature[] = [
   // Pages, in the menu's order.
   { key: 'home', group: 'pages', label: 'Home', blurb: 'Where the app starts.', pages: ['/'] },
   { key: 'features', group: 'pages', label: 'Features', blurb: 'What is asked for and what is built (to read; ticking stays yours).', pages: ['/features'] },
   { key: 'themes', group: 'pages', label: 'Themes', blurb: 'The six looks, light and dark.', pages: ['/themes'] },
-  { key: 'agents', group: 'pages', label: 'Agents', blurb: 'Their floors and the agents shared with them, and making their own. What you shared stays open to them anyway.', pages: ['/agents', '/chats'] },
+  { key: 'agents', group: 'pages', label: 'Agentic Platform', blurb: 'Their floors and the agents shared with them, and making their own. What you shared stays open to them anyway.', pages: ['/agents', '/chats'] },
   { key: 'old-reader', group: 'pages', label: 'Live talking', blurb: 'Questions about the old app, answered in seconds (both Live talking pages).', pages: [OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE] },
   { key: 'pc-control', group: 'pages', label: 'PC control', blurb: 'The PCs and their tabs (each tab below is chosen on its own).', pages: ['/pc-control'] },
   { key: 'browser', group: 'pages', label: 'Browser', blurb: 'A browser on the Server.', pages: ['/browser'], locked: 'It is your browser on the Server, with your sign-ins.' },
   { key: 'whatsapp', group: 'pages', label: 'WhatsApp', blurb: 'Your WhatsApp.', pages: ['/whatsapp'], locked: 'It is your own WhatsApp.' },
   { key: 'tasks', group: 'pages', label: 'Tasks', blurb: 'Your task list: there is one list, so whoever you open it to sees and edits yours.', pages: ['/tasks'] },
-  { key: 'crm-files', group: 'pages', label: 'CRM files', blurb: 'The CRM’s files.', pages: ['/drive'], locked: `${RUNS_AS_YOU} Each person’s own CRM files come in a later step.` },
+  { key: 'crm-files', group: 'pages', label: 'CRM files', blurb: 'The CRM’s files, with each person’s own CRM sign-in. The PC’s drive stays the owner’s.', pages: ['/drive'] },
   { key: 'chris', group: 'pages', label: 'Hey Chris', blurb: 'The phone app’s Hey Chris screen, to look at (no microphone).', pages: ['/chris'] },
   { key: 'goals', group: 'pages', label: 'Goals', blurb: 'Their own CRM goals and today’s tasks, on their own CRM sign-in (the CRM decides what they see).', pages: ['/goals'] },
   { key: 'crm', group: 'pages', label: 'CRM', blurb: 'The CRM in the app, full window, on their own CRM sign-in (the CRM decides what they see).', pages: ['/crm'] },
@@ -80,7 +84,15 @@ export const FEATURES: readonly Feature[] = [
   { key: 'pc-screen', group: 'pc-control', label: 'Screen', blurb: 'Controlling a PC’s screen.', needs: 'pc-control', locked: 'It controls your PCs’ screens and keyboards.' },
   { key: 'pc-updates', group: 'pc-control', label: 'Updates', blurb: 'Updating each PC.', needs: 'pc-control', locked: 'It updates and restarts your PCs.' },
   { key: 'pc-ports', group: 'pc-control', label: 'Ports', blurb: 'Each PC’s ports and Tailscale addresses, read only.', needs: 'pc-control' },
-  { key: 'pc-ssh', group: 'pc-control', label: 'SSH', blurb: 'A terminal on the PC.', needs: 'pc-control', locked: 'It is a terminal on your PCs, as you.' },
+  // Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): chosen per PC.
+  {
+    key: 'pc-ssh',
+    group: 'pc-control',
+    label: 'SSH',
+    blurb: 'A live terminal on the PCs you choose, through the Server’s own SSH key: they can do there what that login can, and their own Assistant may use it by the same rules (it never types a password; what deletes or shuts down waits for their tap).',
+    needs: 'pc-control',
+    perPc: true,
+  },
   { key: 'pc-resources', group: 'pc-control', label: 'Resources', blurb: 'Each PC’s CPU, memory, drives and processes, read only.', needs: 'pc-control' },
   { key: 'pc-deps', group: 'pc-control', label: 'Dependencies', blurb: 'What the app needs on each PC and the command that fixes a missing one, read only.', needs: 'pc-control' },
   // The Assistant, voice and talk.
@@ -98,6 +110,23 @@ export const SUGGESTED: readonly string[] = ['assistant', 'agents', 'goals', 'cr
 
 const BY_KEY = new Map(FEATURES.map(f => [f.key, f]))
 export const featureOf = (key: string): Feature | undefined => BY_KEY.get(key)
+
+/** Order o68f0: a PC's device id (identity ids: 16 lower-case letters and digits). */
+export const isPcId = (v: unknown): v is string => typeof v === 'string' && /^[a-z0-9]{16}$/.test(v)
+/** Order o68f0: the key a per-PC choice is kept under. */
+export const perPcKey = (feature: string, pcId: string) => `${feature}@${pcId}`
+/**
+ * Order o68f0: a choice's key read back: its feature and, for a per-PC feature, the PC. Null for a key that is no feature's, a per-PC feature
+ * without its PC (it has no whole choice) or a PC on a feature that is not chosen per PC.
+ */
+export function choiceKey(key: string): { feature: Feature; pcId: string | null } | null {
+  const at = key.indexOf('@')
+  const feature = featureOf(at < 0 ? key : key.slice(0, at))
+  if (!feature) return null
+  if (at < 0) return feature.perPc ? null : { feature, pcId: null }
+  const pcId = key.slice(at + 1)
+  return feature.perPc && isPcId(pcId) ? { feature, pcId } : null
+}
 
 /** The feature of a page of the app, or null for a page that is not one (anything not listed is the owner's). */
 export function pageFeature(pathname: string): Feature | null {
@@ -145,14 +174,18 @@ export const ROUTES: readonly RouteRule[] = [
   r('POST', `${AGENT}\\/(tune|move|chat|run-on|terminate|restart|session|say|say-direct|draft\\/clear|share|attach)`, ['agents'], true),
   r('GET', `${AGENT}\\/(messages|chat|draft|deliveries|deliveries\\/[^/]+|attachment\\/[^/]+)`, ['agents'], true),
   r('GET', `${A}\\/(offline-chats|codex\\/status|opencode\\/status|codex\\/settings|sync-mode|defaults|engine-switch-capabilities|previews|runs)`, ['agents', 'pc-control'], true),
-  r('GET', `${A}\\/approvals`, ['agents'], true),
-  r('POST', `${A}\\/approvals\\/(answer|cancel)`, ['agents'], true),
-  r('POST', `${A}\\/send-as-me`, ['agents'], true),
+  // o7e6d (refinement2 line 56): approvals and Send as me are the owner's only: no feature and no share opens them (the policy is OWNER in agent/agentic/access.ts).
   r('WS', `${A}\\/(terminal|chat)`, ['agents', 'pc-chats'], true),
   r('WS', `${A}\\/events`, ['agents', 'pc-control'], true),
   // The Assistant's hands on this person's own pages (order o355e made the bridge per person: their pages join only their own scope).
   r('WS', `${A}\\/ui`, ['assistant']),
-  // PC control: the page, its chats, and the read-only tabs.
+  // F-162 slice A: a person's own Assistant floor (agent/agentic/own-assistant.ts): read it, and make it on their first open.
+  r('GET', `${A}\\/own-assistant`, ['assistant']),
+  r('POST', `${A}\\/own-assistant`, ['assistant']),
+  // PC control: the page, its chats, and the read-only tabs. Order o68f0: SSH (its mount checks each PC: allows(caller, 'pc-ssh', pcId)).
+  r('GET', '\\/pc-ssh\\/pcs\\/[^/]+\\/(target|sessions|status)', ['pc-ssh']),
+  r('POST', '\\/pc-ssh\\/pcs\\/[^/]+\\/(session|test)', ['pc-ssh']),
+  r('WS', '\\/pc-ssh\\/terminal', ['pc-ssh']),
   r('GET', `${A}\\/pc-control`, ['pc-control']),
   r('GET', `${A}\\/pc-control\\/pcs\\/[^/]+`, ['pc-control']),
   r('POST', `${A}\\/pc-control\\/pcs\\/[^/]+\\/slots\\/[^/]+\\/(open|stop|engine)`, ['pc-chats']),
@@ -209,6 +242,8 @@ export interface AccessChange {
   /** Who changed it (the owner). */
   by: { id: string; name: string }
   feature: string
+  /** Order o68f0: the PC, for a feature chosen per PC. */
+  pcId?: string
   from: AccessChoice
   to: AccessChoice
 }
@@ -233,9 +268,20 @@ export function cleanChoice(v: unknown): AccessChoice | null {
 
 /** Order o929e: whether anything at all is open to others (the tab says "Nothing is open to others yet" while not). */
 export const anythingOpen = (choices: Readonly<Record<string, AccessChoice>>) =>
-  Object.entries(choices).some(([k, c]) => !featureOf(k)?.locked && (c.mode === 'everyone' || (c.mode === 'people' && c.people.length > 0)))
+  Object.entries(choices).some(([k, c]) => { const ck = choiceKey(k); return !!ck && !ck.feature.locked && (c.mode === 'everyone' || (c.mode === 'people' && c.people.length > 0)) })
 
 /** The features open to everyone signed in, or to this person: what the page shows them (the owner has every one). */
 export function openTo(choices: Readonly<Record<string, AccessChoice>>, personId: string): string[] {
-  return FEATURES.filter(f => !f.locked && choiceOpens(choices[f.key] ?? OWNER_ONLY, personId)).map(f => f.key)
+  const out: string[] = []
+  for (const f of FEATURES) {
+    if (f.locked) continue
+    if (!f.perPc) {
+      if (choiceOpens(choices[f.key] ?? OWNER_ONLY, personId)) out.push(f.key)
+      continue
+    }
+    // Order o68f0: a per-PC feature: its key (open on at least one PC) and one '<key>@<pcId>' for each PC open to them.
+    const pcs = Object.entries(choices).filter(([k, c]) => choiceKey(k)?.feature === f && choiceOpens(c, personId)).map(([k]) => k)
+    if (pcs.length) out.push(f.key, ...pcs.sort())
+  }
+  return out
 }

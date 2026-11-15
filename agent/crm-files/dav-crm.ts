@@ -28,6 +28,8 @@ export interface CrmDavOptions {
   service(): CrmFilesService | null
   /** The time used for folders the CRM gives no time (the root, a category): fixed, so a file manager does not think they changed. */
   started?: number
+  /** o4fb7: how long a folder's listing is kept while the service's view of the tree is the same (ms, default 4000; 0 = never kept). */
+  listMs?: number
   log?: { info(m: string): void; warn(m: string): void }
 }
 
@@ -188,15 +190,29 @@ export function createCrmDav(o: CrmDavOptions) {
     return s
   }
 
+  // o4fb7: each folder's listing is kept while the service's view of the tree is the same (generation()) and at most LIST_MS. gvfs asks about every file of a folder it shows,
+  // one request each, and each request used to list every folder of its path again (from the top): 61 files cost 1.7 s on the Z800, against 52 ms for the folder itself.
+  const LIST_MS = o.listMs ?? 4_000
+  const listings = new Map<string, { gen: number; at: number; node: CrmNode; kids: Map<string, CrmNode> }>()
+  async function listing(s: CrmFilesService, id: string): Promise<{ node: CrmNode; kids: Map<string, CrmNode> }> {
+    const hit = listings.get(id)
+    if (hit && LIST_MS > 0 && hit.gen === s.generation() && Date.now() - hit.at < LIST_MS) return hit
+    const r = await s.children(id)
+    const v = { gen: s.generation(), at: Date.now(), node: r.node, kids: kidsOf(r.children) }
+    if (listings.size > 2_000) listings.clear()
+    listings.set(id, v)
+    return v
+  }
+
   async function find(parts: string[]): Promise<Found> {
     const s = svc()
-    let node = (await s.children('root')).node
+    let node = (await listing(s, 'root')).node
     let parent: CrmNode | null = null
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i]
       const last = i === parts.length - 1
       if (!node.isFolder) throw new CrmFilesError(404, 'notfound', 'Not found.')
-      const kids = kidsOf((await s.children(node.id)).children)
+      const kids = (await listing(s, node.id)).kids
       const next = kids.get(name)
       if (!next) {
         if (!last) throw new CrmFilesError(404, 'notfound', 'Not found.')
@@ -319,7 +335,7 @@ export function createCrmDav(o: CrmDavOptions) {
         const self = nodeXml(parts, f.node, parts.at(-1) ?? 'CRM files', f.spooled)
         const depth = String(req.headers.depth ?? '1')
         if (!f.node.isFolder || depth === '0') return sendXml(res, 207, multistatus([self]))
-        const kids = kidsOf((await svc().children(f.node.id)).children)
+        const kids = (await listing(svc(), f.node.id)).kids
         const spool = o.service()?.spool
         const out = [self, ...[...kids].map(([n, k]) => nodeXml([...parts, n], k, n, k.isFolder ? null : (spool?.pendingVersion(k.id) ?? null)))]
         for (const e of pendingNewIn(f.node.id)) if (![...kids.keys()].some(k => (win ? k.toLowerCase() === e.name.toLowerCase() : k === e.name))) out.push(keptXml([...parts, e.name], e.name, e))
@@ -510,9 +526,14 @@ export function createCrmDav(o: CrmDavOptions) {
   }
 
   return async function crmDav(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // o4fb7: a change made through here drops the kept listings at once (the service's generation changes too; this is the belt to its braces).
+    const changes = !['GET', 'HEAD', 'PROPFIND', 'OPTIONS', 'LOCK', 'UNLOCK'].includes((req.method ?? 'GET').toUpperCase())
+    if (changes) listings.clear()
     try {
       await handle(req, res)
+      if (changes) listings.clear()
     } catch (e) {
+      if (changes) listings.clear()
       const x = e as { status?: unknown; code?: unknown }
       const known = e instanceof CrmFilesError || (typeof x.status === 'number' && typeof x.code === 'string')
       const code = known ? (x.code === 'nodelete' ? 403 : (x.status as number)) : 500

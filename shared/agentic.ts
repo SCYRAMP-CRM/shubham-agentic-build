@@ -54,7 +54,14 @@ export const FLOOR_PREAMBLE_MAX = 8000
 export const AGENT_BRIEF_MAX = 20_000
 
 /** F-086: a job the hub gives a chat (see FloorAgent.duty); null: none. */
-export type AgentDuty = 'orchestrator' | null
+export type AgentDuty = 'orchestrator' | 'person-assistant' | null
+
+/**
+ * F-162 slice B: a person's own Assistant (its boss, owned by that person, made by own-assistant.ts). Its duty is its own: not the hub's
+ * Orchestrator (ensureDuty keeps one of those). Its tools are scoped to its owner's pages and chats by access.asChat.
+ */
+export const isPersonAssistant = (agent: { duty?: AgentDuty; owner?: { id: string } | null }): boolean =>
+  agent.duty === 'person-assistant' && !!agent.owner?.id
 
 /**
  * F-086: is this agent the Orchestrator (the chat the Assistant hands work to; the overlay chat until now)? By its duty. Only an agent

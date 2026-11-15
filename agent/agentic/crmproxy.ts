@@ -38,6 +38,20 @@ interface Login {
   expiresAt: number
 }
 
+/** Order oc186 (slice 2): one CRM login, the PC's own or a signed-in person's. */
+export type CrmLogin = Login
+
+/** Order oc186 (slice 2): a signed-in person's own CRM session (agent/auth viewerCrm), as the CRM login for their calls. */
+export function crmLoginOf(s: { url: string; cookie: string; signedInAt: string; user: { name?: string | null; username?: string | null } }): CrmLogin {
+  return {
+    url: s.url.replace(/\/+$/, ''),
+    cookie: s.cookie,
+    name: s.user.name ?? s.user.username ?? 'Signed in',
+    username: s.user.username ?? null,
+    expiresAt: Date.parse(s.signedInAt) + SESSION_MS,
+  }
+}
+
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 
@@ -81,6 +95,8 @@ export interface CrmProxy {
    * Throws a CrmNotSignedIn when nobody is signed in. The answer is the CRM's, untouched; the caller reads it.
    */
   request(method: string, sub: string, init?: { json?: unknown; body?: string | Buffer; headers?: Record<string, string>; signal?: AbortSignal }): Promise<Response>
+  /** Order oc186 (slice 2): the same call with a given login (a signed-in person's own CRM session), not the PC's. */
+  requestAs(login: CrmLogin, method: string, sub: string, init?: { json?: unknown; body?: string | Buffer; headers?: Record<string, string>; signal?: AbortSignal }): Promise<Response>
 }
 
 /** F-126: no CRM session on this PC (or it ran out). */
@@ -195,6 +211,10 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
     async request(method, sub, init = {}) {
       const login = readLogin(o.file, now())
       if (!login) throw new CrmNotSignedIn()
+      return this.requestAs(login, method, sub, init)
+    },
+
+    async requestAs(login, method, sub, init = {}) {
       const m = method.toUpperCase()
       const base = new URL(login.url)
       const target = new URL(`/${sub.replace(/^\/+/, '')}`, base)

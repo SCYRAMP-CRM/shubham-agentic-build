@@ -5,8 +5,9 @@ import { MAX_TEXT, type CardGoneReason, type FastServerFrame, type HandoffPhase,
 // events always give the same actions. The page (T3b) feeds it what happens and does what it answers; everything that decides WHEN is
 // here, so it is tested with a fake clock and synthetic frames (talk.test.ts).
 //   in:  frame (one per 20 ms of mic audio: its level in dBFS, after the page's echo-cancelled mic) · played / play-end (playback) ·
-//        stt / stt-fail (Whisper's answers) · fast (Quick's frames) · direct (a poll of a direct-mode order) · user (Stop, End, Mute) ·
-//        tick (every 100 ms) · ready (mic and voice up)
+//        stt / stt-fail (Whisper's answers) · stt-busy (Whisper still at work on them) · fast (Quick's frames) · direct (a poll of a
+//        direct-mode order) · user (Stop, End, Mute) · tick (every 100 ms) · ready (mic, voice and Quick up; o0de2 round 2: never Whisper's
+//        model, and his voice is taken from the first frame: what he says before ready is decided at ready)
 //   out: stt / stt-abort · ask / cancel / direct-ask · say / hush / resume / tone · drop-cards · hold-on · end · view
 // The rules are Live talking classic's (src/live/classic/old-voice.generated.js, MAP.md): its echo-aware voice detector (the noise floor
 // ooe, the echo level aoe, the mic pipeline coe, the segmenter poe), talk-over's echo check (2 of 3 of his words in the last 800 characters
@@ -114,6 +115,38 @@ export const TALK = {
   idPrefixMaxChars: 24,
   /** The longest stop word or backchannel, in words ("stop talking please" is two phrases). */
   phraseMaxWords: 4,
+  /**
+   * o0de2: he goes on within this long after his last piece ended: the same turn of his, one ask (the classic's merge). Later than that, his
+   * earlier words still with Whisper are a turn of their own, decided once they are back and he is quiet. (With Whisper slower than his
+   * pauses, the merge went on for as long as he kept talking: nothing was shown and nothing was asked.)
+   */
+  mergeGapMs: 1500,
+  /**
+   * o0de2: the 20 s above counts from a transcription's last sign of life: its request, or the PC saying Whisper is still at work on it
+   * (loading its model, or busy with it or an earlier piece; the page asks GET /speech/status). This is the most it waits in any case.
+   */
+  sttMaxMs: 120_000,
+  /**
+   * o0de2 round 2: a turn of his with this much VOICE (his voiced frames, not the audio sent: that has 0.8 s of the room around them) that
+   * Whisper gave no words for gets "I didn't catch any words", said and shown; less is a cough or a click. (Round 1 counted the audio, 1.8 s
+   * of it: his short tries of 14 Nov, 1.0-1.78 s of audio, would have got nothing at all had Whisper given no words for them.)
+   */
+  noWordsVoiceMs: 400,
+  /**
+   * o0de2 round 3: a "Thank you." the PC dropped as one of Whisper's inventions is his own thank you (a backchannel: nothing said back) only
+   * right after an answer he heard, and only with at most this much voice (a thank you takes under a second). Longer, or with no answer
+   * before it, it is Whisper's invention on words it could not write (rig s2-empty: his 19 s question and a 1 s "Can you hear me?" came
+   * back as " Thank you."), and he is told it caught no words.
+   */
+  thanksMaxVoiceMs: 1500,
+  /**
+   * o0de2 round 4: "right after an answer" is this long: his voice starts at most this long after the end of the answer he heard (its last
+   * sentence's play-end), with no turn of his decided since (so none of its own lines about his words said either: those are said only as a
+   * turn of his is decided). Round 3 asked only that an answer had been heard at some time: his retry after "Sorry, I didn't catch that." or
+   * "I didn't catch any words.", or a try a minute later, that Whisper wrote as " Thank you." got nothing at all (rig y-retry-thanks-failed,
+   * y-retry-thanks-nowords, y-late-thanks).
+   */
+  thanksAfterAnswerMs: 5000,
 } as const
 
 // --- options (Settings › Chats › Assistant › Live voice) --------------------------------------------------------------------
@@ -158,7 +191,8 @@ export const TALK_DEFAULTS: TalkOptions = {
   endQuietMs: TALK.endQuietOptionsMs[0],
   guess: false,
   autoEndMs: null,
-  lang: 'auto',
+  // o0de2 round 2: English unless he chose another (see TALK_SETTINGS.lang).
+  lang: 'en',
   idPrefix: 'talk',
   names: NAMES.old,
 }
@@ -232,7 +266,35 @@ export const TALK_SETTINGS: TalkSettings = {
   endQuietMs: 700,
   guess: false,
   end: 'button',
-  lang: 'auto',
+  /**
+   * o0de2 round 2: English by default (Whisper gets 'en', as dictation's en-IN does). His PC's job log of 14 Nov: dictation's pieces with en
+   * ran 1.2-1.5 s, live talk's with auto 3-12 s (whisper.cpp first guesses the language, and it runs one job at a time), and auto can turn
+   * noisy pieces into nothing. Auto, Hindi and Marathi stay choices in Settings › Live voice. Round 3: a browser that saved its settings
+   * before this gets en too, once (TALK_SETTINGS_VERSION); what he picks after it is kept. His 19:05 talk of 14 Nov: its exact cause is NOT
+   * confirmed (most likely Whisper gave back no words with auto); the log fields added in round 1 (the whisper job line's lang= and chars=,
+   * the hub's line for each ask it takes) will show it the next time.
+   */
+  lang: 'en',
+}
+
+/**
+ * o0de2 round 3: the version his settings are stored with ('sad-talk' keeps { v, ...TalkSettings }). Before it there was none, Language's
+ * default was Auto, and every save of ANY Live voice option (the voice, cut in, fillers, the pause...) stored lang 'auto' with the rest: a
+ * stored 'auto' without the version is not known to be his choice, so it is moved to English (round 2's default) once (loadTalkSettings),
+ * and stored with the version. From then on his Auto, Hindi or Marathi is kept.
+ */
+export const TALK_SETTINGS_VERSION = 2
+
+/** His stored settings, checked (parseTalkSettings) and moved on to this version. `old`: stored before it (the page stores them again, once). */
+export function loadTalkSettings(raw: unknown): { settings: TalkSettings; old: boolean } {
+  if (!isObject(raw)) return { settings: parseTalkSettings(raw), old: false }
+  const old = !(typeof raw.v === 'number' && raw.v >= TALK_SETTINGS_VERSION)
+  return { settings: parseTalkSettings(old && raw.lang === 'auto' ? { ...raw, lang: 'en' } : raw), old }
+}
+
+/** His settings as they are stored: with their version. */
+export function storedTalkSettings(s: TalkSettings): TalkSettings & { v: number } {
+  return { v: TALK_SETTINGS_VERSION, ...s }
 }
 
 /** His settings as stored, checked field by field: anything missing, of the wrong type or not one of the choices is that field's default. */
@@ -333,8 +395,17 @@ export type TalkEvent =
   | { t: 'played'; now: number; id: string; ms: number; marks?: readonly TalkMark[] }
   /** A sentence ended: played out, failed to render, or stopped at its word by `hush word`. (A later sentence starting ends it too.) */
   | { t: 'play-end'; now: number; id: string }
-  | { t: 'stt'; now: number; req: number; text: string }
+  /**
+   * Whisper's words. `dropped` (o0de2 round 3): the whole of what Whisper wrote was one of its known inventions on silence or noise, and the
+   * PC dropped it (agent/speech/words.ts; POST /speech/transcribe's `dropped`): what it was. A dropped "Thank you." is his backchannel.
+   */
+  | { t: 'stt'; now: number; req: number; text: string; dropped?: string }
   | { t: 'stt-fail'; now: number; req: number; status: number }
+  /**
+   * o0de2: the PC says Whisper is still at work on what was sent (GET /speech/status says busy: a model loading for it counts): every
+   * transcription out is alive now, so none is given up while the PC works on it (a cold load, a long piece, a queue of his pieces).
+   */
+  | { t: 'stt-busy'; now: number }
   | { t: 'fast'; now: number; frame: TalkFastFrame }
   | { t: 'direct'; now: number; view: TalkDirectView }
   | { t: 'user'; now: number; act: TalkUserAct }
@@ -356,8 +427,9 @@ export type TalkEndReason = 'end' | 'silence' | 'taken-over' | 'paused' | 'unava
 export type TalkAction =
   /**
    * Transcribe frames fromFrame <= n < toFrame, then push `stt` (its text) or `stt-fail`. `guess`: the early guess (Whisper may answer
-   * 409 busy at once). One not answered in 20 s is given up (`stt-abort`) and counts as failed. `check` (review of T3b): a short sound of
-   * his over the answer (under 500 ms), whose words are only looked at for a stop word: not a turn of his, so the page's turn record skips it.
+   * 409 busy at once). One with no sign of life for 20 s (o0de2: the page pushes `stt-busy` while the PC works on it), or out 2 minutes, is
+   * given up (`stt-abort`) and counts as failed. `check` (review of T3b): a short sound of his over the answer (under 500 ms), whose words
+   * are only looked at for a stop word: not a turn of his, so the page's turn record skips it.
    */
   | { t: 'stt'; req: number; fromFrame: number; toFrame: number; guess: boolean; check?: true }
   | { t: 'stt-abort'; req: number }
@@ -388,7 +460,8 @@ export type TalkAction =
   /** Something on screen changed: read snapshot(). */
   | { t: 'view' }
 
-export type TalkPhase = 'starting' | 'listening' | 'hearing' | 'thinking' | 'speaking' | 'ended'
+/** hearing: his voice now; writing (o0de2): his voice ended and his words are with Whisper (it was "hearing" until they were decided). */
+export type TalkPhase = 'starting' | 'listening' | 'hearing' | 'writing' | 'thinking' | 'speaking' | 'ended'
 export interface TalkLine {
   who: 'you' | 'quick' | 'assistant'
   text: string
@@ -419,8 +492,12 @@ export interface TalkBrain {
 export const ACKS = ['On it.', 'Right away.', 'One moment.', 'Looking into it.', 'Checking now.'] as const
 /** Chris's 90 s line. */
 export const PROGRESS_LATE = "This one is taking a while. I'll speak up when it's done."
-/** Chris's retry line: Whisper could not give his words. */
-export const NOT_CAUGHT = "Sorry, I didn't catch that."
+/** Chris's retry line: Whisper could not give his words (it failed, or they were given up). o0de2: and what to do now. */
+export const NOT_CAUGHT = "Sorry, I didn't catch that. Say it again."
+/** o0de2: a piece of his words was lost (Whisper failed on it) and the rest was asked: he is told, so nothing is lost silently. */
+export const PART_LOST = 'I missed part of that.'
+/** o0de2: a real turn of his (TALK.noWordsVoiceMs of voice) that Whisper gave no words for. Round 2: said and shown (a cough is shorter). */
+export const NO_WORDS = "I didn't catch any words. Try again."
 export const REST_ON_SCREEN = 'The rest is on the screen.'
 
 /** Chris's 25 s line: "Still on it." or "Still on it: <what it is doing>." (his progress1). */
@@ -665,7 +742,8 @@ export interface FrameRange {
   from: number
   to: number
 }
-export type SegmentOut = { t: 'start' } | { t: 'end'; range: FrameRange | null; voiced: number } | { t: 'cut'; range: FrameRange | null }
+/** `voiced`: the voiced frames of what ends here (o0de2 round 2: a 25 s cut says it too, for "I didn't catch any words"). */
+export type SegmentOut = { t: 'start' } | { t: 'end'; range: FrameRange | null; voiced: number } | { t: 'cut'; range: FrameRange | null; voiced: number }
 
 export interface Segmenter {
   readonly open: boolean
@@ -752,7 +830,7 @@ export function createSegmenter(floor: Pick<NoiseFloor, 'value' | 'count'>, endQ
     return out
   }
   function cut(): SegmentOut {
-    const out: SegmentOut = { t: 'cut', range: voiced >= TALK.minSpeechFrames ? range(frames.length) : null }
+    const out: SegmentOut = { t: 'cut', range: voiced >= TALK.minSpeechFrames ? range(frames.length) : null, voiced }
     frames = []
     voiced = 0
     lastVoiced = -1
@@ -830,6 +908,11 @@ interface Say {
   keep: boolean
   /** For the page's turn record only (the say action's `turn`): its turn, or the question a filler or an error line stands in for. */
   of: string | null
+  /**
+   * o0de2 round 3: one of the brain's own lines about his words (NOT_CAUGHT, NO_WORDS, PART_LOST: sayOwn), with no turn behind it. His
+   * voice over one is never taken as over an answer (see onOnset): the line is hushed and his voice is decided by the turn that is out.
+   */
+  own: boolean
 }
 
 interface Turn {
@@ -838,10 +921,17 @@ interface Turn {
   kind: 'ask' | 'telling' | 'direct'
   /** What was asked ('' for a telling). */
   text: string
+  /** What he heard of the answer before it (the ask's `heard`): o0de2, a question merged with his later words still carries it. */
+  heard: string
   at: number
   /** Quick is still writing it; in direct mode, the order is out. */
   generating: boolean
   cancelled: boolean
+  /**
+   * o0de2: cancelled at his voice before a word of its answer was heard (thinking, on the PC or earbuds): his words decided after that ask it
+   * again with theirs, also words of his that were with Whisper when it was cancelled.
+   */
+  byVoice: boolean
   /** Answer text not cut into sentences yet, and all of it so far. */
   buffer: string
   received: string
@@ -881,6 +971,10 @@ interface Part {
   failed: boolean
   /** It is the early guess, made the final. */
   guess: boolean
+  /** o0de2 round 2: his voiced frames in it (the segmenter's count: the room kept around his voice is not counted). */
+  voiced: number
+  /** o0de2 round 3: Whisper's whole text for it, when the PC dropped it as a known invention (the stt event's `dropped`). */
+  dropped: string | null
 }
 interface Utterance {
   policy: Policy
@@ -891,15 +985,21 @@ interface Utterance {
   parts: Part[]
   /** His voice is still going. */
   open: boolean
+  /** o0de2: when his voice started, and when it last ended (the merge gap counts from there). */
+  startedAt: number
+  closedAt: number
+  /** o0de2: his words as they come back from Whisper, in the transcript before they are decided (null until some came back). */
+  line: TalkLine | null
 }
-/** A transcription out, and when it was asked for. */
-type Req = ({ kind: 'guess' } | { kind: 'part'; utt: Utterance; part: Part } | { kind: 'check'; part: Part }) & { at: number }
+/** A transcription out: when it was asked for, and its last sign of life (o0de2: the PC said Whisper was still at work). */
+type Req = ({ kind: 'guess' } | { kind: 'part'; utt: Utterance; part: Part } | { kind: 'check'; part: Part }) & { at: number; alive: number }
 interface Guess {
   req: number
   from: number
   to: number
   lastVoice: number
   text: string | null
+  dropped: string | null
   back: boolean
 }
 interface Order {
@@ -955,8 +1055,18 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   let reqNo = 0
   const reqs = new Map<number, Req>()
   let utt: Utterance | null = null
+  /**
+   * o0de2: his earlier turns still with Whisper when he spoke again after the merge gap, oldest first. Each is decided on its own, in the
+   * order he said them, once its words are back and he is quiet (utt, his voice now or last, comes after them).
+   */
+  let sealed: Utterance[] = []
   let guess: Guess | null = null
   let lost: Lost | null = null
+  /**
+   * o0de2 round 4: when the last sentence of an answer he heard ended playing; null once a turn of his is decided after it (decide). A dropped
+   * "Thank you." is his own only right after it (see rightAfterAnswer).
+   */
+  let answerEndAt: number | null = null
 
   // what it says
   let askNo = 0
@@ -991,8 +1101,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   // --- turns ------------------------------------------------------------------------------------------------------------
   const turnOf = (id: string | null): Turn | undefined => (id === null ? undefined : turns.find(t => t.id === id))
   const hasSays = (t: Turn) => queue.some(s => s.turn === t.id) || pending.some(s => s.turn === t.id)
-  function newTurn(id: string, kind: Turn['kind'], text: string): Turn {
-    const t: Turn = { id, kind, text, at: now, generating: true, cancelled: false, buffer: '', received: '', answered: false, said: [], line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
+  function newTurn(id: string, kind: Turn['kind'], text: string, heard = ''): Turn {
+    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, said: [], line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
     turns.push(t)
     while (turns.length > TALK.turnsMax) {
       const i = turns.findIndex(x => !x.generating && !hasSays(x))
@@ -1029,11 +1139,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     if (quick) for (const t of turns) if (t.generating && t.kind !== 'direct') stopTurnQuietly(t)
     // Whatever was held for his words is moot once he asks something new.
     if (held) dropAudio(false)
-    newTurn(id, quick ? 'ask' : 'direct', clean)
+    const h = heard ? tailText(heard, TALK.heardMaxChars) : ''
+    newTurn(id, quick ? 'ask' : 'direct', clean, h)
     // The classic's echo window starts again with each question.
     spoken = ''
     info = ''
-    const h = heard ? tailText(heard, TALK.heardMaxChars) : ''
     if (quick) act({ t: 'ask', id, text: clean, ...(h ? { heard: h } : {}) })
     else act({ t: 'direct-ask', id, text: clean })
     dirty = true
@@ -1048,14 +1158,14 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   // --- the voice --------------------------------------------------------------------------------------------------------
   const sounding = () => !held && queue.some(s => s.started)
   /** He has the floor (talking, or his words not yet decided) or the sound is held: nothing new starts playing. */
-  const blocked = () => held || utt !== null
+  const blocked = () => held || utt !== null || sealed.length > 0
   /**
    * One sentence to say (in pieces the PC voice takes, when it is long). A direct order's answer is kept through a cut-in (see Say.keep).
    * `of`: the turn the page's record counts it for (its own turn, or the question a filler or an error line stands in for).
    */
   function say(text: string, kind: SayKind, turn: Turn | null, keep = turn?.kind === 'direct', of: string | null = turn?.id ?? null) {
     for (const piece of sayPieces(text)) {
-      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of }
+      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of, own: false }
       if (blocked()) pending.push(s)
       else emitSay(s)
     }
@@ -1129,7 +1239,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // said: it is not in what he heard nor in the transcript (each started one went into the transcript as it started).
     for (const s of queue.splice(0, i + 1)) {
       const t = s.started && s.kind === 'answer' && !s.cutting ? turnOf(s.turn) : undefined
-      if (t) t.said.push(s.text)
+      if (t) {
+        t.said.push(s.text)
+        answerEndAt = now
+      }
     }
     dirty = true
   }
@@ -1162,45 +1275,63 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     const r = seg.guessRange()
     if (!r) return
     const req = ++reqNo
-    guess = { req, from: r.from, to: r.to, lastVoice: seg.lastVoice, text: null, back: false }
-    reqs.set(req, { kind: 'guess', at: now })
+    guess = { req, from: r.from, to: r.to, lastVoice: seg.lastVoice, text: null, dropped: null, back: false }
+    reqs.set(req, { kind: 'guess', at: now, alive: now })
     act({ t: 'stt', req, fromFrame: r.from, toFrame: r.to, guess: true })
   }
   /** The words of a piece of his turn: the guess when it covers exactly these frames (no second transcription), else a new one. */
-  function partOf(r: FrameRange, u: Utterance | null): Part {
+  function partOf(r: FrameRange, u: Utterance | null, voiced: number): Part {
     const g = guess
     guess = null
     if (g && g.from === r.from && g.to === r.to) {
-      const p: Part = { req: g.req, from: r.from, to: r.to, text: g.text, done: g.back, failed: false, guess: true }
-      const at = reqs.get(g.req)?.at ?? now
-      if (!g.back) reqs.set(g.req, u ? { kind: 'part', utt: u, part: p, at } : { kind: 'check', part: p, at })
+      const p: Part = { req: g.req, from: r.from, to: r.to, text: g.text, done: g.back, failed: false, guess: true, voiced, dropped: g.dropped }
+      const was = reqs.get(g.req)
+      const at = was?.at ?? now
+      const alive = was?.alive ?? now
+      if (!g.back) reqs.set(g.req, u ? { kind: 'part', utt: u, part: p, at, alive } : { kind: 'check', part: p, at, alive })
       return p
     }
     if (g && reqs.delete(g.req)) act({ t: 'stt-abort', req: g.req })
-    const p: Part = { req: ++reqNo, from: r.from, to: r.to, text: null, done: false, failed: false, guess: false }
-    reqs.set(p.req, u ? { kind: 'part', utt: u, part: p, at: now } : { kind: 'check', part: p, at: now })
+    const p: Part = { req: ++reqNo, from: r.from, to: r.to, text: null, done: false, failed: false, guess: false, voiced, dropped: null }
+    reqs.set(p.req, u ? { kind: 'part', utt: u, part: p, at: now, alive: now } : { kind: 'check', part: p, at: now, alive: now })
     act({ t: 'stt', req: p.req, fromFrame: r.from, toFrame: r.to, guess: false, ...(u ? {} : { check: true as const }) })
     return p
   }
   /** His voice starts: what it means depends on what is out and what plays. */
   function onOnset() {
     lastActive = now
-    // He goes on before his words were asked: one ask (the merge).
-    if (utt) {
-      utt.open = true
-      if (sounding()) hold()
-      return
+    // o0de2: the note that his last turn had no words is about that turn; his voice now is the next.
+    if (info === NO_WORDS) {
+      info = ''
+      dirty = true
     }
-    const fresh = (policy: Policy, turn: Turn | null, cancelled = false, talkOver = false): Utterance => ({ policy, turn, cancelled, talkOver, heard: '', parts: [], open: true })
+    if (utt) {
+      // He goes on before his words were asked, within the merge gap: one ask (the merge).
+      if (utt.open || now - utt.closedAt <= TALK.mergeGapMs) {
+        utt.open = true
+        if (sounding()) hold()
+        return
+      }
+      // o0de2: later than that, what he said is a turn of its own: decided once its words are back and he is quiet, while what he says now
+      // is taken by the rules below. (With Whisper slower than his pauses, the merge lasted as long as he kept talking: nothing was ever
+      // shown or asked.)
+      sealed.push(utt)
+      utt = null
+    }
+    const fresh = (policy: Policy, turn: Turn | null, cancelled = false, talkOver = false): Utterance => ({ policy, turn, cancelled, talkOver, heard: '', parts: [], open: true, startedAt: now, closedAt: now, line: null })
     // Tap only: he is heard only while nothing is out or playing (see deaf()), and his voice never cuts anything off.
     if (style === 'tap') {
       utt = fresh('plain', null)
       return
     }
     const over: Policy = style === 'barge' ? 'barge' : 'hold'
-    // Speaking: an answer has started playing (its words are being heard).
+    // Speaking: an answer has started playing (its words are being heard). o0de2 round 3: never one of its own lines about his words
+    // (NOT_CAUGHT, NO_WORDS, PART_LOST): no turn is behind one, so his voice over it is taken as over a filler, by the turn that is out (below).
+    // Taken as over an answer, 500 ms of his voice over "I missed part of that." (said as the rest of his words is asked) asked his new words
+    // alone, which ended the question just asked: it was never answered (rig x-partlost-over; x-notcaught-over the same with "Sorry, I didn't
+    // catch that." said while a question of his was out).
     const playing = held ? undefined : queue.find(s => s.started)
-    if (playing?.kind === 'answer') {
+    if (playing?.kind === 'answer' && !playing.own) {
       hold()
       utt = fresh(over, turnOf(playing.turn) ?? null)
       return
@@ -1217,12 +1348,14 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       utt = fresh(over, heard)
       return
     }
-    // Thinking: a turn is out and he has heard none of its answer (a filler may play).
+    // Thinking: a turn is out and he has heard none of its answer (a filler, or one of its own lines, may play): on the PC or earbuds it is
+    // cancelled and his words are asked with it (ONE question); talking over it, it is held until his words say what they were.
     if (t) {
       if (style === 'barge') {
         // On the PC or earbuds: cut off at his voice (a filler with it); his words decide what is asked next.
         dropAudio(false)
         stopTurn(t)
+        if (t.kind === 'ask') t.byVoice = true
         utt = fresh('think', t, t.kind !== 'direct')
       } else {
         // On the phone speaker or talking over it: held, not cancelled; a filler's own echo must not cancel it.
@@ -1231,7 +1364,18 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       }
       return
     }
-    // One of its own lines is at the page (the waiting line, "didn't catch that"), playing or about to: held like an answer.
+    // o0de2 round 3: one of its own lines about his words at the page ("Try again.", "Say it again."), playing or about to, and nothing of his
+    // out: on the PC or earbuds his voice is his retry, a turn of its own however short (the 500 ms rule is for answers): the line is hushed
+    // and his words decide (rig x-hello-over-nowords: a 0.4 s "Hello?" over it was only looked at for a stop word, and nothing happened).
+    // Talking over it, it is held until his words say whether they were its own echo, as below. (A filler being cut at its word goes first.)
+    // Round 4: held, not dropped: his words asked drop it (ask), a try that comes to nothing lets it go on (settle), and a try with no words
+    // or lost finds it as the same line (sayOwn). Dropped, a cough over "I didn't catch any words. Try again." left no line and no caption.
+    if (style === 'barge' && queue.find(s => !s.cutting)?.own) {
+      hold()
+      utt = fresh('plain', null)
+      return
+    }
+    // One of its own lines is at the page (the waiting line, an error line), playing or about to: held like an answer.
     if (queue.length > 0) {
       hold()
       utt = fresh(over, null)
@@ -1248,7 +1392,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     dropAudio(false, utt.turn)
     stopTurn(utt.turn)
   }
-  function onSegmentEnd(range: FrameRange | null) {
+  function onSegmentEnd(range: FrameRange | null, voiced: number) {
     const u = utt
     if (!u) {
       dropGuess()
@@ -1259,45 +1403,93 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       utt = null
       resume()
       if (range) {
-        const p = partOf(range, null)
+        const p = partOf(range, null, voiced)
         if (p.done) onCheck(p.text ?? '')
       } else dropGuess()
-      return
+      // o0de2: he is quiet: his earlier turns whose words are back are decided now.
+      return settle()
     }
     if (range) {
       if (fillers !== 'off') {
         act({ t: 'tone' })
         echoTail = TALK.echoTailFrames
       }
-      u.parts.push(partOf(range, u))
+      u.parts.push(partOf(range, u, voiced))
     } else dropGuess()
     u.open = false
-    settle(u)
+    u.closedAt = now
+    settle()
   }
-  function onSegmentCut(range: FrameRange | null) {
+  function onSegmentCut(range: FrameRange | null, voiced: number) {
     dropGuess()
-    if (utt && range) utt.parts.push(partOf(range, utt))
+    if (utt && range) utt.parts.push(partOf(range, utt, voiced))
   }
-  /** All of his words are back and he is quiet: decide. */
-  function settle(u: Utterance) {
-    if (u !== utt || u.open || u.parts.some(p => !p.done)) return
-    utt = null
-    const text = u.parts
+  const textOf = (parts: readonly Part[]) =>
+    parts
       .map(p => p.text ?? '')
       .join(' ')
       .replace(/\s+/g, ' ')
       .trim()
-    const failed = u.parts.length > 0 && u.parts.every(p => p.failed)
-    decide(u, text, failed)
-    // Nothing was asked and nothing cut: what was held for his words goes on.
-    if (held && utt === null) resume()
+  /**
+   * His turns are decided in the order he said them, each once all of its words are back and he is quiet. o0de2: a turn sealed by his
+   * going on after the merge gap waits only for its own words (and for him to be quiet: nothing is ever asked while he talks), not for the
+   * ones he says after it.
+   */
+  function settle() {
+    // o0de2 round 2: his words from before it was ready (Quick, the mic, the PC voice) are kept, and decided once it is ('ready' settles).
+    if (!started) return
+    for (;;) {
+      const u = sealed[0] ?? utt
+      if (!u || u.open || utt?.open || u.parts.some(p => !p.done)) break
+      if (u === sealed[0]) sealed.shift()
+      else utt = null
+      // o0de2: a piece lost (Whisper failed, or it was given up) is never silent (see decide). It used to count only when EVERY piece was
+      // lost, so one lost next to an empty one was silence, and one lost next to words went unnoticed.
+      decide(u, textOf(u.parts), u.parts.some(p => p.failed))
+    }
+    // Nothing was asked and nothing cut: what was held for his words goes on (once none of his words is left to decide).
+    if (held && utt === null && sealed.length === 0) resume()
+  }
+  /** o0de2: his words in the transcript as soon as Whisper gives them back, before they are decided (it was a bare "Hearing you" till then). */
+  function showWords(u: Utterance) {
+    // Talking over its own sound, his "words" may be its echo: they show once decided.
+    if (u.policy === 'hold' || u.talkOver) return
+    const text = textOf(u.parts.filter(p => p.done))
+    if (text) youLine(u, text)
+  }
+  /** His words in the transcript: the line that showed them as they came back, made final, or a new one. */
+  function youLine(u: Utterance | null, text: string) {
+    if (!u?.line) {
+      const l = addLine('you', text)
+      if (u) u.line = l
+      return
+    }
+    u.line.text = capText(text, TALK.lineMaxChars)
+    dirty = true
+  }
+  /**
+   * o0de2: the latest question asked after he began these words (from his earlier words, decided while these were with Whisper), none of
+   * whose answer he heard: still out, or cut off at his voice since (its text goes with his next words). Quick only (voice never cancels a
+   * direct order). Each such question holds the ones before it, so his words are never lost from it.
+   */
+  function askedSince(u: Utterance): Turn | null {
+    if (!quick) return null
+    for (let i = turns.length - 1; i >= 0 && turns[i].at >= u.startedAt; i--) {
+      const t = turns[i]
+      if (t.kind !== 'ask') continue
+      if (t.said.length > 0 || queue.some(s => s.turn === t.id && s.started)) return null
+      if (t.cancelled) return t.byVoice ? t : null
+      const out = t.generating || queue.some(s => s.turn === t.id && s.kind === 'answer') || pending.some(s => s.turn === t.id && s.kind === 'answer')
+      return out ? t : null
+    }
+    return null
   }
   function onCheck(text: string) {
     if (gateOf(text) === 'stop') stopWords(text)
   }
   /** A stop word: hush, cancel what runs, drop the cards; nothing is asked. Direct-mode orders stay out (voice cannot stop an order). */
-  function stopWords(text: string) {
-    if (text) addLine('you', text)
+  function stopWords(text: string, u: Utterance | null = null) {
+    if (text) youLine(u, text)
     stopAll()
     act({ t: 'drop-cards' })
   }
@@ -1325,7 +1517,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // made his next cut-in count as its echo).
     if (text !== '' && isEcho(text, spoken)) learnDoubts()
     else doubts = []
-    resume()
+    // o0de2: more of his words still to be decided (he went on after these): the sound stays held for them (settle lets it go after).
+    if (utt === null && sealed.length === 0) resume()
     return true
   }
   /** One ask of what he said first and what he adds (a turn of Quick's own question only). */
@@ -1333,29 +1526,94 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   /** Whisper could not give his words: it says so and listens. `carry`: what his next words take along instead (see Lost). */
   function notCaught(carry: Lost | null) {
     lost = carry
-    info = NOT_CAUGHT
-    say(NOT_CAUGHT, 'answer', null)
+    info = sayOwn(NOT_CAUGHT)
+    dirty = true
+  }
+  /**
+   * o0de2 round 2: the brain's own lines about his words (NOT_CAUGHT, NO_WORDS, PART_LOST). Said when the turn they are about is decided (he
+   * is quiet then), not held back behind his later words still with Whisper (r-fail-all: it waited 35 s, then said it twice); only a sound
+   * held for his voice keeps one waiting. Never twice in a row: not again while the same line (NOT_CAUGHT and NO_WORDS are one: "say it
+   * again") is still waiting or playing. Returns the line he will hear (the caption shows that one).
+   */
+  function sayOwn(text: string): string {
+    const again = (t: string) => t === NOT_CAUGHT || t === NO_WORDS
+    const same = (s: Say) => s.turn === null && s.of === null && (s.text === text || (again(s.text) && again(text)))
+    const waiting = queue.find(same) ?? pending.find(same)
+    if (waiting) return waiting.text
+    const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text, kind: 'answer', turn: null, started: false, ms: 0, marks: null, cutting: false, keep: false, of: null, own: true }
+    if (held) pending.push(s)
+    else emitSay(s)
+    return text
   }
   /** His words asked, with what his lost words carried (the question they were added to, or what he heard of the answer he cut off). */
   function askWords(text: string, heard: string | undefined, carry: Lost | null) {
     if (!carry) return ask(text, heard)
     return ask(carry.merge ? merged(carry.turn, text) : text, heard || carry.heard || undefined)
   }
-  function decide(u: Utterance, text: string, failed: boolean) {
-    const gate = failed && !text ? 'failed' : gateOf(text)
+  /**
+   * His words, decided: what they ask, cut or stop. `lostPiece` (o0de2): Whisper lost a piece of them (it failed, or it was given up). With
+   * nothing else from him that is "didn't catch that"; with words, they are asked and he is told part of it was missed. Never silent.
+   */
+  function decide(u: Utterance, text: string, lostPiece: boolean) {
+    const asks = askNo
+    decideWords(u, text, lostPiece)
+    if (lostPiece && askNo > asks && !ended) sayOwn(PART_LOST)
+    // o0de2 round 4: a turn of his came after the answer he heard: what he says next is no longer right after it.
+    answerEndAt = null
+  }
+  /** His voice in a turn, ms (his voiced frames, never the room sent around them). */
+  const voiceMs = (u: Utterance) => u.parts.reduce((n, p) => n + p.voiced, 0) * TALK.frameMs
+  /**
+   * o0de2 round 4: his voice started right after an answer he heard: within TALK.thanksAfterAnswerMs of its last sentence's end, and no turn
+   * of his decided since (none of its own lines about his words said, then).
+   */
+  function rightAfterAnswer(u: Utterance): boolean {
+    return answerEndAt !== null && u.startedAt - answerEndAt <= TALK.thanksAfterAnswerMs
+  }
+  /**
+   * What his words are. o0de2 round 3: no words, and the PC dropped what Whisper wrote for a piece of them as one of its known inventions
+   * (agent/speech/words.ts): a dropped "Thank you." (or "Thanks.") right after an answer he heard, on a thank you's length of voice, is what
+   * the BACKCHANNELS list says: nothing to act on, nothing to say back (rig x-thankyou: his "Thank you." after an answer got "I didn't catch
+   * any words. Try again."). Otherwise it is no words, as any other invention ("you", "[BLANK_AUDIO]"): see TALK.thanksMaxVoiceMs and
+   * (round 4: right after is within seconds of the answer's end, with no try of his between) TALK.thanksAfterAnswerMs.
+   */
+  function gateOfTurn(u: Utterance, text: string, lostPiece: boolean): TalkGate | 'failed' {
+    if (lostPiece && !text) return 'failed'
+    const gate = gateOf(text)
+    if (gate !== 'empty' || !u.parts.some(p => p.dropped !== null && gateOf(p.dropped) === 'backchannel')) return gate
+    return rightAfterAnswer(u) && voiceMs(u) <= TALK.thanksMaxVoiceMs ? 'backchannel' : 'empty'
+  }
+  function decideWords(u: Utterance, text: string, lostPiece: boolean) {
+    const gate = gateOfTurn(u, text, lostPiece)
     const t = u.turn
     // Words lost after a cut-off go with these, when nothing newer is going on (a turn out, an answer playing); else they are moot.
     const carry = t === null ? lost : null
     lost = null
-    if (gate === 'stop') return stopWords(text)
+    if (gate === 'stop') return stopWords(text, u)
     const words = gate === 'words'
+    // o0de2: his earlier words were asked after he began these, and nothing of their answer was heard yet: ONE question with both (as when
+    // he goes on while it thinks), carrying what he heard before it. A backchannel or nothing: that question goes on (asked again when his
+    // voice cut it off meanwhile); his words lost: it says so, and (cut off) his next words go with it.
+    const since = askedSince(u)
+    if (since) {
+      if (gate === 'failed') return notCaught(since.cancelled ? { turn: since, heard: since.heard, merge: true } : null)
+      if (!words) return since.cancelled ? ask(since.text, since.heard || undefined) : undefined
+      youLine(u, text)
+      dropAudio(false, since)
+      stopTurn(since)
+      return ask(merged(since, text), since.heard || undefined)
+    }
     switch (u.policy) {
       case 'plain':
         if (words) {
-          addLine('you', text)
+          youLine(u, text)
           return askWords(text, undefined, carry)
         }
-        if (gate === 'failed') notCaught(carry)
+        if (gate === 'failed') return notCaught(carry)
+        // o0de2 round 3: nothing to ask (no words, a cough, a backchannel): what his lost words carried waits for his next words. (On the PC
+        // his voice over "Sorry, I didn't catch that." is a turn of his now, so a cough over it would have taken the question along with it.)
+        lost = carry
+        if (gate === 'empty') noWords(u)
         return
       case 'hold': {
         if (wasNothing(gate, text)) return
@@ -1364,7 +1622,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         dropAudio(false, t)
         markCut(t, heard)
         stopTurn(t)
-        addLine('you', text)
+        youLine(u, text)
         return askWords(text, quick ? heard : undefined, carry)
       }
       case 'think':
@@ -1381,19 +1639,38 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
           return u.cancelled && t?.kind === 'ask' ? ask(t.text) : undefined
         }
         // Anything else: ONE ask, what he asked first and what he adds.
-        addLine('you', text)
+        youLine(u, text)
         return ask(u.cancelled || u.talkOver ? merged(t, text) : text)
       case 'cut':
       case 'barge':
         // He cut the answer off and his words were lost: it says so and listens, and his next words say what he heard (review of T3a:
         // the answer went on as for an "okay", and he was never told).
         if (gate === 'failed') return notCaught(quick && t ? { turn: t, heard: u.heard, merge: false } : carry)
-        // A backchannel or nothing: it goes on from what he heard (Quick's own question only).
-        if (!words) return quick && t?.kind === 'ask' ? ask(t.text, u.heard) : undefined
-        addLine('you', text)
+        // A backchannel or nothing: it goes on from what he heard (Quick's own question only). o0de2 round 2: over a line with no turn behind
+        // it no words at all are noted as in a plain turn (rig s2-empty: his "Can you hear me?" over "I didn't catch any words" came back
+        // empty, and nothing happened; round 3: on the PC his voice over one of its own lines is a plain turn, so this is the waiting line's
+        // or an error line's case now).
+        if (!words) {
+          if (quick && t?.kind === 'ask') return ask(t.text, u.heard)
+          // o0de2 round 4: over a line with no turn behind it, nothing asked: what his lost words carried waits for his next words, as in a
+          // plain turn (an "okay" over the waiting line dropped the question he had cut off, and his next words were asked alone).
+          if (t === null) lost = carry
+          if (t === null && gate === 'empty') noWords(u)
+          return
+        }
+        youLine(u, text)
         return askWords(text, quick ? u.heard : undefined, carry)
       default:
     }
+  }
+  /**
+   * o0de2: a real turn of his that Whisper gave no words for is noted. Round 2: by his voice (TALK.noWordsVoiceMs of it, never the room sent
+   * around it), said and shown: a short "Hello?" that came back empty was silence (a cough is shorter).
+   */
+  function noWords(u: Utterance) {
+    if (voiceMs(u) < TALK.noWordsVoiceMs) return
+    info = sayOwn(NO_WORDS)
+    dirty = true
   }
   /** His "words" were its own echo after all: the loud frames kept while it played were the echo too (the classic's learnDoubts). */
   function learnDoubts() {
@@ -1405,21 +1682,26 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     }
     doubts = []
   }
-  function onStt(req: number, text: string) {
+  function onStt(req: number, text: string, dropped: string | null) {
     const r = reqs.get(req)
     if (!r) return
     reqs.delete(req)
     if (r.kind === 'guess') {
       if (guess?.req === req) {
         guess.text = text
+        guess.dropped = dropped
         guess.back = true
       }
       return
     }
     r.part.text = text
+    r.part.dropped = dropped
     r.part.done = true
     if (r.kind === 'check') onCheck(text)
-    else settle(r.utt)
+    else {
+      showWords(r.utt)
+      settle()
+    }
   }
   function onSttFail(req: number) {
     const r = reqs.get(req)
@@ -1433,18 +1715,25 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       // The guess became the final and then failed (Whisper was busy): the same frames are transcribed in full, once.
       r.part.guess = false
       r.part.req = ++reqNo
-      reqs.set(r.part.req, { ...r, at: now })
+      reqs.set(r.part.req, { ...r, at: now, alive: now })
       act({ t: 'stt', req: r.part.req, fromFrame: r.part.from, toFrame: r.part.to, guess: false, ...(r.kind === 'check' ? { check: true as const } : {}) })
       return
     }
     r.part.done = true
     r.part.failed = true
-    if (r.kind === 'part') settle(r.utt)
+    if (r.kind === 'part') settle()
   }
-  /** A transcription that never came back (a lost request) fails after 20 s, so his turn is never left waiting. */
+  /** o0de2: the PC says Whisper is still at work on what was sent: nothing out is given up while it is. */
+  function onSttBusy() {
+    for (const r of reqs.values()) r.alive = now
+  }
+  /**
+   * A transcription that never came back (a lost request) fails after 20 s with no sign of life (o0de2: the PC saying Whisper is still at
+   * work on it is one: a cold load and a long piece take longer than 20 s), and after 2 minutes in any case, so his turn never waits for ever.
+   */
   function expireReqs() {
     for (const [req, r] of reqs) {
-      if (now - r.at < TALK.sttTimeoutMs) continue
+      if (now - r.alive < TALK.sttTimeoutMs && now - r.at < TALK.sttMaxMs) continue
       act({ t: 'stt-abort', req })
       onSttFail(req)
     }
@@ -1459,8 +1748,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   const deaf = () => style === 'tap' && (queue.length > 0 || turns.some(t => t.generating && t.kind !== 'direct'))
   function onFrame(db: number) {
     const n = frameNo++
-    if (!started || muted) return
+    if (muted) return
     const level = Number.isFinite(db) ? Math.max(TALK.silentDb, db) : TALK.silentDb
+    // o0de2 round 2: his voice is taken from the tap (the mic's first frame), not from ready: the same ears run while it gets ready, and what
+    // he says then is decided once it is ready (settle), so nothing he says after the tap is lost. (Round 1 only learnt the room then: his
+    // voice before ready went into the noise floor, and nothing he said registered until he paused.)
     const playing = sounding()
     // A new stretch of sound: what was kept from the last one is stale.
     if (playing && !wasPlaying) doubts = []
@@ -1476,19 +1768,21 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         doubts.push(level)
         if (doubts.length > TALK.doubtFrames) doubts.shift()
       }
-    } else if (!isEcho) floor.push(level)
+      // o0de2 round 2: the room is learnt only from frames before his voice starts (and between his turns), never from his speech: frames
+      // of an open turn are his, not the room. (The classic learnt them too; his voice going on for seconds became the floor.)
+    } else if (!isEcho && !seg.open) floor.push(level)
     if (deaf()) {
       if (seg.open) {
         seg.reset()
         dropGuess()
-        onSegmentEnd(null)
+        onSegmentEnd(null, 0)
       } else seg.reset()
       return
     }
     const r = seg.push({ n, db: level, echo: isEcho, echoDb: isEcho ? echo.value : null })
     if (r?.t === 'start') onOnset()
-    else if (r?.t === 'end') onSegmentEnd(r.range)
-    else if (r?.t === 'cut') onSegmentCut(r.range)
+    else if (r?.t === 'end') onSegmentEnd(r.range, r.voiced)
+    else if (r?.t === 'cut') onSegmentCut(r.range, r.voiced)
     if (seg.open) {
       if (seg.hearing) lastActive = now
       watchCutIn()
@@ -1734,6 +2028,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     reqs.clear()
     guess = null
     utt = null
+    sealed = []
     if (queue.length > 0 || held) act({ t: 'hush', at: 'now', hold: false })
     queue = []
     pending = []
@@ -1754,6 +2049,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   const busy = () =>
     seg.hearing ||
     (utt !== null && utt.parts.length > 0) ||
+    sealed.length > 0 ||
     reqs.size > 0 ||
     queue.length > 0 ||
     pending.length > 0 ||
@@ -1780,7 +2076,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         if (seg.open) {
           seg.reset()
           dropGuess()
-          onSegmentEnd(null)
+          onSegmentEnd(null, 0)
         } else seg.reset()
         dirty = true
         return
@@ -1793,15 +2089,19 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       case 'stop':
         // The Stop button: quiet now, and the turn is cancelled; his own words still being taken become a new question. Cards stay (a tap is his).
         stopAll()
+        // o0de2 round 2: a question his voice cut off and he then stopped is over: it is never merged into his later words (askedSince).
+        for (const t of turns) t.byVoice = false
         for (const [req, r] of reqs) {
           if (r.kind !== 'check') continue
           reqs.delete(req)
           act({ t: 'stt-abort', req })
         }
-        if (utt) {
-          utt.policy = 'plain'
-          utt.turn = null
-          utt.heard = ''
+        // o0de2: his earlier turns still with Whisper too (each is decided on its own, as a new question).
+        for (const u of utt ? [...sealed, utt] : sealed) {
+          u.policy = 'plain'
+          u.turn = null
+          u.heard = ''
+          u.talkOver = false
         }
         dirty = true
         return
@@ -1812,8 +2112,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   // --- the view ---------------------------------------------------------------------------------------------------------
   function phase(): TalkPhase {
     if (ended) return 'ended'
-    if (!started) return 'starting'
-    if (utt) return 'hearing'
+    // o0de2 round 2: his voice is taken while it gets ready too: the strip says so (his words back and waiting for ready: getting ready).
+    if (!started) return utt?.open ? 'hearing' : [...sealed, utt].some(u => u?.parts.some(p => !p.done)) ? 'writing' : 'starting'
+    // His voice now; o0de2: then his words with Whisper while he is quiet (it said "hearing you" for as long as Whisper took).
+    if (utt?.open) return 'hearing'
+    if (utt || sealed.length > 0) return 'writing'
     if (queue.some(s => s.kind === 'answer') || pending.some(s => s.kind === 'answer')) return 'speaking'
     if (turns.some(t => t.generating)) return 'thinking'
     if (queue.length > 0) return 'speaking'
@@ -1847,10 +2150,13 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
           onPlayEnd(ev.id)
           break
         case 'stt':
-          onStt(ev.req, typeof ev.text === 'string' ? ev.text : '')
+          onStt(ev.req, typeof ev.text === 'string' ? ev.text : '', typeof ev.dropped === 'string' && ev.dropped.trim() !== '' ? ev.dropped : null)
           break
         case 'stt-fail':
           onSttFail(ev.req)
+          break
+        case 'stt-busy':
+          onSttBusy()
           break
         case 'fast':
           if (isObject(ev.frame)) onFast(ev.frame)
@@ -1867,6 +2173,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
             lastActive = now
             if (quick) act({ t: 'hold-on' })
             dirty = true
+            // o0de2 round 2: what he said while it got ready is decided now (once its words are back and he is quiet), after the hold.
+            settle()
           }
           break
         default:

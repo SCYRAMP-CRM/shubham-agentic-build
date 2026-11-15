@@ -8,6 +8,8 @@ export const DELIVERY_BLOCK_REASONS = [
   'input-changed', 'empty-message', 'preflight-failed',
   'asking', // 12 Nov (Stage 1): the transcript says Claude has a question open: nothing typed, answer it and send again
   'withdrawn', // oeee2 (14 Nov): typed, but the chat's box never showed it as sent; taken back out of the box (Backspace), box read empty: nothing submitted
+  'staff-text', // o7e6d (15 Nov): a person's own Assistant takes plain words only (staff-policy.ts staffText): nothing typed
+  'staff-runtime', // o7e6d (15 Nov): that Assistant's chat was not started under the staff policy (or under one this build does not know): nothing typed
 ] as const
 export type DeliveryBlockReason = typeof DELIVERY_BLOCK_REASONS[number]
 export function isDeliveryBlockReason(value: unknown): value is DeliveryBlockReason {
@@ -87,5 +89,7 @@ export function deliveryBlockWords(reason: DeliveryBlockReason, targetPcName?: s
     case 'preflight-failed': return 'The delivery preflight failed before typing. Refresh the destination and review your kept draft.'
     case 'asking': return 'Claude is asking a question in the terminal. Answer it there, then send again. Nothing was typed.'
     case 'withdrawn': return 'The chat did not take the message as it was typed (some of its characters may not have arrived), so it was taken back out of its input box. Nothing was submitted; it is safe to send it again. If this repeats, send it without special symbols.'
+    case 'staff-text': return 'This Assistant takes plain messages only: no line may start with ! / # @ or &, no word may be an image file name, an @ only inside an email address, and no control keys. Nothing was typed.'
+    case 'staff-runtime': return 'This Assistant’s chat was not started with its restrictions. It has to be stopped and opened again before it takes messages. Nothing was typed.'
   }
 }

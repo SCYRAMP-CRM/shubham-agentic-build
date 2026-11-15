@@ -71,6 +71,8 @@ interface Waiting {
   resolve(v: unknown): void
   reject(e: unknown): void
   timer: ReturnType<typeof setTimeout>
+  /** o7e6d: a staff call's page rule; its answer must carry the route the page captured, and that route must pass it. */
+  guard?: (route: string) => boolean
 }
 
 export const UI_CALL_TIMEOUT_MS = 25_000
@@ -79,7 +81,7 @@ export interface UiBridge {
   /** The handler for a page's socket; `who` is whoever is signed in on that page (default: the owner's open app). */
   socket(): (ws: WsSocket, who?: UiWho) => void
   /** Runs `cmd` on the screen being looked at, of `as`'s own pages only, and answers what the page answered. */
-  call(cmd: string, args: unknown, timeoutMs?: number, as?: UiWho): Promise<unknown>
+  call(cmd: string, args: unknown, timeoutMs?: number, as?: UiWho, guard?: (route: string) => boolean): Promise<unknown>
   /** Is the screen a call of `as` would drive now a phone? null: there is none to drive (nobody is looking, or it is hidden). */
   onPhone(as?: UiWho): boolean | null
   /** Order od371: which device `as`'s Assistant drives now (null: none, or two are open and none is chosen). */
@@ -200,7 +202,13 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
           if (!w || w.client !== me) return
           clearTimeout(w.timer)
           waiting.delete(m.id)
-          if (m.ok === true) w.resolve(m.result ?? null)
+          if (m.ok === true && w.guard) {
+            // o7e6d: a staff call is answered only with the route the page captured, and only if that route passes the guard now.
+            // A page that moved on (allowed -> forbidden while the call was in flight), an old page, or one that says nothing is refused.
+            const captured = typeof m.route === 'string' ? m.route : null
+            if (captured === null || !w.guard(captured)) w.reject(apiError(403, 'The page moved to one your Assistant may not look at; it did not look.'))
+            else w.resolve(m.result ?? null)
+          } else if (m.ok === true) w.resolve(m.result ?? null)
           else w.reject(apiError(422, typeof m.error === 'string' ? m.error : 'That did not work'))
         }
       })
@@ -212,7 +220,7 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
       })
     },
 
-    call(cmd, args, timeoutMs = UI_CALL_TIMEOUT_MS, as = UI_OWNER) {
+    call(cmd, args, timeoutMs = UI_CALL_TIMEOUT_MS, as = UI_OWNER, guard?: (route: string) => boolean) {
       let scope: string
       try {
         scope = scopeOf(as)
@@ -225,15 +233,18 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
       const c = driving(scope)
       if (!c) return Promise.reject(apiError(409, 'No screen of the app is open: nobody is looking at the app right now. Ask him to open it (on any of his PCs, localhost or the tailnet address) and sign in.'))
       if (!c.visible) return Promise.reject(apiError(409, "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
+      // F-162 o7e6d: a guard (a staff chat's page rule) is checked against the page that will be driven, in the same step as the pick. Refused, fail closed.
+      if (guard && !guard(c.route)) return Promise.reject(apiError(403, 'That page is not open to your Assistant; it can look at the app\'s main pages only.'))
       return new Promise((resolve, reject) => {
         const id = randomUUID()
         const timer = setTimeout(() => {
           waiting.delete(id)
           reject(apiError(504, "The screen didn't answer in time"))
         }, timeoutMs)
-        waiting.set(id, { client: c, resolve, reject, timer })
+        waiting.set(id, { client: c, resolve, reject, timer, guard })
         try {
-          c.ws.sendText(JSON.stringify({ t: 'cmd', id, cmd, args }))
+          // o7e6d: a staff call says so, and the page checks its own route before it runs anything (no field for the owner: unchanged).
+          c.ws.sendText(JSON.stringify(guard ? { t: 'cmd', id, cmd, args, staff: true } : { t: 'cmd', id, cmd, args }))
         } catch {
           clearTimeout(timer)
           waiting.delete(id)

@@ -4,6 +4,7 @@ import path from 'node:path'
 import type { CrmNode, CrmUpload, CrmUploadStart } from '../../shared/crm-files.ts'
 import { BROWSER_PRIVATE_MARK } from '../../shared/browser.ts'
 import { PHONE_PRIVATE_MARK, PHONE_SHOTS_DIR } from '../../shared/phone-private.ts'
+import { SSH_PRIVATE_MARK } from '../../shared/ssh-assist.ts'
 import { writeAtomic } from '../config.ts'
 
 // F-211, stage 1 (orders obd04, o63c5 and o7472; Shubham's own answers, 13 Nov 2026): every floor chat's conversation (its Claude Code JSONL) is kept in two places, on the PC
@@ -266,13 +267,19 @@ const STAND_IN = Buffer.from('{"type":"private","note":"A row of the Browser or 
  */
 const UI_CALL = callOf('ui_control')
 const UI_IN_BROWSER = /"action"\s*:\s*"browse"|"ref"\s*:\s*"b\d{1,5}"/
+/** Order o68f0: an SSH terminal's rows: the calls (what is typed, where) and their answers (marked SSH_PRIVATE_MARK: the terminal's text). */
+const SSH_CALL = callOf('ssh_open|ssh_read|ssh_type|ssh_close')
+/** Order o68f0, slice 2: ui_control typing into the SSH terminal through the screen (ref s1). */
+const UI_IN_SSH = /"ref"\s*:\s*"s\d{1,3}"/
 const privateText = (s: string): boolean =>
   s.includes(BROWSER_PRIVATE_MARK) ||
   BROWSER_CALL.test(s) ||
-  (UI_CALL.test(s) && UI_IN_BROWSER.test(s)) ||
+  (UI_CALL.test(s) && (UI_IN_BROWSER.test(s) || UI_IN_SSH.test(s))) ||
   s.includes(PHONE_PRIVATE_MARK) ||
   PHONE_CALL.test(s) ||
-  PHONE_SHOT.test(s)
+  PHONE_SHOT.test(s) ||
+  s.includes(SSH_PRIVATE_MARK) ||
+  SSH_CALL.test(s)
 export const privateRow = (row: Buffer): boolean => privateText(row.toString('latin1'))
 /** True when the row answers a tool call whose row was blanked. */
 const answersHidden = (s: string, hidden: ReadonlySet<string>): boolean => {

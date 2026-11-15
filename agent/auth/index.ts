@@ -137,6 +137,10 @@ export interface SignedIn {
 export interface Auth {
   /** F-144: exact private app-session binding; CRM credentials remain in memory. */
   viewerCrm(headers: Record<string, string | string[] | undefined>): CrmSession | null
+  /** Order ofedf (usage): the CRM session of a person who is signed in here and not expired, or null. Used by the Claude usage reporter. */
+  viewerLoginFor(userId: string): CrmSession | null
+  /** Order ofedf (usage): any signed-in person's CRM session (the limits belong to the account, not a person), or null. */
+  anyViewer(): CrmSession | null
   forgetViewerCrm(headers: Record<string, string | string[] | undefined>): void
   /** The request's caller: its cookie's session (touched: it was used now), and where it came from. */
   caller(headers: Record<string, string | string[] | undefined>): Caller
@@ -474,6 +478,14 @@ export function createAuth(o: AuthOptions): Auth {
     return () => void watchers.delete(w)
   }
 
+  /** Whether a signed-in session with this hash still exists and is neither expired nor idle (no touch: this is a read only). */
+  function liveRow(h: string): boolean {
+    const row = f.sessions.find(s => s.h === h)
+    if (!row) return false
+    const t = now()
+    return t - row.createdAt < SESSION_MS && t - row.lastSeen < IDLE_MS
+  }
+
   return {
     viewerCrm(headers) {
       const c = caller(headers)
@@ -481,6 +493,17 @@ export function createAuth(o: AuthOptions): Auth {
       if (!c.person || !token) return null
       const session = viewerSessions.get(hash(token))
       return session?.user.id.toLowerCase() === c.person.id ? session : null
+    },
+    viewerLoginFor(userId) {
+      const id = userId.toLowerCase()
+      for (const [h, session] of viewerSessions) {
+        if (session.user.id.toLowerCase() === id && liveRow(h)) return session
+      }
+      return null
+    },
+    anyViewer() {
+      for (const [h, session] of viewerSessions) if (liveRow(h)) return session
+      return null
     },
     forgetViewerCrm(headers) {
       const token = cookieOf(headers)

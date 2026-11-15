@@ -8,7 +8,7 @@ import {
   type ChatCan,
   type ChatOwner,
 } from '../../shared/auth.ts'
-import type { Floor, FloorAgent } from '../../shared/agentic.ts'
+import { isPersonAssistant, type Floor, type FloorAgent } from '../../shared/agentic.ts'
 import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
 
@@ -135,10 +135,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['DELETE', /^\/old\/api-key$/, OWNER],
   ['POST', /^\/old\/api-key\/test$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, chat('owner')],
-  ['GET', /^\/approvals$/, SIGNED],
-  ['POST', /^\/approvals\/answer$/, SIGNED],
-  ['POST', /^\/approvals\/cancel$/, SIGNED],
-  ['POST', /^\/send-as-me$/, SIGNED],
+  // o7e6d (refinement2 line 56): the owner's only, human proof on top (humanTarget in index.ts).
+  ['GET', /^\/approvals$/, OWNER],
+  ['POST', /^\/approvals\/answer$/, OWNER],
+  ['POST', /^\/approvals\/cancel$/, OWNER],
+  ['POST', /^\/send-as-me$/, OWNER],
   // F-221 (ob98a): live talk's cards and direct line: the owner's page (and Send also takes his signed-in CRM session, in the route itself).
   ['GET', /^\/talk\/cards$/, OWNER],
   ['POST', /^\/talk\/cards\/([^/]+)\/send$/, OWNER],
@@ -170,6 +171,13 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/session$/, chat('owner')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/messages$/, chat('view')],
   ['GET', /^\/floors\/([^/]+)\/transcripts$/, floor('view')],
+  // F-162 slice A: a person's own Assistant floor; the feature 'assistant' opens it (shared/access.ts ROUTES), the owner rule otherwise.
+  ['GET', /^\/own-assistant$/, OWNER],
+  ['POST', /^\/own-assistant$/, OWNER],
+  // Order o7e6d (Agent 12, agreed with Agent 7): the staff preflight, the owner of the app only.
+  ['GET', /^\/staff\/preflight$/, OWNER],
+  // Order oa09e: his overlay Assistant (the hub's Orchestrator), found or made by the hub from its whole list. His only (not in Settings › Access).
+  ['POST', /^\/assistant$/, OWNER],
   ['GET', /^\/tasks$/, OWNER],
   ['POST', /^\/tasks$/, OWNER],
   ['PATCH', /^\/tasks\/([^/]+)$/, OWNER],
@@ -223,6 +231,8 @@ export interface Access {
   rights(c: Caller, agent: FloorAgent): { access: ChatAccess; can: ChatCan } | null
   /** Throws 403 not-yours unless the caller has this much on that chat. `route` and `sid` are for the log. */
   needChat(c: Caller, agent: FloorAgent, need: Need, route: string): void
+  /** o7e6d: may this caller type into this chat (the terminal's keys, a message, a draft)? Non-owners: their own person-assistant only. */
+  mayType(c: Caller, agent: FloorAgent): boolean
   floorSeen(c: Caller, f: Floor): boolean
   /** Throws 403 not-yours unless the caller sees / manages / may delete the floor. */
   needFloor(c: Caller, f: Floor, need: 'view' | 'manage' | 'delete', route: string): void
@@ -253,9 +263,17 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
     onDeny?.(c, route, chatId ?? null)
   }
 
+  /** o7e6d (Lead's B2): a non-owner types only into their OWN person-assistant; every other chat they see is view only. The owner: as before. */
+  function mayType(c: Caller, agent: FloorAgent): boolean {
+    const r = rights(c, agent)
+    if (r === null || r.can === 'view') return false
+    if (isAdmin(c)) return true
+    return !!c.person && isPersonAssistant(agent) && agent.owner?.id === c.person.id
+  }
+
   function needChat(c: Caller, agent: FloorAgent, need: Need, route: string) {
     const r = rights(c, agent)
-    const ok = r !== null && (need === 'view' || (need === 'type' && r.can !== 'view') || (need === 'owner' && r.can === 'owner'))
+    const ok = r !== null && (need === 'view' || (need === 'type' && mayType(c, agent)) || (need === 'owner' && r.can === 'owner'))
     if (ok) return
     deny(c, route, agent.sessionId)
     throw authError(403, r ? "You can only look at this chat; it isn't yours to change." : "That chat isn't yours.", 'not-yours')
@@ -282,6 +300,7 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
     isAdmin,
     ownerOf: c => (c.person ? { id: c.person.id, username: c.person.username, name: c.person.name } : SBSKRRT_OWNER),
     rights,
+    mayType,
     needChat,
     floorSeen,
     needFloor,

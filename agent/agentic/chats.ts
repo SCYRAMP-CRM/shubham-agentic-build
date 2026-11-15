@@ -18,6 +18,9 @@ import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, readTurnState, type Screen } from './screen.ts'
 import { createInputMirror, type InputMirror, type MirrorBox, type MirrorClient, type TakeOut } from './input-mirror.ts'
+import { answerColourQueries } from '../../shared/terminal-colours.ts'
+import { MCP_SERVER_NAME } from './briefs.ts'
+import { policyOf, STAFF_DROP_ENV, STAFF_ENV, STAFF_POLICY, staffArgs, staffText, type ChatPolicy } from './staff-policy.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
 // (node-pty, ConPTY on Windows), as agentic-claude-manager runs them (server/lib/terminal.js):
@@ -175,6 +178,11 @@ export interface StartChat {
    * model/effort/brief/MCP servers are in the profile file (codex/home.ts writeProfile), so none of the Claude flags above are used.
    */
   codex?: { home: string; profile: string; thread: string | null; bin?: string }
+  /**
+   * Order o7e6d: a person's own Assistant starts under the staff policy (staff-policy.ts): its own launch (staffArgs, never the flags above),
+   * no raw keys, checked words only. Native Claude only: with a bridge, Codex or OpenCode it is refused. Any other value is refused.
+   */
+  policy?: typeof STAFF_POLICY
 }
 
 /** F-078: how a chat ended. cause: stopped (by him), idle-reaper, agent-stop (the app stopping: an Update, a restart), exited (it ended itself, code 0), crashed (a non-zero code), ended (no code). */
@@ -205,6 +213,8 @@ export interface ChatInfo {
   state: ChatState
   startedAt: string
   viewers: number
+  /** Order o7e6d: the policy it was started under ('unknown': adopted with a policy this build does not know; nothing reaches it). Absent: none. */
+  policy?: ChatPolicy
 }
 
 export interface ChatPool {
@@ -322,6 +332,8 @@ export interface AdoptChat {
   key: string
   cols: number
   rows: number
+  /** Order o7e6d: the policy the host's record of the chat names, as it is (policyOf decides what it means). */
+  policy?: string
 }
 
 export interface ChatPoolOptions {
@@ -387,6 +399,9 @@ export interface ChatPoolOptions {
    * the Orchestrator's chat its own file with the voice lock (latch-hook.ts) and every other chat what it had. Undefined: no --settings at all.
    */
   settings?: string | ((s: StartChat) => string | undefined)
+  /** Order ofedf: extra environment for one Claude chat's process (the usage hook's values), asked once per start. Undefined: none. */
+  chatEnv?: (s: StartChat) => Record<string, string>
+
   /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
   addDirs?: string[]
   /**
@@ -433,6 +448,9 @@ export function findClaude(env: NodeJS.ProcessEnv = process.env): string | null 
 // Claude chat (or Christopher's), and a claude that inherits those thinks it is a child session.
 // F-134: nor a Codex login or key of the person's own: the Codex chats run on the CRM's login (CODEX_HOME is set for them below), and a stray OPENAI_API_KEY must not win over it.
 const DROP_ENV = /^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_MESSAGING_.*|CLAUDE_PID|CLAUDE_CONFIG_DIR|COS_.*|MDV2_PORT|SAD_AGENTIC_.*|CODEX_HOME|CODEX_API_KEY|CODEX_ACCESS_TOKEN|OPENAI_API_KEY)$/i
+
+/** Order o7e6d: a staff chat refused at its start (staff-policy.ts); nothing was started. */
+const staffRefused = (message: string) => Object.assign(new Error(message), { status: 409, code: 'staff-policy' })
 
 interface Chat {
   info: Omit<ChatInfo, 'state' | 'viewers'>
@@ -798,6 +816,13 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   function answerGates(c: Chat, chunk: string) {
     const g = c.gates
+    // Order o7e6d (Agent 14's audit): never a key into a chat with a policy (staff, or one this build does not know), whatever its output or
+    // replayed history shows: its gates are never armed (start, adopt) and this is the backstop. Its trust is recorded before it starts
+    // (prepareClaudeConfig); an unexpected onboarding or resume menu just waits, it is never answered by the app.
+    if (c.info.policy) {
+      g.trust = g.resume = false
+      return
+    }
     if (!g.trust && !g.resume) return
     if (Date.now() > g.until) {
       g.trust = g.resume = false
@@ -959,8 +984,21 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     actualExits.set(c.info.sessionId, exit)
     chats.set(c.info.sessionId, c)
     keys.set(c.key, c)
-    pty.onData(data => {
-      noteConsole(data)
+    pty.onData(raw => {
+      noteConsole(raw)
+      // o747c: a CLI asking the terminal for its colours (Codex does, to draw the bands behind his messages and its input box) is answered
+      // here, on the chat's PC, with the dark scheme the pages draw (shared/terminal-colours.ts); the question is taken out of the output, so
+      // no page answers it again (a second answer would be typed into the chat). Under Windows' ConPTY the question never comes out at all.
+      const asked = raw.includes('\x1b]1') ? answerColourQueries(raw) : null
+      for (const reply of asked?.replies ?? []) {
+        try {
+          c.pty.write(reply)
+        } catch {
+          // The chat is ending.
+        }
+      }
+      const data = asked ? asked.output : raw
+      if (!data) return
       if (c.silentSince !== undefined) {
         log?.info(`chat ${c.info.sessionId.slice(0, 8)}: terminal output again ${Math.round((Date.now() - c.silentSince) / 1000)} s after a paste that got no echo (it had not been reading its input)`)
         c.silentSince = undefined
@@ -1041,7 +1079,21 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     return sending
   }
 
-  function paste(c: Chat, text: string) {
+  /**
+   * Order o7e6d: what may be typed into a staff chat (staff-policy.ts staffText: plain words, line ends and tabs made plain), or null: refused,
+   * nothing typed. A chat whose policy this build does not know takes nothing at all.
+   */
+  function staffWords(c: Chat, raw: string): string | null {
+    const checked = c.info.policy === STAFF_POLICY ? staffText(raw) : null
+    if (checked?.ok) return checked.text
+    log?.info(`chat ${c.info.sessionId.slice(0, 8)}: a text was not typed: ${checked ? `the staff policy refuses it (${checked.why})` : 'its policy is not known here'}`)
+    return null
+  }
+
+  function paste(c: Chat, raw: string) {
+    // o7e6d: every type() and typeWhenReady() paste comes through here: a staff chat's words are checked first.
+    const text = c.info.policy ? staffWords(c, raw) : raw
+    if (text === null) return false
     // A paste, not keystrokes: the TUI takes it whole, newlines in it are text, and Enter
     // follows separately (in the same chunk it would be a newline in the paste).
     // M1: Enter at a permission prompt or a menu picks the highlighted option, an approval nobody tapped.
@@ -1151,6 +1203,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   /** Types `text` once the chat is at its prompt: waits past start-up questions and past any later question (never drops it for that). */
   function typeWhenReady(id: string, text: string, opt?: { holdForDraft?: boolean }) {
+    // o7e6d: a staff chat's text is checked now, so a refused one never waits (paste checks it again when it goes in).
+    const now = chats.get(id)
+    if (now?.info.policy && staffWords(now, text) === null) return
     const born = Date.now()
     let since = born
     const over = waitFor(id, text)
@@ -1238,10 +1293,15 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         || s.bridge.binding.sessionId !== s.sessionId || s.bridge.binding.agentId !== s.agentId
         || s.model !== 'gpt-6.1-sol' || s.effort !== 'max')) throw Object.assign(new Error('Invalid managed execution launch.'), { status: 409, code: 'execution-runtime-mismatch' })
       if (s.engine && s.engine !== 'claude' && s.engine !== 'codex') throw Object.assign(new Error('This native terminal pool does not support the requested engine.'), { status: 503, code: 'engine-not-supported' })
+      // Order o7e6d: the staff policy or none. A staff chat is native Claude only: never with a bridge, as Codex or as OpenCode.
+      if (s.policy !== undefined && s.policy !== STAFF_POLICY) throw staffRefused('This chat names a policy this app does not know, so it was not started.')
+      if (s.policy && (s.bridge || s.codex || (s.engine ?? 'claude') !== 'claude')) throw staffRefused('A person’s own Assistant runs only as native Claude, so it was not started.')
       const existing = chats.get(s.sessionId)
       if (existing && !existing.exited) {
         if (existing.engine !== (s.engine ?? 'claude')) throw engineMismatch(s.engine ?? 'claude', existing.engine)
         if (JSON.stringify(existing.info.execution ?? null) !== JSON.stringify(s.bridge?.binding ?? null) || (existing.info.bridgeRunId ?? null) !== (s.bridge?.runId ?? null)) throw Object.assign(new Error('The existing runtime belongs to another execution.'), { status: 409, code: 'execution-runtime-mismatch' })
+        // o7e6d: a running chat of another policy is never handed back (an unrestricted run as a staff one, or the other way round).
+        if ((existing.info.policy ?? null) !== (s.policy ?? null)) throw staffRefused('This chat is running under another policy. Stop it first.')
         return infoOf(existing)
       }
       if (!spawnPty) {
@@ -1258,8 +1318,13 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
       const key = `sad_${randomBytes(24).toString('hex')}`
       const env: Record<string, string> = {}
-      for (const [k, v] of Object.entries(o.env ?? process.env)) if (v !== undefined && !DROP_ENV.test(k)) env[k] = v
+      // o7e6d: a staff chat also inherits none of the app's own variables, Claude Code's switches or other tools' keys (STAFF_DROP_ENV).
+      for (const [k, v] of Object.entries(o.env ?? process.env)) if (v !== undefined && !DROP_ENV.test(k) && !(s.policy && STAFF_DROP_ENV.test(k))) env[k] = v
       Object.assign(env, { TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3', SAD_AGENTIC_KEY: key, SAD_AGENTIC_URL: o.toolsUrl() })
+      // Order ofedf: the Claude usage hook's values for this chat (who started it, a fresh launch id); asked once per start.
+      if (!s.bridge && o.chatEnv) Object.assign(env, o.chatEnv(s))
+      // o7e6d: a staff chat's status line never runs another command (the PC's own status line is not chained), whoever set the variable.
+      if (s.policy) delete env.SAD_STATUSLINE_CHAIN
       // F-040: claude's plain screen, not its full-screen one. That one (the alternate screen,
       // with the mouse captured) keeps no scrollback in the page's terminal and scrolls only by
       // wheel events, which don't get through Windows' pseudo-terminal: the chat couldn't be
@@ -1292,28 +1357,38 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
         }
 
-        args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
-        if (s.strictMcp) args.push('--strict-mcp-config')
-        // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
-        for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
-        if (s.model) args.push('--model', s.model)
-        if (s.effort) args.push('--effort', s.effort)
-        // Shubham chose bypass for all existing/new chats: resumes get the same launch default.
-        // The native startup consent is recorded by prepareClaudeConfig, not answered with keys.
-        args.push('--permission-mode', 'bypassPermissions')
         // F-221 (ob98a, T4): read once per start (a function is asked for this chat only; Codex in Claude Code never gets settings).
+        // o7e6d: a staff chat takes only a file made for its start (a function's answer), never a file shared with other chats.
         const pick = s.bridge ? undefined : o.settings
-        const settings = typeof pick === 'function' ? pick(s) : pick
-        if (settings) args.push('--settings', settings)
+        const settings = typeof pick === 'function' ? pick(s) : s.policy ? undefined : pick
+        if (s.policy) {
+          // Order o7e6d: the staff launch (staff-policy.ts), none of the flags below. Without its own settings file or its own MCP file it is
+          // not started at all (never the coding chats' settings or the shared MCP file in their place).
+          if (!settings || !s.mcpConfig) throw staffRefused('The settings or the tools file of a person’s own Assistant could not be made, so it was not started.')
+          Object.assign(env, STAFF_ENV)
+          args = staffArgs({ sessionId: s.sessionId, resume: s.resume, briefPath: s.briefPath, mcpConfig: s.mcpConfig, server: MCP_SERVER_NAME, model: s.model, effort: s.effort, settings })
+        } else {
+          args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
+          if (s.strictMcp) args.push('--strict-mcp-config')
+          // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
+          for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
+          if (s.model) args.push('--model', s.model)
+          if (s.effort) args.push('--effort', s.effort)
+          // Shubham chose bypass for all existing/new chats: resumes get the same launch default.
+          // The native startup consent is recorded by prepareClaudeConfig, not answered with keys.
+          args.push('--permission-mode', 'bypassPermissions')
+          if (settings) args.push('--settings', settings)
+        }
       }
       const file = s.bridge ? process.execPath : /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = s.bridge ? [s.bridge.wrapperPath, s.bridge.descriptorFile, ...args] : /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }
       const startedAt = new Date().toISOString()
-      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt, engine, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}) } satisfies Record<string, unknown> })
+      // o7e6d: the chat host keeps the policy in the chat's meta, so the agent that takes it over after a restart knows what it is (link.ts adoptable).
+      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt, engine, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}), ...(s.policy ? { policy: s.policy } : {}) } satisfies Record<string, unknown> })
 
       const c: Chat = {
-        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, engine, cwd: s.cwd, startedAt, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}) },
+        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, engine, cwd: s.cwd, startedAt, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}), ...(s.policy ? { policy: s.policy } : {}) },
         engine,
         pty,
         key,
@@ -1330,7 +1405,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         size,
         screen: createScreen(size.cols, size.rows),
         // F-134: Codex has no start-up questions to answer here (its folder is trusted in the profile's world and approvals are off).
-        gates: engine === 'codex' ? { trust: false, trustTries: 0, resume: false, scan: '', until: 0 } : { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
+        // o7e6d: nor does a chat with a policy: the app answers nothing in it (answerGates refuses it too).
+        gates: engine === 'codex' || s.policy ? { trust: false, trustTries: 0, resume: false, scan: '', until: 0 } : { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
       }
       register(c)
       log?.info(`chat ${s.sessionId.slice(0, 8)}: ${s.resume ? 'resumed' : 'started'} in ${s.cwd}`)
@@ -1389,6 +1465,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     input(id, data) {
       const c = chats.get(id)
       if (!c) return false
+      // Order o7e6d: no raw keys into a staff chat, from any page or anyone; its words go in by the checked send only (staffWords).
+      if (c.info.policy) return false
       c.lastSeen = Date.now()
       // oeee2: what xterm sends by itself (the focus report the Windows console asks for whenever a page gains or loses focus, answers to
       // queries) is not typing: it never cancels a message in flight and is not "he is typing". (14 Nov, 19:35: an order to Lead's Codex,
@@ -1462,7 +1540,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const c = chats.get(id)
       const view = (): DraftView | null => (c && !c.exited ? draftViewOf(c, draftReading(c)) : null)
       if (!c || c.exited) return { result: 'gone', draft: null }
-      if (c.engine !== 'claude' || c.info.execution) return { result: 'unsupported', draft: view() }
+      // o7e6d: no keys into a staff chat, these neither.
+      if (c.engine !== 'claude' || c.info.execution || c.info.policy) return { result: 'unsupported', draft: view() }
       // Never while a send or a paste of ours is in flight, and never at a question: Ctrl+U there would edit or answer something else.
       if (c.delivering || c.pasteChain || (c.pastingUntil ?? 0) > Date.now()) return { result: 'busy', draft: view() }
       if (menuOnScreen(c) || dialogAbove(c)) return { result: 'menu', draft: view() }
@@ -1500,9 +1579,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       return paste(c, text)
     },
 
-    async deliver(id, text, opt) {
+    async deliver(id, given, opt) {
       const c = chats.get(id)
       if (!c || c.exited) return 'gone'
+      // Order o7e6d: a staff chat's words are checked before anything is typed (staffWords); refused, nothing of it goes in.
+      const text = c.info.policy ? staffWords(c, given) : given
+      if (text === null) { opt?.onBlocked?.(c.info.policy === STAFF_POLICY ? 'staff-text' : 'staff-runtime'); return 'blocked' }
       // Stage 1 (oad50): the simple send for a Claude chat, unless "Old way" is on. Nothing before it refuses on what the screen shows.
       // Only where Agent 12's transcript reader runs: a Claude chat that is not Codex-in-Claude (c.info.execution). Everything else keeps the checked path.
       if (simpleLayerFor(c.info, oldWay())) {
@@ -1676,8 +1758,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const existing = chats.get(a.sessionId)
       if (existing && !existing.exited) return infoOf(existing)
       const size = { cols: a.cols, rows: a.rows }
+      // o7e6d: the policy the host's record names comes with it ('unknown' when this build does not know it: it then takes nothing).
+      const policy = policyOf(a.policy)
       const c: Chat = {
-        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, engine: a.engine === 'codex' ? 'codex' : 'claude', cwd: a.cwd, startedAt: a.startedAt, ...(a.execution ? { execution: a.execution, bridgeRunId: a.bridgeRunId } : {}) },
+        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, engine: a.engine === 'codex' ? 'codex' : 'claude', cwd: a.cwd, startedAt: a.startedAt, ...(a.execution ? { execution: a.execution, bridgeRunId: a.bridgeRunId } : {}), ...(policy ? { policy } : {}) },
         engine: a.engine === 'codex' ? 'codex' : 'claude',
         pty,
         key: a.key,
@@ -1718,6 +1802,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     press(id, data) {
       const c = chats.get(id)
       if (!c || c.exited) return false
+      // o7e6d: the app presses no keys in a staff chat either (a menu answer, Esc, a watchdog key).
+      if (c.info.policy) return false
       c.inputEpoch = (c.inputEpoch ?? 0) + 1
       c.typedAt = Date.now()
       c.lastInput = { at: c.typedAt, kind: inputKind(data), via: 'app' }
@@ -1756,6 +1842,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     draftMirror(id, client) {
       const c = chats.get(id)
       if (!c || c.exited) return null
+      // o7e6d: no live mirror in a staff chat (it types keys into the input line); the page sends the old way, checked.
+      if (c.info.policy) return null
       const m = mirrorOf(c)
       const detach = m.attach(client)
       return { set: (seq, text, base, seal) => m.set(client, seq, text, base, seal), detach }

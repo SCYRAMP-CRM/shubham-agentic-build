@@ -27,7 +27,7 @@ import { createPhoneAppsMount } from './agentic/phone-apps.ts'
 import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
-import { createBuild, findDevDir, type Build, type ChatHostGate } from './build.ts'
+import { createBuild, findDevDir, type Build, type ChatHostGate, type UpdateGuard } from './build.ts'
 import { authError, mayPublish } from './auth/types.ts'
 import { createCoordinator, type Coordinator } from './update/coordinator.ts'
 import { createUpdateState } from './update/state.ts'
@@ -130,6 +130,11 @@ export interface AgentExtras {
   currentBuild?: () => string | null
   /** F-075: set here once the chats run in the chat host, for the update to ask about it (build.ts). */
   chatHostGate?: { current: ChatHostGate | null }
+  /**
+   * Order o7e6d S1: what may hold an Update of this PC (build.ts UpdateGuard), set here as soon as the Agents section exists (with or without
+   * the chat host); with the Agents section off, explicitly nothing. Until then the build's holder is empty, which holds every Update.
+   */
+  updateGuard?: { current: UpdateGuard | null }
   /** F-173a: the build the automatic update applies (the hub's), and where its coordinator is kept (created here, on the hub only). */
   updateBuild?: Build
   updateCoordinator?: { current: Coordinator | null }
@@ -334,6 +339,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let member: { links: MemberLinks; discovery: DiscoveryClient } | null = null
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
+    // Order o68f0: the overlay Assistant's SSH tools use the Server's terminals (made further down; only called once the agent runs).
+    ssh: () => (role === 'hub' ? sshTerm.assistant : null),
     pcControlDevices: () => [{ id: identity.id, name: config.name, online: true }, ...(role === 'hub' ? devices.members().map(p => ({ id: p.id, name: p.name, online: !!hub?.links.mux(p.id) })) : (() => { const h = devices.hub(); return h ? [{ id: h.id, name: h.name, online: !!member?.links.mux() }] : [] })())],
     codex,
     openCodeCredential: provider => provider === 'opencode' ? Promise.resolve(FREE_CREDENTIAL) : openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
@@ -385,6 +392,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     crmFilesMountDriver: crmFilesLinux,
   })
   crmFilesService = agentic?.crmFiles.service ?? null
+  // Order o7e6d S1 (Lead's GO): the Update guard, as soon as the Agents section exists, chat host or not (the staff fence record lives there).
+  // With the Agents section off no chat of it runs here, so nothing of it can hold an Update: explicitly not applicable, never left empty.
+  if (extras.updateGuard) extras.updateGuard.current = agentic ? { blockers: () => agentic.updateBlockers() } : { blockers: () => [] }
   if (agentic && chatHost && extras.chatHostGate) {
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
   }
@@ -529,6 +539,10 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     dir: path.join(paths.agent, 'ssh'),
     log: log.child('ssh'),
     status: { status: id => sshStatus!.status(id), test: id => sshStatus!.test(id) },
+    // Order o68f0: the Assistant's use of these terminals goes off while <state>/agent/ssh/assistant.off exists.
+    assistantOff: () => existsSync(path.join(paths.agent, 'ssh', 'assistant.off')),
+    // Order o68f0, slice 3: who else may use SSH, PC by PC (Settings › Access, 'pc-ssh@<pcId>').
+    allows: (c, pcId) => featureAccess.allows(c, 'pc-ssh', pcId),
   })
   // Order o1fa0, the read-only status: this PC's OpenSSH as it can see it (pc-ssh-read.ts), a member's over their link, and the banner-only Test.
   const sshDeps = realSshDeps(tailscaleRunner)
@@ -1327,9 +1341,12 @@ if (import.meta.main) {
     const root = path.resolve(import.meta.dirname, '..')
     const devDir = findDevDir(root)
     const hostGate: { current: ChatHostGate | null } = { current: null }
+    // Order o7e6d S1: supplied from the start and empty until the agent sets it (startAgent), so no Update goes before it can be asked.
+    const updateGuard: { current: UpdateGuard | null } = { current: null }
     const updateCoordinator: { current: Coordinator | null } = { current: null }
     build = createBuild({
       chatHostGate: hostGate,
+      updateGuard,
       root,
       devDir,
       role: () => config.role,
@@ -1347,7 +1364,7 @@ if (import.meta.main) {
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
     speech = createEngine({ log: log.child('speech') })
     pcVoice = createTts({ log: log.child('speech') })
-    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'), pcVoice)], devDir, agents, speech, chatHostGate: hostGate, updateBuild: build, updateCoordinator, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
+    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'), pcVoice)], devDir, agents, speech, chatHostGate: hostGate, updateGuard, updateBuild: build, updateCoordinator, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')
