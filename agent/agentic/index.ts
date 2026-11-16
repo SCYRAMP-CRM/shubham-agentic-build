@@ -1675,6 +1675,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
         await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard, executable)
         guard()
       },
+      // Order occ4c: the way back to native Claude (execution-native-claude.ts). The existing open, Claude Code at the exact executable proved,
+      // under the same guards as native Codex just above; never a person's own Assistant (its own staff launch only).
+      claudeBin: () => o.claude ?? findClaude(),
+      nativeClaudeOpen: async (request, assertCurrent, executable) => {
+        const guard = () => {
+          assertCurrent()
+          const agent = workflowExecutionAgent(request.scope.floorId, request.scope.agentId)
+          assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
+          if (request.signal.aborted || request.kind !== 'native' || request.binding.execution.profile !== 'claude-native-v1' || isStaffAssistant(agent)
+            || agent.owner?.id !== request.scope.ownerId || request.scope.targetPcId !== self().id
+            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
+        }
+        guard()
+        await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard, executable)
+        guard()
+      },
       launch: request => {
         const floor = floorOf(request.scope.floorId), agent = workflowExecutionAgent(floor.id, request.scope.agentId)
         // Order o7e6d: never a bridge launch of a staff Assistant (blocked here, before the bridge; its proof is not touched).
@@ -2495,7 +2511,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
     }
     voiceLockGiven = null
-    const started = chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    // Order occ4c: a managed native Claude run starts at the executable its capability proved (nativeExecutable), never a fresh lookup.
+    const started = chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows,
+      ...(nativeExecutable ? { claudeBin: nativeExecutable } : {}) })
     // F-221 (ob98a, T4): this run has the voice lock when its start was given hooks-orchestrator.json (chatSettings); kept by its start time.
     if (voiceLockGiven === sid) voiceLocks.started(sid, started.startedAt)
     voiceLockGiven = null
@@ -5212,7 +5230,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (isStaffAssistant(a) && (args.executionProfile !== undefined || args.restoreHistory !== undefined || executionIdentityOf(a, defaultsNow()).profile !== 'claude-native-v1' || (typeof args.pc === 'string' && args.pc.trim() !== '' && args.pc !== self().id && args.pc.trim().toLowerCase() !== self().name.toLowerCase()))) throw staffError("A person's own Assistant opens on the Server only, as native Claude.")
         const explicitProfile = args.executionProfile
         if (args.restoreHistory !== undefined && (args.restoreHistory !== true || explicitProfile !== 'codex-native-v1')) throw executionHttpError('execution-invalid', 'selection')
-        if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1' && explicitProfile !== 'codex-native-v1') throw executionHttpError('execution-invalid', 'open')
+        // Order occ4c: claude-native-v1 is the way back to native Claude for a managed conversation (the service refuses it for a plain one).
+        if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1' && explicitProfile !== 'codex-native-v1' && explicitProfile !== 'claude-native-v1') throw executionHttpError('execution-invalid', 'open')
         if (explicitProfile || executionIdentityOf(a, defaultsNow()).profile === 'codex-in-claude-v1') {
           workflowExecutionAgent(f.id, a.id)
           if (!executionService || !me.person || !a.owner || !a.homePc || a.homePc !== self().id
@@ -5221,7 +5240,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
           executionService.bindActor(scope, chatExecutionActor({ floorId: floor.id, agentId: agent.id }, scope,
             { floors, access, target: workflowExecutionAgent }))
           const operationId = typeof args.operationId === 'string' ? args.operationId : explicitProfile ? '' : randomUUID()
-          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1', explicitProfile === 'codex-native-v1' ? explicitProfile : 'codex-in-claude-v1', args.restoreHistory === true)
+          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1',
+            explicitProfile === 'codex-native-v1' || explicitProfile === 'claude-native-v1' ? explicitProfile : 'codex-in-claude-v1', args.restoreHistory === true)
           return json({ ...reply, sessionId: reply.committed.sessionId, agent: a.name, floor: f.name, pc: self().name })
         }
         const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null

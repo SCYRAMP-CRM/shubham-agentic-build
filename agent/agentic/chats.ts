@@ -179,6 +179,11 @@ export interface StartChat {
    */
   codex?: { home: string; profile: string; thread: string | null; bin?: string }
   /**
+   * Order occ4c: a managed native Claude run (execution-native-claude.ts) starts the PC's own Claude Code at the exact executable its capability
+   * proved (an absolute .exe), never a fresh PATH lookup. Claude only: never with a bridge, the staff policy or another engine (refused).
+   */
+  claudeBin?: string
+  /**
    * Order o7e6d: a person's own Assistant starts under the staff policy (staff-policy.ts): its own launch (staffArgs, never the flags above),
    * no raw keys, checked words only. Native Claude only: with a bridge, Codex or OpenCode it is refused. Any other value is refused.
    */
@@ -1311,9 +1316,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       }
       const engine = s.engine === 'codex' ? 'codex' : 'claude'
       if (s.codex?.bin && (!path.isAbsolute(s.codex.bin) || !/\.exe$/i.test(s.codex.bin))) throw Object.assign(new Error('Invalid pinned native executable.'), { status: 409, code: 'execution-runtime-mismatch' })
+      if (s.claudeBin !== undefined && (engine !== 'claude' || s.bridge || s.policy || !path.isAbsolute(s.claudeBin) || !/\.exe$/i.test(s.claudeBin))) throw Object.assign(new Error('Invalid pinned native executable.'), { status: 409, code: 'execution-runtime-mismatch' })
       const codexBin = engine === 'codex' ? (s.codex?.bin ?? o.codexBin?.() ?? null) : null
       if (engine === 'codex' && (!codexBin || !s.codex)) throw Object.assign(new Error("The Codex CLI isn't installed on this PC"), { status: 503, code: 'not-installed' })
-      const claude = engine === 'codex' ? codexBin! : (o.claude ?? findClaude(o.env))
+      const claude = engine === 'codex' ? codexBin! : (s.claudeBin ?? o.claude ?? findClaude(o.env))
       if (!claude) throw Object.assign(new Error("Claude Code isn't installed on this PC (no claude on PATH)"), { status: 503 })
 
       const key = `sad_${randomBytes(24).toString('hex')}`

@@ -15,6 +15,7 @@ import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.t
 import { readChildConfig } from '../codex-claude/child.ts'
 import { recoverUnreportedHostPids } from './execution-host-observation.ts'
 import { createNativeCodexExecution } from './execution-native.ts'
+import { createNativeClaudeExecution, nativeClaudeSourceAllowed, NATIVE_CLAUDE_PROFILE } from './execution-native-claude.ts'
 import type { ConversionStage } from '../../shared/conversion-progress.ts'
 
 export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
@@ -29,6 +30,10 @@ export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
   prepare(scope: ExecutionIntentScope, expected: ExecutionSnapshot, target: ExecutionIdentity): Promise<PreparedExecutionSelection>
   /** Existing native launcher, with the same current-profile/owner guards around its awaits. */
   nativeOpen?(request: ExecutionStartRequest, assertCurrent: () => void, executable: string): Promise<void>
+  /** Order occ4c: the existing chat open for a managed native Claude run, at the proved executable, with the same guards around its awaits. */
+  nativeClaudeOpen?(request: ExecutionStartRequest, assertCurrent: () => void, executable: string): Promise<void>
+  /** Order occ4c: this PC's Claude Code, found the way the chat pool finds it. */
+  claudeBin?(): string | null
 }
 interface FenceState {
   scope: ExecutionIntentScope; expected: ExecutionSnapshot; next: ExecutionSnapshot | null;
@@ -36,8 +41,10 @@ interface FenceState {
 }
 export interface ExecutionToolIntent {
   version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest;
-  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply; targetProfile?: 'codex-in-claude-v1' | 'codex-native-v1'; restoreHistory?: true;
+  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply; targetProfile?: ExecutionToolProfile; restoreHistory?: true;
 }
+/** What an explicit tool open may select (order occ4c added native Claude, the way back from the other two). */
+export type ExecutionToolProfile = 'codex-in-claude-v1' | 'codex-native-v1' | 'claude-native-v1'
 /** Recover only the FIRST unused open of an exact, authoritatively reconciled selection.
  * This is called by the explicit open POST, never by GET or an ambiguous started operation. */
 export function confirmedPreparedToolSelection(intent: ExecutionToolIntent, parent: ExecutionIntent | null, child: ExecutionIntent | null): ExecutionSelectionReply {
@@ -153,6 +160,20 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       const entry=ledger?.get(intent.scope,intent.id)
       return entry?.kind==='open'&&entry.state==='uncertain'&&entry.revision===intent.revision&&entry.runId===intent.runId
     } }) : null
+  // Order occ4c: native Claude, the same guards as native Codex above around the existing chat open.
+  const nativeClaude = o.nativeClaudeOpen && o.claudeBin && o.host ? createNativeClaudeExecution({ directory: o.directory, host: o.host, pool: o.pool, bin: o.claudeBin,
+    open: (request, fence, executable) => o.nativeClaudeOpen!(request, () => { fence(); actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) }, executable),
+    guard: request => { actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) },
+    authorizeObservation: request => { actor(request.scope) },
+    dispatchGuard: request => {
+      const entry=ledger?.get(request.scope,request.openIntentId)
+      if(entry?.kind!=='open'||entry.state!=='starting'||entry.runId!==request.runId)throw executionHttpError('execution-intent-uncertain','open',request.openIntentId)
+      assertExecutionCAS(request.binding,entry.binding)
+    },
+    canConfirmAbsent: intent => {
+      const entry=ledger?.get(intent.scope,intent.id)
+      return entry?.kind==='open'&&entry.state==='uncertain'&&entry.revision===intent.revision&&entry.runId===intent.runId
+    } }) : null
   const assertCurrent = (context: FenceState) => {
     actor(context.scope); runtime.storage!.assertExclusiveWriter(); context.source.assertCurrent()
     if (sourceHash(context.floorFile) !== context.floorHash) throw executionHttpError('execution-stale', 'selection')
@@ -171,6 +192,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       assertCurrent(context)
       if (request.target.profile === CODEX_IN_CLAUDE_PROFILE) runtime.cachedCapability()
       else if (request.target.profile === 'codex-native-v1' && native) native.capability()
+      else if (request.target.profile === NATIVE_CLAUDE_PROFILE && nativeClaude && nativeClaudeSourceAllowed(request.expected)) nativeClaude.capability()
       else throw executionHttpError('execution-capability-required', 'selection')
     },
     persist(file, text) {
@@ -190,6 +212,13 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       if (source !== CODEX_IN_CLAUDE_PROFILE && source !== 'codex-native-v1') throw executionHttpError('execution-capability-required', 'capability')
       const target = native.capability(), now = Date.now()
       return { targetPcId: o.self().id, execution, linkGeneration: `native_${runtimeEpoch}_${target.host.generation}_${target.binHash}`,
+        observedAtMs: now, validUntilMs: now + 30_000, nativeVerified: true }
+    }
+    // Order occ4c: native Claude, only for a managed conversation (nativeClaudeSourceAllowed); a plain Claude chat keeps its legacy open.
+    if (execution.profile === NATIVE_CLAUDE_PROFILE && nativeClaude) {
+      if (!nativeClaudeSourceAllowed(o.state(scope).binding)) throw executionHttpError('execution-capability-required', 'capability')
+      const target = nativeClaude.capability(), now = Date.now()
+      return { targetPcId: o.self().id, execution, linkGeneration: `nclaude_${runtimeEpoch}_${target.host.generation}_${target.binHash}`,
         observedAtMs: now, validUntilMs: now + 30_000, nativeVerified: true }
     }
     if (execution.profile !== CODEX_IN_CLAUDE_PROFILE) throw executionHttpError('execution-capability-required', 'capability')
@@ -259,10 +288,15 @@ export function createExecutionService(o: ExecutionServiceOptions) {
           } finally { committing.delete(key(scope)) }
         },
         start: (request: ExecutionStartRequest) => {
+          if (request.kind === 'native' && request.binding.execution.profile === NATIVE_CLAUDE_PROFILE) {
+            if (!nativeClaude) throw executionHttpError('execution-capability-required', 'open', request.openIntentId)
+            return nativeClaude.start(request)
+          }
           if (request.kind === 'native' && native) return native.start(request)
           return runtime.start(request)
         },
         observeRun: async (scope, intent) => {
+          if (intent.binding.execution.profile === NATIVE_CLAUDE_PROFILE) return nativeClaude ? nativeClaude.observe(intent) : { state: 'unknown' }
           if (intent.binding.execution.profile === 'codex-native-v1' && native) return native.observe(intent)
           if (!intent.lease) return { state: 'unknown' }
           const observed = await runtime.observe(intent.lease.request,{lease:intent.lease,fence:()=>{
@@ -294,7 +328,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       if (!initialization) throw executionHttpError('execution-capability-required', 'status', id)
       await initialization; return coordinator!.status(scope, id)
     },
-    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean, profile: 'codex-in-claude-v1' | 'codex-native-v1' = CODEX_IN_CLAUDE_PROFILE, restoreHistory = false): Promise<ExecutionOpenReply> {
+    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean, profile: ExecutionToolProfile = CODEX_IN_CLAUDE_PROFILE, restoreHistory = false): Promise<ExecutionOpenReply> {
       actor(scope)
       if (!executionIntentId(operationId)) throw executionHttpError('execution-invalid', 'open')
       await ensure()
