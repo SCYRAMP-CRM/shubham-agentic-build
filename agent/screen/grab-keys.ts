@@ -62,8 +62,9 @@ export interface Decision {
 }
 
 /**
- * The grab's state for one turn of the hook (from grab to letting go). `injected: 'only'` is for
- * tests: it takes what they inject and leaves real typing alone.
+ * The grab's state for one turn of the hook (from grab to letting go). `injected: 'only'` takes only
+ * injected keys and leaves real typing alone. Since order o5826 no product path or real hook uses it
+ * (the real-keys test that did is gone); only the decisions unit test grab-keys-decisions.test.ts does.
  */
 export function createGrabState(codes: ReadonlyMap<number, string>, o: { injected?: 'skip' | 'only' } = {}) {
   const taken = new Set<string>()

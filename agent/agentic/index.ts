@@ -84,7 +84,7 @@ import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge, type UiWho } from './ui-bridge.ts'
 import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
-import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress } from './orders.ts'
+import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, untappedMark, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress, type Untapped } from './orders.ts'
 import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
 import { BUSY_WORDS, createLatchFiles, createLineQueue, createLockRecord, createSpokenLatch, HELD_WORDS, holdsChat, LINE_POLL_MS, latchVerdict, lockHook, noLockWords, REFUSED_WORDS } from './talk-latch.ts'
 import { createResidualHolds, type Seen } from './talk-residual.ts'
@@ -97,6 +97,10 @@ import { createChatLog, describeEvents } from './chat-log.ts'
 import { createVoice, type AskView } from './voice.ts'
 import { spawn, spawnSync } from 'node:child_process'
 import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
+import { createQuickHistory, quickHistoryFile, quickSessionId } from './quick-history.ts'
+import { assistantsForPerson, keepsAssistantHistory, readAssistantHistory, requireSavedAssistant } from './assistant-history.ts'
+import { createAssistantNativeHistory, type AssistantNativeBinding } from './assistant-native-history.ts'
+import { QUICK_HISTORY_NOTICE, type AssistantHistoryIndex, type AssistantHistorySource } from '../../shared/assistant-history.ts'
 import { namesChoice, namesFor, type NamesChoice } from '../../shared/fast-names.ts'
 import { fastHello, ID_RE, MAX_TEXT } from '../../shared/fast.ts'
 import { buildBrief, buildSnapshot, type SnapshotInput } from './fast-brief.ts'
@@ -130,7 +134,7 @@ import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from '.
 import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
 import { appCommand, STAFF_OWNER_RE, STAFF_POLICY, STAFF_TOOLS, STAFF_TOOLS_STAMP, staffBrief, staffMcpConfig, staffSettings, staffToolAllowed, staffUsageEnv } from './staff-policy.ts'
 import { staffMayScreen } from '../../shared/staff-screen.ts'
-import { createFenceStore } from './staff-fence.ts'
+import { createFenceStore, type FenceReason } from './staff-fence.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
 import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexEffort, type CodexStatus } from '../../shared/codex.ts'
 import type { CodexManager } from '../codex/index.ts'
@@ -154,6 +158,8 @@ import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
+import { createQuickForwarding } from './quick-forwarding.ts'
+import { quickUntappedSender } from '../../shared/quick-forwarding.ts'
 import { createToolsSeen, needsRefresh, toolsVersion } from './tools-seen.ts'
 import { TOOLS } from './tools.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
@@ -568,9 +574,8 @@ export interface Agentic {
   /** F-075: chats in the middle of something (running or asking) on this PC. */
   busyChats(): number
   /**
-   * Order o7e6d S1 (Lead's GO for the Update guard): what holds an Update of this PC now, in words; empty: nothing. Read only. The staff fence
-   * record's own problems (bad, a write that may not have landed, a fence held only in memory): an Update would end and reopen chats with
-   * nothing sound on disk to say which runs are fenced. Only a person clears them (GET /staff/preflight names them).
+   * o25c1 C0: only a LIVE, known unsafe staff/policy run whose evidence is not sound can hold this PC's Update. Unclassified history and a
+   * bad store alone hold staff activation, never an unrelated ordinary Update. Read only; no clearing or recovery action.
    */
   updateBlockers(): string[]
   /**
@@ -664,11 +669,10 @@ interface Replica {
 }
 
 /**
- * Order o7e6d: why a run (or the fence record) is not safe: an activation blocker (staffPreflight). 'no-policy': a staff Assistant's run without
- * the staff policy (bound to one now, or started for one); 'unknown-policy'; 'origin-unknown': where it came from is not proven ordinary (S1
- * lineage); 'fenced': on record from an earlier finding; 'fence-closed': fenced because the fence record can't be trusted (F1); 'other-pc'.
+ * o25c1 C0: staff activation findings only. A generic old record is unclassified, NOT a verdict on that run. Unknown origins and ordinary
+ * non-admin chats are no longer listed as unsafe just because they are not proven administrators'.
  */
-export type StaffUnsafe = 'no-policy' | 'unknown-policy' | 'origin-unknown' | 'fenced' | 'fence-closed' | 'other-pc' | 'fence-store-bad' | 'fence-store-dirty' | 'fence-not-durable'
+export type StaffUnsafe = 'no-policy' | 'unknown-policy' | 'other-pc' | 'fence-store-bad' | 'fence-store-dirty' | 'fence-not-durable' | 'fence-unclassified'
 
 /**
  * Order o7e6d S1 (Agent 3's M3): the Server's own class of one of its agents, judged with the Server's sign-in: 'staff' (a person's own
@@ -695,8 +699,8 @@ const classesFingerprint = (rows: [string, string, StaffClass][] | null) => (row
 
 /** Order o7e6d S1: the staff fence record's problems as the Update guard words them (Agentic.updateBlockers). */
 const STAFF_FENCE_WORDS: Record<string, string> = {
-  'fence-store-bad': "the staff fence record can't be read (agent/agentic/staff/fenced.json); a person has to look at it",
-  'fence-store-dirty': 'a write of the staff fence record may not have landed (agent/agentic/staff/fenced.poison is there); a person has to look at it',
+  'fence-store-bad': "the staff fence evidence can't be read (agent/agentic/staff); a person has to look at it",
+  'fence-store-dirty': 'a write of the staff fence evidence may not have landed (a poison marker is there); a person has to look at it',
   'fence-not-durable': 'a staff fence could not be written to disk (it is held in memory only)',
 }
 
@@ -1035,10 +1039,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     log: o.log,
   })
   void convUploads.start().catch(e => o.log?.warn(`conversations: the waiting folder could not be read (${e instanceof Error ? e.message : String(e)})`))
+  const quickHistory = createQuickHistory(o.dir, SBSKRRT_OWNER.id)
+  const assistantNativeHistory = createAssistantNativeHistory(o.dir)
   const conversations = createConversations({
     dir: path.join(o.dir, 'conversations'),
     sessions: () => conversationSessions(),
-    fileOf: sid => findClaudeTranscript(sid, projectsDir),
+    fileOf: sid => historyFile(sid),
     drive: {
       children: id => crmFiles.service.children(id),
       folder: (parent, name) => crmFiles.service.folder(parent, name),
@@ -1119,8 +1125,6 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * when that stream closes or errs, the subscription is dropped, the link changes or this PC stops being a member, and by a frame it can't use.
    */
   let fresh: { stream: Duplex; token: object; hubId: string; gen: number; classes: Map<string, StaffClass> | null } | null = null
-  /** The Server's classes from the last frame taken (fresh or not): only ever a hint that ADDS a fence (M3), never one that lifts it. */
-  let lastClasses: Map<string, StaffClass> | null = null
   /** The current subscription's stream, over the link this PC is joined by now (M2): only its frames change anything here. */
   function currentStream(link: LinkPeer, stream: Duplex): boolean {
     if (mode() !== 'member' || !sub || sub.stream !== stream || sub.token !== link.token) return false
@@ -1797,9 +1801,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * Lead (15 Nov): a running chat once found unsafe stays fenced for as long as THAT run lasts (by its start time), whatever its floor says
    * later: its agent deleted, moved, its session bound elsewhere or its duty changed. A new run (after a stop) is judged afresh.
    */
-  const staffFenced = new Map<string, string>()
-  /** The runs taken over from the chat host by this agent (session → that run's start time): the ones a failed-closed fence store fences. */
-  const adoptedRuns = new Map<string, string>()
+  const staffFenced = new Map<string, { startedAt: string; why: FenceReason }>()
   /** Agent 3's M5: a floor of a store this PC holds itself: on the hub every floor (its own and its PC Control); on a member its own floors and its own PC Control store. */
   const isOwnStore = (f: Floor) => mode() !== 'member' || isLocalFloor(f.id) || controlFloors.store.get(f.id) !== null
   /** The run's own floor (its exact origin) is in a store this PC holds: judged here, so it never waits for a fresh copy of the Server's floors. */
@@ -1817,113 +1819,67 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /**
    * Order o7e6d S1: one agent's class for the lineage. Of a store this PC holds (M5): judged here with this PC's sign-in, definite. Of a member's
    * copy of the Server's floors (M3): the Server's own class from the current fresh frame, else none (null), because a member's sign-in can't
-   * say who is the Server's administrator (with sign-in off it calls everyone one). `staffHint`: a staff Assistant by ANY source (the class, the
-   * class of the last frame, this PC's own reading of the copy): it may only add a fence, never lift one.
+   * say who is the Server's administrator (with sign-in off it calls everyone one). C0 does not turn stale/local readings of a replica into
+   * staff provenance. Only a definite staff class may create a new runtime fence; once recorded, that exact run's reason survives disconnection.
    */
-  function classOf(floor: Floor, agent: FloorAgent): { cls: StaffClass | null; staffHint: boolean } {
+  function classOf(floor: Floor, agent: FloorAgent): StaffClass | null {
     if (isOwnStore(floor)) {
-      const cls: StaffClass = isStaffAssistant(agent) ? 'staff' : access.isAdmin(access.asChat(agent)) ? 'admin' : 'other'
-      return { cls, staffHint: cls === 'staff' }
+      return isStaffAssistant(agent) ? 'staff' : access.isAdmin(access.asChat(agent)) ? 'admin' : 'other'
     }
     const key = classKey(floor.id, agent.id)
-    const cls = replicaIsFresh() ? fresh?.classes?.get(key) ?? null : null
-    return { cls, staffHint: cls === 'staff' || lastClasses?.get(key) === 'staff' || isStaffAssistant(agent) }
+    return replicaIsFresh() ? fresh?.classes?.get(key) ?? null : null
   }
   /**
-   * Order o7e6d S1 lineage (Lead's bounded GO with Agent 3's B1, B2 and M3-M5): where a run came from, by the agent it was started for
-   * (ChatInfo.floorId and agentId: set at its start, kept by the chat host, never changed by a floor edit). Agent ids are a page's to choose and
-   * are unique only within one floor, so every agent anywhere with that id is looked at, and ANY staff Assistant among them makes it 'staff'.
-   * It is 'ordinary' only for its exact pair (that floor, that agent), or with no exact pair for the one agent anywhere with that id (an agent
-   * moved to another floor), and only when that agent is an administrator's. None found, several, someone else's, or a copy of the Server's
-   * floors with no class from the Server now: 'unknown'. `settled` (M4): decided from definite facts only, about an agent that was FOUND (a
-   * store this PC holds, or the Server's class from a fresh frame): a definite staff Assistant, or a found agent that is someone else's. An
-   * origin not found or ambiguous is never settled, on any PC. Anything not settled is never recorded. Throws when a lookup fails.
+   * o25c1 C0: only definite STAFF provenance restricts a no-policy run. Its current binding or its EXACT immutable spawn pair can supply it.
+   * A same-id agent on another floor is not proof (ids are page controlled). Missing/ambiguous origins, a non-admin ordinary agent, a stale
+   * replica or a lookup failure supply NO new runtime restriction and NO durable reason. Access/B2 still decide what the caller may do.
    */
-  function lineageOf(run: ChatInfo): { origin: 'staff' | 'ordinary' | 'unknown'; settled: boolean } {
-    const seen: { floor: Floor; cls: StaffClass | null; staffHint: boolean }[] = []
-    for (const floor of lineageFloors()) for (const agent of floor.agents) if (agent.id === run.agentId) seen.push({ floor, ...classOf(floor, agent) })
-    const exact = seen.filter(s => s.floor.id === run.floorId)
-    // B2: any staff Assistant with that id, wherever. Settled only when a definite class says so; a hint from anything else fences this check only.
-    const definiteStaff = seen.some(s => s.cls === 'staff')
-    if (definiteStaff || seen.some(s => s.staffHint)) return { origin: 'staff', settled: definiteStaff }
-    // H1: its own floor not found while what this PC's stores knew at their load is degraded: no other agent with its id stands in for it.
-    const degraded = exact.length === 0 && originKnowledgeDegraded(run)
-    const pick = exact.length === 1 ? exact[0] : exact.length === 0 && seen.length === 1 && !degraded ? seen[0] : null
-    // None found, or several (Agent 3's source trace, Lead): unknown, and NEVER recorded, on any PC, whatever state the stores are in now. The
-    // lineage is immutable and re-derived at every check, so a record adds no safety here; it would only outlive a store that was missing or
-    // replaced for a while (an auto-recreated PC Control store, a floors file made new): with its original back, the run is ordinary again.
-    if (!pick) return { origin: 'unknown', settled: false }
-    // The Server's floors without the Server's class now (not fresh, an older Server, a malformed list): unknown for this check only (M3).
-    if (pick.cls === null) return { origin: 'unknown', settled: false }
-    return { origin: pick.cls === 'admin' ? 'ordinary' : 'unknown', settled: true }
-  }
-  /**
-   * Order o7e6d S1 (Agent 3's H1): could this PC's own stores have lost the run's floor at their load (FloorStore.loadStatus, read only)? On
-   * any PC: the run's floor quarantined at load, or its session one of a quarantined floor's (main store or PC Control), or a corrupt file set
-   * aside or a shape not read in either store. On the hub also its floors file missing. (A member's own floors file is often missing: no floors
-   * made there; and a PC Control file is missing wherever PC Control was never set up: neither alone counts.) A found origin is judged as found
-   * whatever another floor's state; only a run whose own floor is not found is affected: no other agent with its id stands in for it (an origin
-   * not found is never recorded anyway, degraded or not).
-   */
-  function originKnowledgeDegraded(run: ChatInfo): boolean {
-    const main = pickFloors().loadStatus(), control = controlFloors.store.loadStatus()
-    for (const st of [main, control]) {
-      if (st.quarantinedFloors.includes(run.floorId) || st.quarantinedSessions.includes(run.sessionId)) return true
-      if (st.corrupt || st.unsupported) return true
+  function knownStaffOrigin(run: ChatInfo): boolean {
+    try {
+      const at = bySession(run.sessionId)
+      if (at && classOf(at.floor, at.agent) === 'staff') return true
+      const exact = lineageFloors().filter(f => f.id === run.floorId).flatMap(f => f.agents.filter(a => a.id === run.agentId).map(a => ({ f, a })))
+      return exact.length === 1 && classOf(exact[0].f, exact[0].a) === 'staff'
+    } catch (e) {
+      const now = Date.now()
+      if (now - (lineageWarned.get(run.sessionId) ?? 0) >= 60_000) {
+        lineageWarned.set(run.sessionId, now)
+        log?.warn(`staff provenance: chat ${run.sessionId.slice(0, 8)} could not be classified now (${message(e)}); no new runtime fence or evidence is inferred`)
+      }
+      return false
     }
-    return mode() !== 'member' && main.missing
   }
-  /** S-a: when a lineage lookup last failed for a session (its warning is written at most once a minute). */
   const lineageWarned = new Map<string, number>()
   /**
-   * Order o7e6d S1 (Lead's GO, Agent 3's B3): the ONE check every way into a run of this PC asks: its keys, words and drafts (the pool below),
-   * its tools and recall (callTool, staffGate, /mcp/tools, /mcp/recall), its files (refuseStaffFiles), a lease or take-over (isStaffSid), an
-   * open, a restart and the preflight. Fenced: a run on record (this agent's memory, or fenced.json: that exact run); with a record that can't
-   * be trusted (F1) every run taken over without the staff policy; a run of a policy this build does not know; a run without the staff policy
-   * whose session is bound now to a staff Assistant, or whose lineage is not proven ordinary (lineageOf). A run under the staff policy is not
-   * fenced: the policy holds it. A settled finding is kept for that run (memory and the record on disk), so it outlives an Update, a rebind or
-   * a deleted floor. S-a (M4): a finding that is not settled (a member PC's copy of the Server's floors not fresh, no class from the Server) and
-   * a lookup that fails fence this check only: nothing is recorded, and the next check looks again. Only a settled finding (a store this PC
-   * holds, the Server's class from a fresh frame) or an explicit unknown policy is recorded. `record` false (the preflight): nothing is recorded
-   * at all. Nothing is ever stopped here.
+   * ONE runtime check at every C0 gate. STAFF_POLICY is enforced by the pool itself. Unknown policy, known staff without the policy, or
+   * independently typed evidence for this exact incarnation fence it. Old generic records and F1 state NEVER stand in for provenance.
+   * A typed reason is sticky after rebind/delete; a failed write is retried on the next observation. record=false (preflight/quiet) is read only.
    */
   function runFenced(sid: string, record = true): boolean {
     const run = nativeChats.info(sid)
     if (!run) { staffFenced.delete(sid); return false }
-    if (staffFenced.get(sid) === run.startedAt || staffFence.has(sid, run.startedAt)) return true
     if (run.policy === STAFF_POLICY) return false
-    // F1: a fence record that can't be trusted (bad, or a write that may not have landed) fences every chat taken over without the staff policy,
-    // the owner's too, until it is stopped and opened again (not recorded: it follows the record's state).
-    if (staffFence.failClosed() && adoptedRuns.get(sid) === run.startedAt) return true
-    let fence = true, settled = true
-    try {
-      if (run.policy === undefined) {
-        // Its session bound now to a staff Assistant (by any source: only ever adds the fence; recorded only on a definite class), else its lineage.
-        const at = bySession(sid)
-        const bound = at ? classOf(at.floor, at.agent) : null
-        if (bound && (bound.cls === 'staff' || bound.staffHint)) settled = bound.cls === 'staff'
-        else {
-          const lineage = lineageOf(run)
-          fence = lineage.origin !== 'ordinary'
-          settled = lineage.settled
-        }
-      }
-    } catch (e) {
-      const now = Date.now()
-      if (now - (lineageWarned.get(sid) ?? 0) >= 60_000) {
-        lineageWarned.set(sid, now)
-        log?.warn(`staff policy: where chat ${sid.slice(0, 8)} came from could not be read now (${message(e)}); it is fenced for this check only, nothing is recorded`)
-      }
-      return true
+    const saved = staffFenced.get(sid)
+    const remembered = saved && saved.startedAt === run.startedAt ? saved.why : staffFence.reason(sid, run.startedAt)
+    let why: FenceReason | null = run.policy !== undefined ? 'unknown-policy' : remembered
+    if (!why && knownStaffOrigin(run)) why = 'staff'
+    if (!why) return false
+    if (record) {
+      staffFenced.set(sid, { startedAt: run.startedAt, why })
+      staffFence.add(sid, run.startedAt, why)
     }
-    if (fence && settled && record) {
-      staffFenced.set(sid, run.startedAt)
-      staffFence.add(sid, run.startedAt)
-    }
-    return fence
+    return true
   }
-  /** A staff Assistant's session (its binding now), or a run of it here that is fenced: a lease, a take-over and the MCP routes ask this. */
-  const isStaffSid = (sid: string) => { const at = bySession(sid); return (!!at && isStaffAssistant(at.agent)) || runFenced(sid) }
+  /** A live unsafe staff run with unsound evidence is related to this Update. An ordinary-only PC (even with corrupt/unclassified history) is not. */
+  function staffUpdateBlockers(): string[] {
+    if (!nativeChats.live().some(run => run.policy !== STAFF_POLICY && runFenced(run.sessionId, false))) return []
+    return staffFence.problems().filter(p => p !== 'fence-unclassified').map(p => STAFF_FENCE_WORDS[p] ?? `the staff fence evidence has a problem (${p})`)
+  }
+  /** Current definite staff binding, policy, or typed runtime evidence, never an old generic record. */
+  const isStaffSid = (sid: string) => {
+    if (nativeChats.info(sid)?.policy !== undefined || runFenced(sid)) return true
+    try { const at = bySession(sid); return !!at && classOf(at.floor, at.agent) === 'staff' } catch { return false }
+  }
   const chats: ChatPool = { ...nativeChats,
     beforeAdopt: async info => {
       const at = bySession(info.sessionId)
@@ -1960,13 +1916,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         } else assertLegacySid(info.sessionId)
       } catch (error) { blockedLegacyAdoption = true; throw error }
       const result = nativeChats.adopt(info, pty, replay)
-      adoptedRuns.set(info.sessionId, result.startedAt)
       if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery')
-      // Order o7e6d (P1, Lead 15 Nov; S1 lineage): a chat the host kept that is fenced (a staff Assistant's run without the staff policy, a policy
-      // this build does not know, a run whose lineage is not proven ordinary) is QUARANTINED, never ended because a host was taken over: it takes
+      // o25c1 C0: a KNOWN staff run without its policy, or a policy this build does not know, is quarantined, never ended by adoption. It takes
       // no input and no tool (runFenced), and stays as it is until an explicit stop; the next open starts it afresh.
       else if (runFenced(info.sessionId)) {
-        log?.warn(`staff policy: chat ${info.sessionId.slice(0, 8)} was taken over without the staff policy; it is quarantined (no input, no tools) until it is stopped (a staff Assistant's run, an unknown policy, or where it came from is not proven ordinary)`)
+        log?.warn(`staff policy: chat ${info.sessionId.slice(0, 8)} was taken over without the staff policy; it is quarantined (known unsafe staff/policy provenance, no input or tools), not stopped`)
       }
       return result
     },
@@ -2294,6 +2248,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * Claude only (no Codex, OpenCode, Codex in Claude Code or other managed execution), at home here, for a person whose id fits. Else refused.
    */
   function assertStaffStart(floor: Floor, agent: FloorAgent) {
+    if (staffFence.activationBlocked() && (!agent.sessionId || nativeChats.info(agent.sessionId)?.policy !== STAFF_POLICY)) {
+      throw staffError('Staff activation is held: the staff provenance evidence needs review (GET /staff/preflight). Nothing was started.')
+    }
     if (mode() === 'member') throw staffError("A person's own Assistant runs on the Server only.")
     if (isPcControl(floor)) throw staffError("A person's own Assistant is not a PC-control chat.")
     if (executionIdentityOf(agent, defaultsNow()).profile !== 'claude-native-v1') throw staffError("A person's own Assistant runs only as native Claude (not Codex, OpenCode or Codex in Claude Code).")
@@ -2369,49 +2326,38 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const staffOpening = new Map<string, Promise<ChatOpened>>()
 
   /**
-   * H2 (Agent 3's review): the staff Assistants' runs that are not safe, wherever they run: here without the staff policy (quarantined), here
-   * with a policy this build does not know, or on another PC (nothing there is checked). Read only: nothing is stopped or changed. Before staff
-   * access is switched on this must be empty (an activation preflight blocker); each one goes by an explicit, approved stop.
+   * C0 staff ACTIVATION preflight. Store trouble/unclassified history is visible without turning it into an ordinary runtime fence. No clear,
+   * certify or recovery endpoint is added. Remote ordinary/unknown runs are not classified as unsafe merely for lacking an admin proof.
    */
   function staffPreflight(): { sessionId: string; floor: string; agent: string; pc: string; why: StaffUnsafe }[] {
     const out: ReturnType<typeof staffPreflight> = []
-    // S1: the fence record itself (bad, dirty, or a fence held only in memory): a row each, an activation blocker like any unsafe run.
-    for (const why of staffFence.problems()) out.push({ sessionId: '', floor: '', agent: '', pc: self().name, why: why as StaffUnsafe })
-    for (const [sid, w] of Object.entries(whereAll())) {
+    for (const why of staffFence.problems()) if (why !== 'fence-unclassified') out.push({ sessionId: '', floor: '', agent: '', pc: self().name, why })
+    const where = whereAll()
+    for (const entry of staffFence.entries()) {
+      if (entry.why) continue
       let at: { floor: Floor; agent: FloorAgent } | null = null
-      try { at = bySession(sid) } catch { at = null }
+      try { at = bySession(entry.sessionId) } catch { /* the evidence stays visible */ }
+      out.push({ sessionId: entry.sessionId, floor: at?.floor.name ?? '', agent: at?.agent.name ?? '', pc: where[entry.sessionId]?.name ?? self().name, why: 'fence-unclassified' })
+    }
+    for (const [sid, w] of Object.entries(where)) {
+      let at: { floor: Floor; agent: FloorAgent } | null = null
+      try { at = bySession(sid) } catch { /* not proof of staff */ }
       const row = { sessionId: sid, floor: at?.floor.name ?? '', agent: at?.agent.name ?? '', pc: w.name }
       if (w.id !== self().id) {
-        // Another PC's run: nothing there is checked from here. H2 (Agent 3): it is listed unless the agent its session is bound to here has a
-        // DEFINITE administrator class (a store this PC holds, or the Server's class from a fresh frame) and no staff hint from any source;
-        // unbound, someone else's, no class, or a lookup that fails: listed.
-        let safe = false
-        try {
-          const c = at ? classOf(at.floor, at.agent) : null
-          safe = !!c && c.cls === 'admin' && !c.staffHint
-        } catch { /* listed */ }
-        if (!safe) out.push({ ...row, why: 'other-pc' })
+        let staff = false
+        try { staff = !!at && classOf(at.floor, at.agent) === 'staff' } catch { /* no new restriction from a failed lookup */ }
+        if (staff) out.push({ ...row, why: 'other-pc' })
         continue
       }
-      // This PC's own runs: every fenced one (S1, B3: the same check as every way in), read only (nothing is recorded by the preflight).
-      const run = chats.info(sid)
-      if (run && runFenced(sid, false)) out.push({ ...row, why: fencedWhy(sid, run, at) })
+      const run = nativeChats.info(sid)
+      if (run && runFenced(sid, false)) {
+        const saved = staffFenced.get(sid)
+        const why = run.policy !== undefined && run.policy !== STAFF_POLICY ? 'unknown-policy'
+          : (saved && saved.startedAt === run.startedAt ? saved.why : staffFence.reason(sid, run.startedAt))
+        out.push({ ...row, why: why === 'unknown-policy' ? 'unknown-policy' : 'no-policy' })
+      }
     }
     return out
-  }
-
-  /** Why a run of this PC is fenced, for the preflight (read only; a reason that can't be read now is 'origin-unknown'). */
-  function fencedWhy(sid: string, run: ChatInfo, at: { floor: Floor; agent: FloorAgent } | null): StaffUnsafe {
-    if (run.policy !== undefined && run.policy !== STAFF_POLICY) return 'unknown-policy'
-    try {
-      if (at && classOf(at.floor, at.agent).staffHint) return 'no-policy'
-      const lineage = lineageOf(run)
-      if (lineage.origin === 'staff') return 'no-policy'
-      if (lineage.origin === 'unknown') return 'origin-unknown'
-      return staffFence.failClosed() && adoptedRuns.get(sid) === run.startedAt ? 'fence-closed' : 'fenced'
-    } catch {
-      return 'origin-unknown'
-    }
   }
 
   /** The person's own empty room, its working folder: the same at every start and resume, never the floor's folder, a repo or the owner's. */
@@ -2572,14 +2518,128 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (isPcControl(f)) continue
       for (const a of f.agents) {
         const sid = a.sessionId
-        if (!sid || engineFor(a) !== 'claude') continue
-        const base = { owner: a.owner?.username || SBSKRRT_OWNER.username, pc: where[sid]?.name ?? last[sid]?.pc ?? me.name, floor: f.name, agent: a.name, running: !!where[sid] }
-        out.push({ sessionId: sid, ...base })
-        const next = chats.claudeSession?.(sid)
-        if (next && next !== sid) out.push({ sessionId: next, ...base })
+        if (!sid && !keepsAssistantHistory(a)) continue
+        const base = { owner: a.owner?.username || SBSKRRT_OWNER.username, pc: (sid ? where[sid]?.name ?? last[sid]?.pc : null) ?? me.name, floor: f.name, agent: a.name, running: !!sid && !!where[sid] }
+        if (sid && (engineFor(a) === 'claude' || keepsAssistantHistory(a))) out.push({ sessionId: sid, ...base })
+        if (keepsAssistantHistory(a)) for (const h of a.conversationHistory ?? []) {
+          if (!out.some(s => s.sessionId === h.sessionId)) out.push({ ...base, sessionId: h.sessionId, running: h.sessionId === sid && base.running, pc: h.homePcName || base.pc })
+        }
+        if (a.owner?.id === SBSKRRT_OWNER.id && a.duty === 'orchestrator') {
+          const roots = new Set((a.conversationHistory ?? []).filter(h => h.engine === 'claude' && !h.executionProfile).map(h => h.sessionId))
+          if (sid && engineFor(a) === 'claude' && !a.executionProfile) roots.add(sid)
+          for (const appSid of roots) {
+            const binding = ownerAssistantBinding(f, a, appSid)
+            if (binding) for (const r of assistantNativeHistory.forBinding(binding)) {
+              if (!out.some(s => s.sessionId === r.nativeSessionId)) out.push({ ...base, sessionId: r.nativeSessionId, running: sid === appSid && chats.claudeSession?.(appSid) === r.nativeSessionId })
+            }
+          }
+        }
+        if (sid && engineFor(a) === 'claude') {
+          const next = chats.claudeSession?.(sid)
+          if (next && next !== sid) out.push({ sessionId: next, ...base })
+        }
       }
     }
+    if (existsSync(quickHistory.file)) out.push({ sessionId: quickHistory.sessionId, owner: SBSKRRT_OWNER.username, pc: me.name, floor: 'Assistant', agent: 'Quick', running: !!fastHost?.status().pid })
     return out
+  }
+
+  /** Every saved Assistant binding, not only the newest engine. Nothing is copied into a live native transcript. */
+  function historyFile(sid: string): string | null {
+    if (sid === quickSessionId(SBSKRRT_OWNER.id)) return existsSync(quickHistory.file) ? quickHistory.file : null
+    for (const f of floors.list()) for (const a of f.agents) if (keepsAssistantHistory(a)) {
+      const h = a.conversationHistory?.find(r => r.sessionId === sid)
+      const engine = a.sessionId === sid ? engineFor(a) : h?.engine
+      const thread = a.sessionId === sid ? a.codexThread : h?.codexThread
+      if (engine === 'codex') return thread && o.codex ? findRollout(o.codex.paths.home, thread) : null
+      if (engine === 'opencode') return openCode.file(sid)
+    }
+    return findClaudeTranscript(sid, projectsDir)
+  }
+
+  /** Scope only; callers still require the existing native runtime/engine/staff fences. No profile or staff launch is changed here. */
+  function ownerAssistantBinding(floor: Floor, a: FloorAgent, sid: string): AssistantNativeBinding | null {
+    return a.duty === 'orchestrator' && a.owner?.id === SBSKRRT_OWNER.id
+      ? { ownerId: a.owner.id, floorId: floor.id, agentId: a.id, appSessionId: sid } : null
+  }
+  /**
+   * oc65c: an Assistant session KNOWN to have had a conversation: its own hook reported a prompt in it, or the CRM drive copy (F-211) holds its
+   * bytes. Only then is a missing or empty JSONL a loss, and the open is refused instead of starting it empty. An Assistant opened but never
+   * used has no file yet and starts as before.
+   */
+  function assistantHadConversation(a: FloorAgent, sid: string): boolean {
+    if (!keepsAssistantHistory(a)) return false
+    try {
+      if (a.owner?.id && assistantNativeHistory.hadPrompt(a.owner.id, sid)) return true
+    } catch { /* An owner id the history store does not take: no receipt evidence. */ }
+    return (conversations.status().sessions.find(s => s.sessionId === sid)?.inDrive ?? 0) > 0
+  }
+  /** A native session that is another agent's (bound now or kept in its history) or that another live chat is writing to now. */
+  function nativeClaimedElsewhere(native: string, agentId: string, runningSid?: string): boolean {
+    const is = (s: string | null | undefined) => !!s && s.toLowerCase() === native.toLowerCase()
+    return floors.list().some(f => f.agents.some(a => a.id !== agentId && (is(a.sessionId) || is(a.codexThread) || is(a.opencodeSession)
+      || !!a.conversationHistory?.some(h => is(h.sessionId) || is(h.codexThread) || is(h.opencodeSession)))))
+      || chats.live().some(c => c.sessionId !== runningSid && (is(c.sessionId) || is(chats.claudeSession?.(c.sessionId))))
+  }
+  /**
+   * oc65c: the newer native session a stopped owner Assistant went on in (/clear, /resume), when it is safe to continue there; else null and
+   * its own binding resumes as before. Never one with no saved words, one that is another agent's, or one another live chat is writing to.
+   */
+  function nativeSuccessorFor(floor: Floor, a: FloorAgent, sid: string): string | null {
+    if (engineFor(a) !== 'claude' || a.executionProfile) return null
+    const binding = ownerAssistantBinding(floor, a, sid)
+    const next = binding ? assistantNativeHistory.successor(binding) : null
+    if (!next) return null
+    const file = findClaudeTranscript(next, projectsDir)
+    let size = 0
+    try { size = file ? statSync(file).size : 0 } catch { /* Not here: nothing to continue. */ }
+    if (!size) {
+      log?.warn(`assistant history: ${a.name}'s newer native session ${next.slice(0, 8)} has no saved conversation here; its own one resumes`)
+      return null
+    }
+    if (nativeClaimedElsewhere(next, a.id)) {
+      log?.warn(`assistant history: ${a.name}'s newer native session ${next.slice(0, 8)} is another chat's now; its own one resumes`)
+      return null
+    }
+    return next
+  }
+
+  function assistantHistory(c: Caller): AssistantHistoryIndex {
+    if (!c.person && !access.isAdmin(c)) throw authError(401, 'Sign in to read your Assistant history.', 'sign-in')
+    const person = access.ownerOf(c)
+    const sources: AssistantHistorySource[] = []
+    const warnings: string[] = []
+    const native = assistantNativeHistory.snapshot(person.id)
+    if (native.problem) warnings.push(native.problem)
+    const add = (id: string, engine: AssistantHistorySource['engine'], channel: AssistantHistorySource['channel'], recordedAt: string | null, current: boolean) => {
+      const key = `${engine}:${id}`
+      const old = sources.find(s => s.id === key)
+      if (old) { old.current ||= current; return }
+      const file = engine === 'quick' ? quickHistoryFile(o.dir, person.id) : historyFile(id)
+      let bytes: number | null = null
+      try { if (file) bytes = statSync(file).size } catch { /* Explicitly unavailable, never silently empty. */ }
+      sources.push({ id: key, engine, channel, recordedAt, current, available: bytes !== null, bytes, file })
+    }
+    for (const { floor, agent: a } of assistantsForPerson(floors.list(), person.id)) {
+      // The conversation it is in now: a live /clear or /resume successor, else the newest one its receipts name, else its binding.
+      const live = a.sessionId && engineFor(a) === 'claude' ? chats.claudeSession?.(a.sessionId) ?? null : null
+      const ownBinding = a.sessionId ? ownerAssistantBinding(floor, a, a.sessionId) : null
+      const later = live && live !== a.sessionId ? live : ownBinding && engineFor(a) === 'claude' && !a.executionProfile ? assistantNativeHistory.successor(ownBinding) : null
+      for (const h of a.conversationHistory ?? []) add(h.sessionId, h.engine, 'assistant', h.recordedAt, !later && h.sessionId === a.sessionId && h.engine === engineFor(a))
+      if (a.sessionId) add(a.sessionId, engineFor(a), 'assistant', null, !later)
+      const roots = new Set((a.conversationHistory ?? []).filter(h => h.engine === 'claude' && !h.executionProfile).map(h => h.sessionId))
+      if (a.sessionId && engineFor(a) === 'claude' && !a.executionProfile) roots.add(a.sessionId)
+      for (const appSid of roots) {
+        const binding = ownerAssistantBinding(floor, a, appSid)
+        if (!binding) continue
+        for (const r of native.receipts.filter(r => r.agentId === binding.agentId && r.appSessionId.toLowerCase() === binding.appSessionId.toLowerCase())) {
+          add(r.nativeSessionId, 'claude', 'assistant', r.observedAt, !!later && r.nativeSessionId === later)
+        }
+      }
+      if (later) add(later, 'claude', 'assistant', null, true)
+    }
+    add(quickSessionId(person.id), 'quick', 'quick', null, true)
+    return { person: { id: person.id, username: person.username }, sources, quickNotice: QUICK_HISTORY_NOTICE, warnings: [...new Set(warnings)] }
   }
 
   function teamInfo(): AgenticTeam | null {
@@ -2916,7 +2976,6 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // an older Server, or a malformed list: then whatever they would decide is unknown, fenced for each check only).
       const classes = parseStaffClasses(raw.staffClasses)
       fresh = { stream, token: link.token, hubId: link.id, gen: sub!.gen, classes }
-      if (classes) lastClasses = classes
       saveReplica()
       emitFloors()
       emitWhere()
@@ -2966,6 +3025,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     const atHome = await resumeAtHome(floor, agent, sid, req)
     if (atHome) return atHome
+    // A known Assistant conversation without its transcript must not be restarted as --session-id (an empty replacement).
+    if (sid && assistantHadConversation(agent, sid)) requireSavedAssistant(historyFile(sid), true)
     // Order o7e6d (Lead's routing ask): a staff Assistant whose home is the Server was just opened there (resumeAtHome: run-on), and a never-run one
     // is passed to the Server by the page's route (forwardFirstOpen). Any other way from here would start it on this PC (its home is another PC,
     // or this open came another way), so it is refused HERE, before a session is bound or a lease taken: its home is never pinned to this PC.
@@ -3394,8 +3455,30 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (engineFor(agentOf(floorOf(floorId), agentId)) === 'claude') needClaudeHere()
     }
     let floor = floorOf(floorId)
-    const agent = agentOf(floor, agentId)
+    let agent = agentOf(floor, agentId)
     let sid = agent.sessionId
+    if (!sid && keepsAssistantHistory(agent) && agent.conversationHistory?.length) {
+      // Older builds' Close could unbind a session. Restore the last native binding, not a new UUID and not an archive pasted as a prompt.
+      const h = agent.conversationHistory.at(-1)!
+      if (h.engine !== engineFor(agent) || h.executionProfile) throw apiError(409, 'The Assistant has saved history under another execution. Use a checked history carry-over; nothing was started empty.')
+      if (isStaffAssistant(agent)) {
+        assertStaffStart(floor, agent)
+        // Agent 3's review of 7ab1767: the restored binding is judged BEFORE anything is written, as the agent will be once restored (its session and
+        // the home its saved entry names; bindSession clears any other home). A saved conversation whose home is another PC is refused here, so a
+        // refused open leaves no binding and no home behind (else that home would go on refusing every later open).
+        assertStaffStart(floor, { ...agent, sessionId: h.sessionId, homePc: h.homePc ?? null, homePcName: h.homePc ? h.homePcName || 'Home PC' : null })
+        staffRefuseOld(h.sessionId)
+      }
+      const claimed = floors.bySession(h.sessionId)
+      if (claimed && claimed.agent.id !== agent.id) throw apiError(409, 'The saved Assistant conversation is bound elsewhere. Nothing was replaced or taken over.')
+      if (assistantHadConversation(agent, h.sessionId)) requireSavedAssistant(historyFile(h.sessionId), true)
+      switchFences.assertWritable(h.sessionId)
+      floor = floors.bindSession(floor.id, agent.id, h.sessionId)
+      if (h.engine === 'codex' && h.codexThread) floor = floors.setCodexThread(floor.id, agent.id, h.codexThread)
+      if (h.engine === 'opencode' && h.opencodeSession) floor = floors.setOpenCodeSession(floor.id, agent.id, h.opencodeSession)
+      if (h.homePc) floor = floors.setHome(floor.id, agent.id, { id: h.homePc, name: h.homePcName || 'Home PC' })
+      agent = agentOf(floor, agentId); sid = agent.sessionId
+    }
     // Order o7e6d: a staff Assistant opens here, under the staff policy only; while a run of it without the policy is up here, or any run of it on
     // another PC, the open is refused (P1). (A take-over open is how a member's page reaches it at its home, the Server: run-on, here.)
     if (isStaffAssistant(agent)) {
@@ -3413,6 +3496,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const atHome = await resumeAtHome(floor, agent, sid, req)
     executionGuard?.()
     if (atHome) return atHome
+    const successor = sid ? nativeSuccessorFor(floor, agent, sid) : null
+    if (successor) {
+      // oc65c: before it stopped it went on in a newer native session (/clear, /resume): it continues THERE, not in the older file. The binding it
+      // had stays in its history (bindSession keeps it), and nothing is copied into either native transcript.
+      switchFences.assertWritable(successor)
+      log?.info(`assistant history: ${agent.name} continues in its newer native session ${successor.slice(0, 8)} (was ${sid!.slice(0, 8)})`)
+      floor = floors.bindSession(floor.id, agent.id, successor)
+      agent = agentOf(floor, agentId)
+      sid = successor
+    }
+    if (sid && assistantHadConversation(agent, sid)) requireSavedAssistant(historyFile(sid), true)
     if (!sid) {
       sid = randomUUID()
       floor = floors.bindSession(floor.id, agent.id, sid)
@@ -3444,8 +3538,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = floors.bySession(sid)
     if (at) requireLegacyExecution(at.agent, defaultsNow())
     if (!at || !chats.info(sid)) return false
-    // Order o7e6d (P1; S1, B3): a quarantined chat (runFenced: a staff Assistant's run without the staff policy, a policy this build does not
-    // know, a run whose lineage is not proven ordinary) is never stopped by an automatic restart (a subscription switch, a tool-list refresh):
+    // C0: known unsafe staff/policy runs are never stopped by an automatic restart (a subscription switch, a tool-list refresh):
     // only an explicit stop replaces it.
     if (runFenced(sid)) {
       log?.warn(`staff policy: chat ${sid.slice(0, 8)} is quarantined; it is not restarted (stop it, then open it)`)
@@ -3482,8 +3575,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       // Here: it was open on this PC when the app stopped (or needs its token again), so it comes back on this PC.
       const opened = await openChat(at.floor.id, at.agent.id, isPcControl(at.floor) ? {} : { here: true })
-      if (opened.started && text) chats.typeWhenReady(sid, text)
-      return opened.started || chats.info(sid) !== null
+      // oc65c: an Assistant that went on in a newer native session reopens THERE, so the carry-on goes to the session that was opened.
+      if (opened.started && text) chats.typeWhenReady(opened.sessionId, text)
+      return opened.started || chats.info(opened.sessionId) !== null
     } catch (e) {
       log?.warn(`couldn't reopen chat ${sid.slice(0, 8)}: ${message(e)}`)
       return false
@@ -4449,7 +4543,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!p.ok) return p
       const { now, at, who, sid, id, line } = p
       const running = sid ? whereAll()[sid] : undefined
-      const extra = { kind: 'handoff' as const, origin, ...(opt.direct ? { direct: true } : {}) }
+      const extra = { kind: 'handoff' as const, origin, ...(opt.direct ? { direct: true } : {}), ...(opt.untapped ? { untapped: opt.untapped } : {}) }
       if (sid && running) {
         if (atPrompt(sid)) return { ok: false, status: 409, reason: `${who} is waiting for an answer on the PC.` }
         if (hasDraft(sid)) return { ok: false, status: 409, reason: `Shubham has unsent text in ${who}'s box on the PC; try again shortly.` }
@@ -4613,6 +4707,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return buildSnapshot(input, namesFor(fastNames))
   }
   const quickSettings = createQuickSettings(path.join(o.dir, 'quick-settings.json'))
+  if (quickSettings.unreadable()) log?.warn('keep Quick running: the saved choice (quick-settings.json) could not be read; Quick is warm only while open plus 10 minutes until he chooses again in Settings')
+  // oc58f: the owner's hub choice "Quick sends without asking" (default on), the same for desktop and APK. It decides only whether Quick's
+  // hand-off waits on a card; it never grants a tap, an approval or Send as me (hand_off below).
+  const quickForwarding = createQuickForwarding(path.join(o.dir, 'quick-forwarding.json'))
+  if (quickForwarding.unreadable()) log?.warn('quick forwarding: the saved choice (quick-forwarding.json) could not be read; Quick asks first (the card until his tap) until he chooses again in Settings')
   const fastOn = o.fastAssistant ?? (process.env.SAD_FAST_ASSISTANT === '1' || existsSync(path.join(o.dir, '..', 'fast-assistant.on')))
   const fastHost: FastHost | undefined =
     fastOn && mode() !== 'member'
@@ -4626,6 +4725,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           },
           env: () => librarianEnv(process.env, o.token?.() ?? null, o.credential?.() ?? null),
           dir: path.join(o.dir, 'fast'),
+          history: quickHistory,
           toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
           shim,
           node: process.execPath,
@@ -4796,9 +4896,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!target || isOrchestratorAgent(target.floor.name, target.agent)) return null
     return orders.plan(sid, toSid, body)
   }
-  function openOrder(id: string, fromSid: string, toSid: string, body: string) {
+  function openOrder(id: string, fromSid: string, toSid: string, body: string, untapped?: Untapped | null) {
     const target = bySession(toSid)
-    if (target) orders.open(id, fromSid, { sessionId: toSid, agent: target.agent.name, floor: target.floor.name }, body)
+    if (target) orders.open(id, fromSid, { sessionId: toSid, agent: target.agent.name, floor: target.floor.name }, body, untapped ? { untapped } : undefined)
+  }
+  /**
+   * oc58f follow-up (Agent 3's B2): the marker of an order the Orchestrator gives. While a request Quick passed on by itself is open on that
+   * Orchestrator (orders.untappedFor), the marker says so: "Quick request (spoken, not tapped), order <id>", so the fact travels with the order and
+   * does not depend on how the Orchestrator retells it. His tap on a held message (tapped) is his own confirmation of those words: no mark. A wider
+   * mark (several requests open, or his own words in the same turn) only lowers trust; ", order <id>" stays last for scanMessages and turns.ts.
+   * NOT marked, on purpose (Lead, 16 Nov): an order given in a later turn, after the request was answered; why: orders.ts untappedFor.
+   */
+  function orderMarker(order: string, fromSid: string, tapped: boolean): { marker: string; untapped: Untapped | null } {
+    const untapped = tapped ? null : orders.untappedFor(fromSid)
+    return { marker: `${untapped ? `${untappedMark(untapped)}, ` : ''}${orders.marker(order)}`, untapped }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -5009,13 +5120,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-221 (ob98a): fail closed, for every client (the page, the Alt+K bar, Chris). No current ask (a cancelled turn, the o: turn that tells an
         // answer, a closed socket), or a cut-off turn the process is still stopping (its late call would be credited to the new ask): nothing typed.
         if (!origin || fastHost?.stopping()) return json({ ok: false, reason: 'There is no current question to hand off from.' })
-        // F-221: the connection HOLDS (live talk, or the bar's "tap to send"): a card on his screen, nothing typed until his tap.
-        if (origin.hold) return json(holdHandoff(text, origin, names))
-        // The old way (hold off: the Alt+K bar or Live talking classic set to "Send at once" (T4), Chris): typed as before, and it holds nothing
-        // (fix round 2, decision 1: the Orchestrator must still be able to message agents for these, and Chris has no card screen). Its label says
-        // where the words came from (decision 5), so the Orchestrator's brief can tell his typed words from his unconfirmed voice; ", order oX]" stays
-        // last.
-        const r = await handoff.handOff(text, orderOrigin(origin), `${names.fast} (${origin.via === 'voice' ? 'spoken, not tapped' : 'typed'})`)
+        // oc58f: one owner choice applies to Quick on every device, including
+        // older clients that still send their former default hold=true. Off is
+        // the old tap-to-send card. Existing cards are NEVER submitted here.
+        if (!quickForwarding.get().sendsWithoutAsking) return json(holdHandoff(text, origin, names))
+        // This passes a REQUEST only. Neither the words nor a client hold frame
+        // grant a human tap, approval, Send-as-me, publish or native permission.
+        // Keep the source label and all existing human/native-write checks.
+        const r = await handoff.handOff(text, orderOrigin(origin), quickUntappedSender(names.fast, origin.via), { untapped: origin.via === 'voice' ? 'spoken' : 'typed' })
         if (!r.ok) return json({ ok: false, reason: r.reason, note: 'Nothing was handed over. Tell him why in one sentence; do not try again yourself.' })
         fastSession?.handedOff(r.orderId, origin, `Asked ${names.big}: ${handoff.status(r.orderId).gist ?? text.slice(0, 80)}`)
         return json({ ok: true, orderId: r.orderId, phase: r.phase, note: `Handed to ${names.big}. Tell him in one short sentence that you have asked and will come back with the answer; do not say it is done.` })
@@ -5063,7 +5175,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** Order o7e6d S1: the open of an agent whose chat runs here fenced is refused (409, code staff-policy); nothing is stopped or started. */
   function fencedOpenError(sid: string) {
     log?.warn(`staff policy: chat ${sid.slice(0, 8)} runs here fenced; the open is refused until it is stopped`)
-    return staffError("Restart required: this chat is running fenced (where it came from can't be proven safe, or it was started without the restrictions it needs). It takes no messages and no tools until it is stopped; stop it, then open it again.")
+    return staffError('Restart required: this chat has known unsafe staff/policy provenance. It takes no messages and no tools until it is stopped; stop it, then open it again.')
   }
 
   /** Order o7e6d: the refusal of a tool to a fenced run (403, code staff-policy): a staff Assistant's in its own words, any other plainly. */
@@ -5073,8 +5185,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const a = agent ?? bySession(sid)?.agent
       staff = !!a && isStaffAssistant(a)
     } catch { /* the plain words */ }
-    log?.warn(`staff policy: chat ${sid.slice(0, 8)} asked for ${String(name).slice(0, 60)} while fenced (no staff policy where one is needed, or where it came from is not proven); refused`)
-    return Object.assign(apiError(403, staff ? "This Assistant's chat was not started with its restrictions, so its tools are off. Open it again." : "This chat is fenced (where it came from can't be proven safe), so its tools are off. Stop it, then open it again."), { code: 'staff-policy' })
+    log?.warn(`staff policy: chat ${sid.slice(0, 8)} asked for ${String(name).slice(0, 60)} with known unsafe staff/policy provenance; refused`)
+    return Object.assign(apiError(403, staff ? "This Assistant's chat was not started with its restrictions, so its tools are off. Open it again." : "This chat has known unsafe staff/policy provenance, so its tools are off. Stop it, then open it again."), { code: 'staff-policy' })
   }
 
   /** Order o7e6d: what a staff Assistant's read tools show is that person's own chats only (own-assistant.ts ownAssistantMayUse); null: not a staff chat. */
@@ -5090,21 +5202,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
     // Order o7e6d: a chat started under a policy is held to it here too, before anything is passed on (staffGate decides for this pool's chats).
     if (me.policy && (me.policy !== STAFF_POLICY || !staffToolAllowed(name))) throw staffDenied(name)
+    // C0: known runtime provenance is checked before forwarding, regardless of current binding or Server availability.
+    if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
     if (mode() === 'member' && !isLocalSession(me.sessionId)) {
-      // S1, B3 (Lead's C): passed to the Server, in this order, each before any request: the Server out of reach (503 hub-offline, as ever); this
-      // PC's copy of the Server's floors not fresh yet, for a run whose origin is not in a store this PC holds (the same retryable 503: try again
-      // in a moment); then the one check (runFenced): a fenced run is refused (403); only then is it passed on (the Server can't see a member's
-      // run). A run whose origin is this PC's own (its floors, its PC Control) never waits for freshness.
+      // C0: normal forwarding needs a reachable Server, as before S1; it does NOT require a fresh administrator class for ordinary chats.
+      // Only a staff-policy run's Server tools wait for fresh remote state. A local own-store origin stays independent of freshness.
       const link = needHub()
-      if (!originInOwnStore(me) && !replicaIsFresh()) throw Object.assign(apiError(503, `${team?.hub()?.name ?? 'The Server'} has just been reached again and its floors are not known fresh here yet, so this chat's tools wait; try again in a moment.`), { code: 'hub-offline' })
-      if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
+      if (me.policy === STAFF_POLICY && !originInOwnStore(me) && !replicaIsFresh()) throw Object.assign(apiError(503, `${team?.hub()?.name ?? 'The Server'} has just been reached again and its floors are not known fresh here yet, so this Assistant's Server tools wait; try again in a moment.`), { code: 'hub-offline' })
       return request<string>(link, 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
         if (['send_to_chat', 'app_send_to_chat', 'broadcast_to_chats'].includes(name) && [502, 504].includes(error?.status)) throw Object.assign(apiError(409, 'Delivery is not confirmed after the connection failed; pending messages may already be submitted or may still complete. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
         throw error
       })
     }
     // S1, B3: this PC's own chat: the one check, judged here (no Server needed); staffGate asks it again inside the tool.
-    if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
     return toolFor(me.sessionId, name, rawArgs)
   }
 
@@ -5217,9 +5327,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
+        const mark = order ? orderMarker(order, sid, opt.tapped === true) : null
         // F-221 (ob98a): a relayed message never carries the tapped marker (its words, or a name). His tap on a held one never sends it twice.
-        if (!(await typeIntoOrUndo(undo, target, neutralizeMarks(`[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, target.sessionId, body) }, me, opt.tapped === true))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
-        if (order) openOrder(order, sid, target.sessionId, body)
+        if (!(await typeIntoOrUndo(undo, target, neutralizeMarks(`[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${mark ? `, ${mark.marker}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, target.sessionId, body, mark?.untapped) }, me, opt.tapped === true))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
+        if (order) openOrder(order, sid, target.sessionId, body, mark?.untapped)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
       }
@@ -5442,9 +5553,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!joinsDraft(c.sessionId) && hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
+        const mark = order ? orderMarker(order, sid, opt.tapped === true) : null
         // F-221 (ob98a): a relayed message never carries the tapped marker (its words, or a name). His tap on a held one never sends it twice.
-        if (!(await typeIntoOrUndo(undo, c, neutralizeMarks(`[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, c.sessionId, body) }, me, opt.tapped === true))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
-        if (order) openOrder(order, sid, c.sessionId, body)
+        if (!(await typeIntoOrUndo(undo, c, neutralizeMarks(`[message from ${tag}${mark ? `, ${mark.marker}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, c.sessionId, body, mark?.untapped) }, me, opt.tapped === true))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
+        if (order) openOrder(order, sid, c.sessionId, body, mark?.untapped)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
       }
@@ -6123,7 +6235,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const run = sid ? chats.info(sid) : null
     if (isStaffAssistant(agent) || run?.policy !== undefined) throw staffError("A person's own Assistant takes plain messages only: no file is sent to it or served from it.")
     // S1, B3: the chat bound to it now is a fenced run (its lineage, an earlier finding, an untrusted record): no file either.
-    if (sid && runFenced(sid)) throw staffError("This chat is fenced (where it came from can't be proven safe): no file is sent to it or served from it. Stop it, then open it again.")
+    if (sid && runFenced(sid)) throw staffError('This chat has known unsafe staff/policy provenance: no file is sent to it or served from it. Stop it, then open it again.')
   }
 
   /** POST …/agents/:id/attach?name=photo.jpg, the file as the body: kept on the chat's PC; answers where. */
@@ -6998,10 +7110,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-083: the watchdog: whether it runs, the heartbeat's last and next beat, and the chats it holds down now.
     ['GET', /^\/watchdog$/, () => watchdogView()],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
+    // oc58f follow-up: the answer says when the saved choice could not be read (the card is in force until he chooses again).
+    ['GET', /^\/fast\/forwarding$/, () => quickForwarding.answer()],
+    ['PUT', /^\/fast\/forwarding$/, (_, r) => quickForwarding.set(r.body)],
     ['GET', /^\/fast\/names$/, () => ({ choice: fastNames })],
     // o1cfa: the owner's hub preference, shared by desktop and APK; not a client ownership or microphone switch.
-    ['GET', /^\/fast\/settings$/, () => ({ settings: quickSettings.get(), available: !!fastHost })],
-    ['PUT', /^\/fast\/settings$/, (_, r) => ({ settings: quickSettings.set(r.body), available: !!fastHost })],
+    // Lead (16 Nov): like /fast/forwarding, the answer says when the saved choice could not be read (the old way is in force until he chooses again).
+    ['GET', /^\/fast\/settings$/, () => quickSettings.answer(!!fastHost)],
+    ['PUT', /^\/fast\/settings$/, (_, r) => (quickSettings.set(r.body), quickSettings.answer(!!fastHost))],
     [
       'POST',
       /^\/fast\/names$/,
@@ -7070,6 +7186,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined, access.ownerOf(callerOf(r))) })],
     // Order oa09e: the overlay asks for its Assistant here (a member passes it on: the hub decides, from its whole list). His only (POLICY).
     ['POST', /^\/assistant$/, (_, r) => ensureHubAssistant(r.body, access.ownerOf(callerOf(r)))],
+    // oc65c: the caller chooses a saved binding of their OWN Assistant, never a filesystem path or another person.
+    ['GET', /^\/assistant-history$/, (_, r) => {
+      const index = assistantHistory(callerOf(r))
+      const id = r.query.get('source')
+      if (!id) return index
+      const source = index.sources.find(s => s.id === id)
+      if (!source) throw apiError(404, 'That conversation is not part of your Assistant or Quick history.')
+      if (!source.available || !source.file) throw apiError(404, 'The saved conversation is unavailable on this PC. Its binding is kept, not replaced by an empty session.')
+      return readAssistantHistory(source.file, Number(r.query.get('offset') ?? 0), r.query.get('view') === 'jsonl')
+    }],
     // Order o7e6d (H2, S1): every unsafe staff Assistant run and the fence record's own problems (staffPreflight), read only, the owner's only
     // (agent/agentic/access.ts: OWNER; a member's page asks the Server, which sees every PC). Empty, with sign-in on, before staff access opens.
     ['GET', /^\/staff\/preflight$/, () => ({ unsafe: staffPreflight() })],
@@ -7292,6 +7418,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const floor = floorOf(id)
         const a = agentOf(floor, agentId)
         const next = r.body.sessionId.trim()
+        if (keepsAssistantHistory(a) && a.sessionId && next !== a.sessionId) {
+          if (next) throw apiError(409, 'The Assistant keeps its conversation when closed. Replacing its session here is refused; use a checked engine conversion to carry history.')
+          stopAnywhere(a.sessionId)
+          return { floor, hasTranscript: !!historyFile(a.sessionId), preserved: true }
+        }
         if (a.sessionId && a.sessionId !== next) stopAnywhere(a.sessionId)
         const after = floors.bindSession(id, agentId, next || null)
         return { floor: after, hasTranscript: next ? !!findTranscript(next, projectsDir) : false }
@@ -7584,7 +7715,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
           if (info.policy === STAFF_POLICY) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, null)
           return { text: '' }
         }
-        if (info) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, typeof r.body.sessionId === 'string' ? r.body.sessionId : null)
+        if (info) {
+          // oc65c: the owner's Assistant's native session as its own hook reports it, kept so a /clear or /resume outlives a stop (metadata only; never
+          // a prompt, a path or a tool payload). One that is another chat's is not kept. A receipt that can't be written never stops the prompt.
+          const native = typeof r.body.sessionId === 'string' && UUID_RE.test(r.body.sessionId) ? r.body.sessionId.toLowerCase() : null
+          const at = native ? floors.bySession(info.sessionId) : null
+          const binding = at && info.engine === 'claude' && !info.execution && !info.policy && !at.agent.executionProfile
+            ? ownerAssistantBinding(at.floor, at.agent, info.sessionId) : null
+          if (binding && native) {
+            try {
+              if (nativeClaimedElsewhere(native, binding.agentId, info.sessionId)) log?.warn(`assistant history: ${at!.agent.name} reported a native session that is another chat's; not kept as its own`)
+              else assistantNativeHistory.observe(binding, native)
+            } catch (e) {
+              log?.warn(`assistant history: a native-session receipt could not be saved (${message(e)})`)
+            }
+          }
+          chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, typeof r.body.sessionId === 'string' ? r.body.sessionId : null)
+        }
         return { text: await callTool(key, 'memory_recall', { prompt: r.body.prompt.slice(0, 20_000) }) }
       },
       'local',
@@ -8600,14 +8747,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     restartCodexChats,
     resumeChat,
     busyChats: () => Object.values(chats.states()).filter(st => st === 'running' || st === 'question').length,
-    updateBlockers: () => staffFence.problems().map(p => STAFF_FENCE_WORDS[p] ?? `the staff fence record has a problem (${p})`),
+    updateBlockers: staffUpdateBlockers,
     quiet: {
       // The host has taken its chats over and recovery has reopened its list: before that "no chat" means "not known yet".
-      // Order o7e6d S1 (Lead's approval, its own change): and the staff fence record is sound. While it is bad, dirty (a write may not have
-      // landed) or holding a fence only in memory, the automatic Update waits (an Update would end and reopen every chat with nothing on disk
-      // to say which runs were fenced); the coordinator reads this at every look, at its last look and while the build waits. GET
-      // /staff/preflight names the problem; only a person clears it. A sound record: exactly as before.
-      ready: () => hostAdopted && recoveryDone && staffFence.problems().length === 0,
+      // C0: store trouble alone is an activation hold, not an ordinary Update hold. Only a live unsafe staff/policy run can make it related.
+      ready: () => hostAdopted && recoveryDone && staffUpdateBlockers().length === 0,
       // Every chat running on a PC this hub sees (its own and each member's), with its state: a chat on another PC is cut from the hub too.
       chats: () => Object.fromEntries(Object.entries(whereAll()).map(([sid, w]) => [sid, { state: w.state, name: floors.bySession(sid)?.agent.name }])),
       drafts: () => chats.live().filter(c => chats.drafting(c.sessionId)).length,

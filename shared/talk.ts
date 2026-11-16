@@ -913,6 +913,12 @@ interface Say {
    * voice over one is never taken as over an answer (see onOnset): the line is hushed and his voice is decided by the turn that is out.
    */
   own: boolean
+  /**
+   * odcd9 (from oeb56's review): a piece of its turn's lead-in, Quick's words before a tool call ("Checking the build."), marked at its first
+   * tool frame (markLeadIn). While he has heard nothing of that turn but its lead-in and more of it is to come (leadInOnly), his voice over it
+   * is taken as over a filler (onOnset): while it thinks, so his added words and his question are ONE ask.
+   */
+  leadIn: boolean
 }
 
 interface Turn {
@@ -939,6 +945,8 @@ interface Turn {
   answered: boolean
   /** Its answer's sentences that were said in full. */
   said: string[]
+  /** odcd9 (from oeb56's review): how many of `said` (the first ones) are its lead-in, said before its first tool call (see Say.leadIn). */
+  leadSaid: number
   line: TalkLine | null
   toolSeen: boolean
   /** The latest tool label (direct mode: the order's words). */
@@ -957,6 +965,8 @@ interface Turn {
  *   plain: nothing was out (or Tap only: his voice never cuts anything).
  *   think: a turn was out and its answer unheard. On the PC or earbuds (Auto) it was cancelled at once (`cancelled`; a direct order
  *          is never cancelled, only its filler stops); talking over it (`talkOver`), it goes on until his words say what they were.
+ *          odcd9 (from oeb56's review): its lead-in before a tool ("Checking the build.") is not its answer until a say after it starts
+ *          (leadInOnly).
  *   barge: over the answer, on the PC or earbuds (Auto): held; 500 ms of voice makes it `cut`, less lets the answer go on.
  *   cut: he cut the answer off; `heard` is what he heard of it.
  *   hold: over the answer, talking over it: held until his words say whether they were its own echo.
@@ -1102,7 +1112,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   const turnOf = (id: string | null): Turn | undefined => (id === null ? undefined : turns.find(t => t.id === id))
   const hasSays = (t: Turn) => queue.some(s => s.turn === t.id) || pending.some(s => s.turn === t.id)
   function newTurn(id: string, kind: Turn['kind'], text: string, heard = ''): Turn {
-    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, said: [], line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
+    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, said: [], leadSaid: 0, line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
     turns.push(t)
     while (turns.length > TALK.turnsMax) {
       const i = turns.findIndex(x => !x.generating && !hasSays(x))
@@ -1129,6 +1139,36 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       if (queue.some(s => s.turn === t.id && s.kind === 'answer') || pending.some(s => s.turn === t.id && s.kind === 'answer')) return t
     }
     return null
+  }
+  /**
+   * odcd9 (from oeb56's review): he has heard nothing of this turn but its lead-in (its words before its first tool call, see Say.leadIn), and
+   * more of it is to come: his voice now is taken as while it thinks (onOnset), the lead-in as a filler. oeb56's review 2: while none of its
+   * says after the lead-in has started, whether Quick still writes it (its tool runs) or it is all written and that answer waits at the page
+   * or to go (a 'done' before it played made his added words a barge again: under 500 ms dropped, 500 ms or more asked alone). Not a turn all
+   * written with nothing after its lead-in: that line was all of its answer (a hand-off it made is not asked again). Once a say after the
+   * lead-in started, it is an answer as before. (A turn with no lead-in counts nothing in `said` as one.)
+   */
+  function leadInOnly(t: Turn): boolean {
+    if (t.cancelled || t.said.length !== t.leadSaid) return false
+    const after = [...queue, ...pending].filter(s => s.turn === t.id && s.kind === 'answer' && !s.leadIn)
+    return !after.some(s => s.started) && (t.generating || after.length > 0)
+  }
+  /** odcd9 (from oeb56's review): a say of its turn's lead-in while he has heard nothing of that turn but it (leadInOnly): his voice over it is as over a filler. */
+  function leadInSay(s: Say): boolean {
+    const t = s.leadIn ? turnOf(s.turn) : undefined
+    return t !== undefined && leadInOnly(t)
+  }
+  /**
+   * odcd9 (from oeb56's review): at its first tool frame, what Quick said of the turn before it is its lead-in ("Checking the build."): its
+   * sentences said in full, and its says at the page or still to go. oeb56's review 2: only at the first (tools called together come as
+   * frames back to back, with no words between them). What it writes after a tool is its answer, also when another tool follows: marked at
+   * the next tool, a cough or an "okay" over it while that tool ran asked the whole question again (review of T3a: his voice between two
+   * sentences of an answer is over the answer, not while it thinks).
+   */
+  function markLeadIn(t: Turn) {
+    if (t.toolSeen) return
+    t.leadSaid = t.said.length
+    for (const s of [...queue, ...pending]) if (s.turn === t.id && s.kind === 'answer') s.leadIn = true
   }
   /** Sends what he said: to Quick, or (direct mode) to the Assistant chat. A new ask ends every Quick turn still being written (the hub does the same). */
   function ask(text: string, heard?: string) {
@@ -1165,7 +1205,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    */
   function say(text: string, kind: SayKind, turn: Turn | null, keep = turn?.kind === 'direct', of: string | null = turn?.id ?? null) {
     for (const piece of sayPieces(text)) {
-      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of, own: false }
+      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of, own: false, leadIn: false }
       if (blocked()) pending.push(s)
       else emitSay(s)
     }
@@ -1241,6 +1281,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       const t = s.started && s.kind === 'answer' && !s.cutting ? turnOf(s.turn) : undefined
       if (t) {
         t.said.push(s.text)
+        // odcd9 (from oeb56's review): a lead-in said in full is still its lead-in (it comes before any of the answer after the tool).
+        if (s.leadIn) t.leadSaid += 1
         answerEndAt = now
       }
     }
@@ -1330,8 +1372,12 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // Taken as over an answer, 500 ms of his voice over "I missed part of that." (said as the rest of his words is asked) asked his new words
     // alone, which ended the question just asked: it was never answered (rig x-partlost-over; x-notcaught-over the same with "Sorry, I didn't
     // catch that." said while a question of his was out).
+    // odcd9 (from oeb56's review): nor Quick's lead-in before a tool ("Checking the build.") while nothing of the answer after it has started
+    // (leadInOnly; oeb56's review 2: also once all of it is written and that answer waits to play): his voice over it is as over a filler
+    // (while it thinks, below), so his added words and his question are ONE ask. Taken as over an answer, under 500 ms of it his words were
+    // only looked at for a stop word and dropped, and 500 ms or more asked them alone.
     const playing = held ? undefined : queue.find(s => s.started)
-    if (playing?.kind === 'answer' && !playing.own) {
+    if (playing?.kind === 'answer' && !playing.own && !leadInSay(playing)) {
       hold()
       utt = fresh(over, turnOf(playing.turn) ?? null)
       return
@@ -1341,15 +1387,17 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // written): as over the answer, not as while it thinks (review of T3a: a cough there asked the whole question again). A short sound
     // lets it go on; only 500 ms of his voice (or his own words, talking over it) cut it off, and the next ask says what he heard. The
     // answer at the page goes first: a newer turn may be out meanwhile (another order, or the telling the hub starts after an answer).
+    // odcd9 (from oeb56's review): a lead-in heard in full is not that answer while none of the answer after it has started (leadInOnly): he
+    // has heard none of it yet.
     const next = turnOf(queue.find(s => s.kind === 'answer')?.turn ?? null)
-    const heard = [next, t].find(x => x && !x.cancelled && x.said.length > 0)
+    const heard = [next, t].find(x => x && !x.cancelled && x.said.length > 0 && !leadInOnly(x))
     if (heard) {
       hold()
       utt = fresh(over, heard)
       return
     }
-    // Thinking: a turn is out and he has heard none of its answer (a filler, or one of its own lines, may play): on the PC or earbuds it is
-    // cancelled and his words are asked with it (ONE question); talking over it, it is held until his words say what they were.
+    // Thinking: a turn is out and he has heard none of its answer (a filler, one of its own lines or, odcd9, its lead-in may play): on the PC
+    // or earbuds it is cancelled and his words are asked with it (ONE question); talking over it, it is held until his words say what they were.
     if (t) {
       if (style === 'barge') {
         // On the PC or earbuds: cut off at his voice (a filler with it); his words decide what is asked next.
@@ -1540,7 +1588,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     const same = (s: Say) => s.turn === null && s.of === null && (s.text === text || (again(s.text) && again(text)))
     const waiting = queue.find(same) ?? pending.find(same)
     if (waiting) return waiting.text
-    const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text, kind: 'answer', turn: null, started: false, ms: 0, marks: null, cutting: false, keep: false, of: null, own: true }
+    const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text, kind: 'answer', turn: null, started: false, ms: 0, marks: null, cutting: false, keep: false, of: null, own: true, leadIn: false }
     if (held) pending.push(s)
     else emitSay(s)
     return text
@@ -1858,6 +1906,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       case 'tool': {
         const t = turnOf(f.id)
         if (!t?.generating || t.cancelled) return
+        // odcd9 (from oeb56's review): what it said of this turn before its first tool call is its lead-in (markLeadIn, onOnset).
+        markLeadIn(t)
         t.toolSeen = true
         t.label = f.label
         info = f.label

@@ -313,7 +313,9 @@ export function createAuth(o: AuthOptions): Auth {
       via: c.via,
       person: c.person,
       session: c.person ? sessionInfo(c.sid) : null,
-      canPublish: c.person?.canSeeAll === true,
+      // Lead, 16 Nov: the publish gate's own owner test (publish-policy.ts publishActor), by id. Not canSeeAll: an administrator
+      // added in auth.json sees everything but may not publish. index.test.ts pins it to publishActor.
+      canPublish: c.person?.id === SBSKRRT_ID,
       mayShowCode: c.person?.canSeeAll === true && !!sessionInfo(c.sid),
       mayApprove: !!c.person && !!sessionInfo(c.sid),
       needsSignIn: !c.person && !c.machine,

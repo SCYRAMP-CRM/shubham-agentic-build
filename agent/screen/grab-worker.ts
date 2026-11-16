@@ -10,7 +10,7 @@ import { createGrabState, GRAB, LET_GO } from './grab-keys.ts'
 // takes the window in front as the one that asked, LET_GO unhooks, WM_QUIT ends the thread. Keys
 // go back with postMessage, which needs nothing of this thread's own event loop.
 
-const { codes, injected } = workerData as { codes: [number, string][]; injected?: 'skip' | 'only' }
+const { codes } = workerData as { codes: [number, string][] }
 const byScan = new Map(codes)
 const k = createRequire(import.meta.url)('koffi') as typeof Koffi
 const user32 = k.load('user32.dll')
@@ -35,7 +35,7 @@ const port = parentPort!
 
 let hook: unknown = null
 let owner = 0
-let state = createGrabState(byScan, { injected })
+let state = createGrabState(byScan)
 
 const proc = k.register(
   (code: number, wParam: number, info: unknown) => {
@@ -60,7 +60,7 @@ for (;;) {
   if (GetMessageW(msg, 0, 0, 0) <= 0) break
   if (msg.message === GRAB) {
     owner = GetForegroundWindow()
-    state = createGrabState(byScan, { injected })
+    state = createGrabState(byScan)
     hook ??= SetWindowsHookExW(WH_KEYBOARD_LL, proc, GetModuleHandleW(null), 0)
     port.postMessage({ t: 'grabbing', ok: Boolean(hook) })
   } else if (msg.message === LET_GO) {

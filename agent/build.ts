@@ -1,12 +1,15 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
+import { StringDecoder } from 'node:string_decoder'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
 import { UPDATE_EXIT_CODE, type BuildInfo, type BuildVersion, type PublishRequest } from '../shared/build.ts'
 import { apiError, type ApiMount, type MountRequest } from './api.ts'
-import { authError, mayPublish } from './auth/types.ts'
+import { authError } from './auth/types.ts'
 import type { Logger } from './log.ts'
+import { cleanPublishActor, maySkipTests, PUBLISH_READY, publishActor, publishDecision, publishRequest, samePublishAudit, type PublishDecision } from './publish-policy.ts'
+import { beginPublishRecord, finishPublishRecord, publishHistory } from './publish-history.ts'
 
 // F-020: what this PC runs, and getting a newer one (shared/build.ts).
 //   which     a build (RELEASE.json in the folder it runs from) or Dev (no RELEASE.json)
@@ -24,6 +27,8 @@ const LOG_LINES = 400
 const KEY_LINE = /^(==|Done\b|Publish stopped)/
 const GIT_TIMEOUT_MS = 60 * 1000
 const PUBLISHED_MARK = 'PUBLISHED '
+/** obcbd: what any caller but the owner's own page hears when it asks to skip the checks. */
+const SKIP_REFUSED = 'Skip tests and publish is the owner’s own choice, made by hand on the Build page. This channel can only Test and publish.'
 const DEV_EVERY_MS = 20_000
 
 export type Git = (args: string[], cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>
@@ -95,6 +100,8 @@ export interface BuildOptions {
   /** Tests: a fake git, and the command publish runs. */
   git?: Git
   publishCommand?: (devDir: string, req: PublishRequest) => { file: string; args: string[] }
+  /** Durable receipts; main supplies the state folder, never the source checkout. */
+  publishHistoryDir?: string
   /** F-075: set once the agent runs its chats in the chat host. */
   chatHostGate?: { current: ChatHostGate | null }
   /**
@@ -108,9 +115,11 @@ export interface BuildOptions {
   hostWaitMs?: number
   hostPollMs?: number
   /**
-   * F-173a: who may press Update (POST /update) and cancel it (POST /update-cancel) from a route. main.ts passes the same rule as
-   * Publish (F-119, auth/types.ts mayPublish): a PAGE (a browser, remote or local) needs a signed-in administrator; a program on the
-   * Server with the local machine token and no page headers is as before (Lead presses Update that way on the person's typed words).
+   * F-173a: who may press Update (POST /update) and cancel it (POST /update-cancel) from a route. main.ts passes F-119's rule
+   * (auth/types.ts mayPublish): a PAGE (a browser, remote or local) needs a signed-in administrator; a program on the Server with
+   * the local machine token and no page headers is as before (Lead presses Update that way on the person's typed words). That is
+   * NOT Publish's rule any more: obcbd narrowed Publish to the owner signed in or the machine-token channel (publish-policy.ts
+   * publishActor), so an administrator who is not the owner may press Update from a page but may not publish.
    * Required and without a default, so a build made without it does not compile. The AUTOMATIC update never goes through this route:
    * it spends a permit (commitUpdate) that only the coordinator in this process can make.
    */
@@ -172,12 +181,17 @@ export function parseVersion(text: string): BuildVersion | null {
     return null
   }
   if (!isObject(v) || typeof v.version !== 'string' || typeof v.builtAt !== 'string') return null
+  let publishAudit: BuildVersion['publishAudit']
+  if (isObject(v.publishAudit) && (v.publishAudit.checks === 'full' || v.publishAudit.checks === 'skip') && typeof v.publishAudit.at === 'string' && Number.isFinite(Date.parse(v.publishAudit.at))) {
+    try { publishAudit = { checks: v.publishAudit.checks, at: v.publishAudit.at, by: cleanPublishActor(v.publishAudit.by) } } catch { /* Malformed audit is not proof of checks. */ }
+  }
   return {
     version: v.version,
     commit: typeof v.commit === 'string' ? v.commit : null,
     dirty: v.dirty === true,
     builtAt: v.builtAt,
     devHash: typeof v.devHash === 'string' ? v.devHash : null,
+    ...(publishAudit ? { publishAudit } : {}),
     // F-075: only when the build says so (builds from before it have no such field).
     ...(isObject(v.chatHost) && typeof v.chatHost.protocol === 'number' && typeof v.chatHost.version === 'number' ? { chatHost: { protocol: v.chatHost.protocol, version: v.chatHost.version } } : {}),
   }
@@ -238,6 +252,7 @@ export function findDevDir(root: string, env: NodeJS.ProcessEnv = process.env): 
 export function createBuild(o: BuildOptions): Build {
   const git = o.git ?? runGit
   const log = o.log
+  const historyDir = o.publishHistoryDir ?? path.join(o.root, '.publish-history')
   const releaseFile = path.join(o.root, 'RELEASE.json')
   const current = existsSync(releaseFile) ? parseVersion(readFileSync(releaseFile, 'utf8')) : null
   const kind: BuildInfo['kind'] = current ? 'build' : 'dev'
@@ -266,7 +281,7 @@ export function createBuild(o: BuildOptions): Build {
     root: o.root,
     current,
     update: { ...update, hostWait: hostWait ? { since: new Date(hostWait.since).toISOString(), busy: o.chatHostGate?.current?.busy() ?? 0, ask: hostWait.ask } : null },
-    publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log] } : null,
+    publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log], history: publishHistory(historyDir) } : null,
   })
 
   /** Dev against the newest build: published since (the last publish, or one on GitHub), or this one. */
@@ -333,37 +348,74 @@ export function createBuild(o: BuildOptions): Build {
     return checking
   }
 
-  function startPublish(req: PublishRequest) {
+  function startPublish(req: PublishRequest, actor: NonNullable<ReturnType<typeof publishActor>>) {
     if (!publish || o.role() !== 'hub') throw apiError(404, 'Publishing is done on the hub, from Dev')
     if (publish.state === 'running') throw apiError(409, 'A publish is already running')
-    const cmd = o.publishCommand?.(publish.devDir, req) ?? {
-      file: process.execPath,
-      args: ['agent/scripts/publish.ts', ...(req.skipChecks ? ['--skip-checks'] : [])],
+    // obcbd: skipping every check is human-only (the owner's own page, by hand); the machine channel only tests and publishes.
+    if (req.checks === 'skip' && !maySkipTests(actor)) throw authError(403, SKIP_REFUSED, 'admin-only')
+    // Fail closed BEFORE spawning if the decision cannot be recorded.
+    const attempt = beginPublishRecord(historyDir, req.checks ?? 'full', actor)
+    let decision: PublishDecision
+    try {
+      decision = publishDecision(req, actor, historyDir, attempt.id)
+    } catch (e) {
+      finishPublishRecord(historyDir, attempt.id, 'failed', null, e instanceof Error ? e.message : String(e))
+      throw e
     }
+    // No option on its command line says how to publish: the decision goes over the process's own control channel (below).
+    const cmd = o.publishCommand?.(publish.devDir, req) ?? { file: process.execPath, args: ['agent/scripts/publish.ts'] }
     Object.assign(publish, { state: 'running', startedAt: new Date().toISOString(), endedAt: null, log: [], error: null })
     log?.info(`publishing a build from ${publish.devDir}`)
-    const child = (running = spawn(cmd.file, cmd.args, { cwd: publish.devDir, windowsHide: true, env: { ...process.env, FORCE_COLOR: '0' } }))
+    let child: ChildProcess
+    try {
+      child = running = spawn(cmd.file, cmd.args, { cwd: publish.devDir, windowsHide: true, env: { ...process.env, FORCE_COLOR: '0' }, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] })
+    } catch (e) {
+      finishPublishRecord(historyDir, attempt.id, 'failed', null, e instanceof Error ? e.message : String(e))
+      publish.state = 'failed'
+      publish.error = 'The publish process could not start.'
+      throw e
+    }
+    // It says it is listening first (a message sent before that would be lost), then gets this attempt's decision, once.
+    let handed = false
+    child.on('message', m => {
+      if (handed || !isObject(m) || m.t !== PUBLISH_READY) return
+      handed = true
+      child.send(decision, e => {
+        if (e) log?.warn(`the publish decision could not be handed to its process: ${e.message}`)
+      })
+    })
     let published: BuildVersion | null = null
-    const take = (chunk: Buffer) => {
+    const line = (raw: string) => {
       // Plain text for the page: tools colour their output even when asked not to.
       // oxlint-disable-next-line no-control-regex
-      const text = chunk.toString('utf8').replace(/\u001b\[[0-9;]*m/g, '')
-      for (const line of text.split(/\r?\n/)) {
-        if (!line.trim()) continue
-        if (line.startsWith(PUBLISHED_MARK)) {
-          published = parseVersion(line.slice(PUBLISHED_MARK.length))
-          continue
-        }
-        publish.log.push(line)
+      const text = raw.replace(/\u001b\[[0-9;]*m/g, '')
+      if (!text.trim()) return
+      if (text.startsWith(PUBLISHED_MARK)) {
+        published = parseVersion(text.slice(PUBLISHED_MARK.length))
+        return
       }
+      publish.log.push(text)
       if (publish.log.length > LOG_LINES) publish.log.splice(0, publish.log.length, ...trimLog(publish.log))
     }
-    child.stdout?.on('data', take)
-    child.stderr?.on('data', take)
+    const streams = [new StringDecoder('utf8'), new StringDecoder('utf8')]
+    const pending = ['', '']
+    const take = (which: number, chunk: Buffer) => {
+      pending[which] += streams[which].write(chunk)
+      const parts = pending[which].split(/\r?\n/)
+      pending[which] = parts.pop() ?? ''
+      for (const part of parts) line(part)
+    }
+    child.stdout?.on('data', chunk => take(0, chunk as Buffer))
+    child.stderr?.on('data', chunk => take(1, chunk as Buffer))
     child.on('error', e => {
       publish.log.push(e.message)
     })
     child.on('close', code => {
+      for (let i = 0; i < streams.length; i++) line(pending[i] + streams[i].end())
+      if (published && req.checks === 'skip' && !samePublishAudit(published.publishAudit, attempt.audit)) {
+        code = 1
+        publish.log.push('The published marker does not carry this attempt’s skipped-checks audit. Inspect the artifact before claiming success.')
+      }
       running = null
       publish.endedAt = new Date().toISOString()
       if (code === 0) {
@@ -376,6 +428,12 @@ export function createBuild(o: BuildOptions): Build {
         publish.state = 'failed'
         publish.error = publish.log.at(-1) ?? `The publish exited ${code}`
         log?.warn(`publish failed: ${publish.error}`)
+      }
+      try { finishPublishRecord(historyDir, attempt.id, code === 0 ? (published ? 'published' : 'unchanged') : 'failed', published?.version ?? null, publish.error) }
+      catch (e) {
+        publish.state = 'failed'
+        publish.error = 'The publish finished, but its audit receipt could not be updated: ' + (e instanceof Error ? e.message : String(e))
+        log?.warn(publish.error)
       }
     })
     return info()
@@ -582,9 +640,9 @@ export function createBuild(o: BuildOptions): Build {
 
   const routes: Record<string, (r: MountRequest) => unknown> = {
     // F-119: whether this browser may press Publish rides with the info, for the page that shows the button.
-    'GET /info': r => ({ ...info(), mayPublish: mayPublish(r.headers, r.caller) }),
+    'GET /info': r => ({ ...info(), mayPublish: publishActor(r.headers, r.caller) !== null }),
     'POST /check': () => check(),
-    // F-173a: from a page, only a signed-in administrator presses Update or cancels it (as Publish); a program on this PC with the machine token and no page headers is as before.
+    // F-173a: from a page, only a signed-in administrator presses Update or cancels it (F-119's rule, not Publish's: obcbd narrowed Publish to the owner); a program on this PC with the machine token and no page headers is as before.
     'POST /update': r => {
       o.authorizeUpdate(r)
       // The person's own press: its body (force, after the wait) is theirs, as it always was.
@@ -596,8 +654,13 @@ export function createBuild(o: BuildOptions): Build {
     },
     'POST /publish': r => {
       // F-119: from a page, only a browser signed in as sbskrrt; a local tool with the machine token and no page headers is as before.
-      if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only sbskrrt, signed in, publishes from a page.', 'admin-only')
-      return startPublish(isObject(r.body) && r.body.skipChecks === true ? { skipChecks: true } : {})
+      const actor = publishActor(r.headers, r.caller)
+      if (!actor) throw authError(403, 'Only the owner, signed in, or Lead on the local machine channel may publish.', 'admin-only')
+      // obcbd: told plainly, before any confirmation is asked for: this caller can never skip the checks.
+      if (isObject(r.body) && r.body.checks === 'skip' && !maySkipTests(actor)) throw authError(403, SKIP_REFUSED, 'admin-only')
+      let req: PublishRequest
+      try { req = publishRequest(r.body) } catch (e) { throw apiError(400, e instanceof Error ? e.message : String(e)) }
+      return startPublish(req, actor)
     },
   }
 

@@ -1365,8 +1365,8 @@ says how it is used; this is how it works.
   `TerminateProcess(handle, code)` with the stop's code (75 stays 75), first appending a line to
   `<state>/agent/logs/exit-watchdog.log`. Node's job for its children ends it when the agent exits
   by itself. Tests: `exit-watchdog.test.ts`.
-- **Publish** (`POST /build/publish {skipChecks?}`, the hub only, one at a time): runs Dev's
-  `node agent/scripts/publish.ts [--skip-checks]` in Dev, keeps 400 lines (colour codes
+- **Publish** (`POST /build/publish {checks?, confirmSkipTests?}`, the hub only, one at a time): runs Dev's
+  `node agent/scripts/publish.ts` in Dev, keeps 400 lines (colour codes
   stripped) for `GET /build/info`, and reads the published version from its `PUBLISHED <json>`
   line; then checks for itself. Over the 400, the oldest plain line goes first (`trimLog`); a line
   starting `==` (the step headings and the checks' summary), `Done` or `Publish stopped` is kept, so the
@@ -1387,6 +1387,41 @@ says how it is used; this is how it works.
   pushed from `<state>/publish/repo`, reset to `origin/main` first, every file but `.git` replaced,
   committed as Dev's git author (`user.name`, `user.email` from Dev), unless only `RELEASE.json`
   changed. The repo is made (private, with `gh`) when it doesn't exist.
+- **Publish choices (obcbd, superseding o9a09)**: **who may publish is narrowed.** Only the owner (sbskrrt) signed in,
+  or the authenticated local machine-token channel, may publish; that channel is a request with no page markers and no
+  person (Lead's channel, and every local program's). Before obcbd any administrator's signed-in page could publish,
+  and so could a signed-in request without page markers, whoever it was; both now get 403 `admin-only`. That is a
+  security improvement AND a capability removal for an administrator who is not the owner, and it is visible: in a
+  build the Publish card follows the same rule (`GET /build/info` mayPublish), so such an administrator no longer sees
+  the card at all; in Dev the card still shows and the agent refuses the press. `AuthStatus.canPublish`, which the page
+  reads before it asks, is the same owner test, by id and not `canSeeAll`: an administrator added in auth.json sees
+  everything and gets false (`auth/index.test.ts` pins it to publishActor). `checks:"full"` is the default: types,
+  lint and themes; the frontend tests (every `*.test.mjs` and `*.test.ts` under src, plus any `*.test.mjs` under
+  shared); then the agent and shared tests (`agent/**/*.test.ts`, `shared/**/*.test.ts`), so each shared test runs
+  exactly once; each test is bounded by `--test-timeout=120000`, and no test needs anyone at the Server (the real-keys
+  keyboard test is gone, order o5826); then build and try-it. `checks:"skip",confirmSkipTests:true` runs no checks or
+  tests, including try-it smoke; it still compiles, assembles/installs the artifact and checks source integrity before
+  publishing. A failed compile cannot publish. **A skip needs the owner's session** (Lead, 16 Nov: skipping is meant to
+  be human-only), **and that session, not his page, is the boundary.** The agent allows a skip for any request signed in
+  as the owner, with or without page markers: it cannot tell his Build page from another program holding his session,
+  so anything holding that session can skip. On the page, the skip button and its warning/Cancel confirmation are
+  humanOnly (the assistant's screen control refuses them; a click that is not a real tap does nothing): a page-level
+  guard, not the boundary. No skip preference is saved. The machine token is an administrator to auth (auth/index.ts's
+  `admin` rule) but is not the owner for publishing: it may publish with full checks and may NOT skip, so every local
+  program and agent on that channel gets 403 `admin-only` for any skip request, before any receipt or process. These
+  protections are session-shaped, not human-shaped. The CLI has no skipping option at all: `--skip-tests`,
+  `--confirm-no-tests` and the old `--skip-checks` are refused with that reason, and it names no other operator
+  (`--by`/`--actor-json` are gone). Every publish the agent starts, either choice, from the page or the machine channel,
+  runs `node agent/scripts/publish.ts` with a Node IPC channel and no options; the script says it is listening
+  (`obcbd-publish-ready`) and takes one decision `{checks, confirmSkipTests?, actor, historyDir, attemptId}`, which it
+  checks again (skip only for the owner), then closes the channel. Started without that channel it is always Test and
+  publish. A program on this PC that builds its own launcher can of course fake a channel, as it could edit the
+  script; that is outside what the product can stop. Old full clients using `skipChecks:false` remain compatible;
+  `skipChecks:true` is refused. Initial per-attempt audit is persisted BEFORE spawn; outcomes/history live in
+  `<state>/agent/build/publish-history/<attempt-id>.json`, and `RELEASE.json.publishAudit` carries checks/by/at.
+  GET info includes the newest 30 history records; failure and unchanged attempts retain their decision. A CLI with a
+  private SAD_HOME may explicitly supply `--history-dir=<intended app-state>/agent/build/publish-history`; otherwise
+  history belongs to that private state. `--no-push` emits BUILT, never PUBLISHED. Nothing presses Update.
 - **Install** (`Install.ps1` in a build): `npm ci --omit=dev` when there are no packages; stops
   Dev's `start-hub.cmd` loop, then the node processes holding 21221 and 5173 (not started with
   `--app`), a previous run of this build, and agent chats left running (`claude.exe` with the app's
@@ -2507,11 +2542,19 @@ Files: `agent/agentic/phone-apps.ts` (+ test), `shared/phone-apps.ts` (+ test), 
   viewer client (asked with the first way listed; each answer read as RustDesk reads it;
   NotSupported stops offering it; never asked where not offered; someone else's ends the
   connection, at login or later).
-  With the shortcuts (F-013, 2026-10-30), also: `agent/screen/grab-keys.test.ts` (scan codes to
+  With the shortcuts (F-013, 2026-10-30), also: `agent/screen/grab-keys-decisions.test.ts` (scan codes to
   KeyboardEvent.code; Alt+Tab and the Windows key taken with the modifiers held; a held key
   repeats; Caps Lock, Num Lock and injected input left alone, a key down before the grab going up
-  here; another window in front: lost once, taken keys still going up; and the real hook on its
-  own thread with keys the test injects, nothing taken after letting go), api (`/keys`:
+  here; another window in front: lost once, taken keys still going up; the tests' own mode taking
+  only injected keys: the hook's decisions on events handed to it, no desktop or window in front).
+  The real-keys test that was in the same file (the hook on its own thread, Shift+F24 injected into
+  whatever window was in front, nothing taken after letting go) was REMOVED on Shubham's order
+  o5826 (16 Nov 2026: "remove the keyboard test altogether please"), so that no publish needs
+  anyone at the Server. Coverage lost with it: no test now checks that real keystrokes reach the
+  installed WH_KEYBOARD_LL hook and are taken from the real window in front; the decision cases
+  above do not prove that. The file was renamed so the merge queue, which excluded the old name for
+  its real keys, runs these six. Nothing brings the real test back (no flag, no skipped leaf). Also
+  api (`/keys`:
   grabbing then each key, closing gives them back; the grab ending, one that can't start, and
   none here).
   With the phone (F-014, F-017, 2026-10-30), also: client (text as one `seq`, none while the
@@ -2631,7 +2674,11 @@ The session around the process (owners, sockets, brief, snapshot, tools and thei
 - **Supervision** is the guard's `supervise()` (backoff 0/2/5/10/20/30 s, 30 s init timeout, hung check); more than 6 exits in 5 minutes: `unavailable`
   with a sentence until somebody opens it again. A turn is sent to a restarted process at most twice. Ended by exact PID and start time (`proc-tree.ts`),
   never by name, pattern, port or `taskkill /T`; on the app stopping, its own handle first.
-- **Warm only while open + 10 minutes** (`host.open(who)` / `host.close(who)`; the owners are the session's). No keep-alive turns.
+- **Keep Quick running** (o1cfa, `quick-settings.ts`, owner-only `GET/PUT /agentic/fast/settings` → `{settings: {keepRunning}, available,
+  unreadable?}`): on by default, the same for the desktop and the APK. On, the host is wanted with no owners at all (no idle end; it prewarms on the
+  memory look's own schedule, never faster); the memory gates, the crash circuit and an explicit stop still win, and a failed Quick history store
+  dominates it (`tick()` returns before demand). Off, the old way: **warm only while open + 10 minutes** (`host.open(who)` / `host.close(who)`; the
+  owners are the session's). No keep-alive turns either way.
 - **Memory** (`fast-gate.ts`, the numbers are in `watchdog_status.fast.gate`): starts at 2.5 GB of available RAM or more; ended first (state `paused`,
   "Assistant paused: memory is low") when available RAM stays under 1.2 GB for 30 s; free commit under 1.0 GB only as a backstop. An unreadable number never
   ends it and never allows a start; when memory is back and somebody still has it open it starts again by itself.
@@ -2652,6 +2699,23 @@ The session around the process (owners, sockets, brief, snapshot, tools and thei
   `waiting-you`, `slow` after 15 minutes) with the chat's spinner words; `not-taken` after 120 s; give-up at 3 h. The answer is **not** typed anywhere: it goes
   to the session that registered with `listen({onReturn, onProgress})`; if that returns false the reply waits (kept 1 h) and is tried again. Stop = Esc into the
   Orchestrator and a reply "(cancelled: Shubham stopped it)". One reply per order; a reply is never an order; an acknowledgement opens none.
+- **Quick sends without asking** (oc58f, `quick-forwarding.ts`, owner-only `GET/PUT /agentic/fast/forwarding` → `{settings: {sendsWithoutAsking},
+  unreadable?}`): on by default, the same for every device. On, `hand_off` types the request straight in as `[message from Quick (spoken|typed, not
+  tapped), order <id>]`, whatever an older client's hold frame says; off, every hand-off is a card until his tap (`(spoken|typed, he tapped Send)`).
+  Switching never sends cards already held. Not tapped is a request, never his confirmation: the overlay brief (v11) and the workers' brief keep publish,
+  Update, delete, pay, approve and send-as-him behind his own separate word. No Quick label but his tap's is trusted (the plain `(typed)` label is gone).
+- **The untapped mark travels with orders** (oc58f follow-up, Agent 3's B2): such a hand-off's order records `untapped: 'spoken'|'typed'` (on disk).
+  While one is open and unanswered on the Orchestrator (`orders.untappedFor`), an order it gives (`send_to_chat`, `app_send_to_chat`) is typed as
+  `[message from Assistant on Assistant, chat ..., Quick request (spoken, not tapped), order <id>]` (spoken wins over typed; `, order <id>]` stays last).
+  His tap on a held message is his own: no mark. **NOT marked, a known limitation kept on purpose (Lead, 16 Nov):** an order given in a later turn,
+  after the request was answered (for example reacting to a worker's reply). It is the Orchestrator's own judgement rather than a relay of his untapped
+  words, so the provenance attenuates rather than being lost; the six risky actions need his word whatever a mark says; and turn tracking to chase a
+  weakening signal would cost more than it protects. Design against a real case if one appears.
+- **An unreadable setting fails safe, visibly** (Lead, 16 Nov): `quick-settings.json` and `quick-forwarding.json` behave ALIKE on purpose. A MISSING file
+  is his not-yet-made choice: the default (on). An UNREADABLE one (any other read error, not JSON, not the one boolean, a folder at the path) is a choice
+  we cannot know: each goes to its own safe state (keep-running: off, the old open + 10 minutes; forwarding: the card), the answer carries
+  `unreadable: true`, Settings › Assistant shows a notice and the hub logs a warning, until his next choice rewrites the file (even when it equals the
+  safe value in force). A save that fails changes nothing. Keep the two alike: never "fix" one back alone.
 
 ## Order o5007: the old-app reader (`/old`; hub side)
 
@@ -2712,7 +2776,7 @@ Every PC's own agent can share some or all of the ports its programs listen on, 
 - **Only its own entries**: the agent changes only the `serve` entries it made (kept in `<state>/agent/ports/state.json`); an entry that points elsewhere (80, 443, 4740, the phone gate's, the Drive's) is never touched and shows read-only (`sharedBy: gate|other`). Never `serve reset`, never Funnel. After a restart its own entries are found again and repaired to the new gate port.
 - **Links never lie**: `PortShare.ipUrl` is http only where nobody does TLS in front of the gate; where Tailscale does the TLS (the phone gate's ports, other entries, `tlsBy: tailscale`) it is https with `ipUrlWarns`.
 - **The Server button**: the hub puts `ports` (`PortsHello`) in its hello and sends a `ports` message when it changes; a member keeps it (`PortsState.server`); an older hub sends none and the member shows only the saved tailnet name.
-- **Systems**: Windows' scanners are netstat and the process table. Linux's (F-116, `ports/scan-linux.ts`) read /proc and run nothing: listeners from `/proc/net/tcp` and `tcp6` (with each socket's uid and inode), the PID behind a socket through `/proc/<pid>/fd` of this account's own processes, and each process's name from its program file (`exe`; Node calls itself "MainThread" in comm). Any other system passes `net`/`procs` to `createPorts` or Ports says it has no scanner there yet.
+- **Systems**: Windows' scanners are netstat and the process table. Linux's (F-116, `ports/scan-linux.ts`) read /proc and run nothing: listeners from `/proc/net/tcp` and `tcp6` (with each socket's uid and inode), the PID behind a socket through `/proc/<pid>/fd` of this account's own processes, and each process's name from its program file (`exe`; Node calls itself "MainThread" in comm). Any other system passes `net`/`procs` to `createPorts` or Ports says it has no scanner there yet. Tests (`ports/linux.test.ts`, on a pretend /proc): the real case makes `/proc/<pid>/fd` symlinks and so runs only where a test may make them (the Z800; the Windows runner skips it, EPERM). A second case runs the same fd walk and its `socket:[inode]` parsing everywhere through `linuxScanners`' optional `readlink` and `uid` (16 Nov, self-skip Stage 2, decision B); the product's one caller passes neither, and that case is not proof that real /proc links are read.
 - **Linux's own ports (F-116)**: a socket of a system account (uid < 1000, or 65534 nobody; never the agent's own non-root uid) or of a known system service (systemd, sshd, cupsd, avahi-daemon, snapd, containerd ...) gets the `windows` reason, worded for both systems. A socket whose PID can't be read (another account's) has `pid: null` and `program: null` in `ListeningPort`, so Share all never takes it.
 - **Tailscale rights on Linux (F-116)**: `tailscale serve` and `tailscale cert` work only for root or Tailscale's operator. Ports reads `tailscale debug prefs` (OperatorUser) with the node's facts, once a minute; when this user is neither, `PortsState.tailscaleRights` = {text, command: `sudo tailscale set --operator=$USER`} and the page shows that one line to run once (the app never runs sudo). status and whois work without it. The field is absent on Windows.
 - **Plain http by name goes to https (F-117, 5 Nov 2026)**: a browser does not upgrade `http://<name>:5173` by itself, and a Tailscale-terminated port cannot answer plain http at all (curl 52 "Empty reply"). On a share where the agent does the TLS (`tlsBy: agent`, certificate loaded) the gate answers plain http whose Host is this PC's NAME (full or short, any case, trailing dot) with **308** to `https://<full name>:<port><same path and query>` (`Cache-Control: no-store`; a POST keeps its method and body); a WebSocket upgrade over http-by-name gets **426** with the wss address that works. A Host that is a bare IP (v4 or [v6]) stays plain http, and a name that is not this PC's is served as before. **No HSTS**: it is per host, not per port, so it would break http on every other port of the name (80, the old way's ports) and stick in browsers after the setting is switched off. `PortsState.httpRedirect {on, active}` (setting `redirectHttp`, default on; `active` = on + tlsBy agent + gate up + certificate loaded). `tlsBy: tailscale` is unchanged and has no redirect (and no plain http). Every Ports settings change is written to the agent log as `setting changed: <key> <old> -> <new>`.
@@ -2910,8 +2974,9 @@ Resources (a phone's tab says "Deps"). READ ONLY: no install button; an install 
   or person), worked out from that PC (its Node folder and version, the app folder, a lock file or not). Agent 6's installer (order o20e2) imports
   this table rather than keeping a copy. The page shows each as text to copy, with what it needs; nothing is run from it.
 - **Whisper as a dependency (F-251, Windows x64; Linux waits for its own approval).** Both Whisper rows' fix is the app's own installer for
-  that PC, `node <app>\agent\scripts\fetch-whisper.ts --part program|model` (agent/whisper-install), and Install.ps1 runs it with
-  `--part all` as its last step, after the app is up (`-NoWhisper` skips it; a failure never fails the install). Update.cmd does not: an
+  that PC, `& node '<app>\agent\scripts\fetch-whisper.ts' --part program|model --model '<model>'` in PowerShell, `<model>` being
+  SAD_WHISPER_MODEL or small (agent/whisper-install). Install.ps1 runs it with `--part all` (the same model) as its last step, after the
+  app is up (`-NoWhisper` skips it; a failure never fails the install). Update.cmd does not: an
   update restarts the app, and a 497 MB download there would hold it down. Pinned (manifest.ts): whisper.cpp b5454 (1.9.5)
   `whisper-bin-x64.zip` and `ggml-small.bin` at a fixed revision, each by size and SHA-256, and the program's 41 files each by SHA-256
   (payloads.ts; its whisper-server.exe is the Server's own). **Missing only:** it adds what is not there and keeps whatever is (another

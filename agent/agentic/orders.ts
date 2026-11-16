@@ -101,7 +101,18 @@ export interface HandOffOptions {
    * "could not take it" (409), as before T2.
    */
   unsure?: boolean
+  /**
+   * oc58f follow-up (Agent 3's B2): Quick passed the request on by itself, from his voice or his typing, and he did not tap it (Order.untapped).
+   * While such an order is open, an order the Orchestrator gives another chat carries that origin in its marker (untappedFor).
+   */
+  untapped?: Untapped
 }
+
+/** oc58f follow-up: how a request Quick passed on by itself began (never his tap). */
+export type Untapped = 'spoken' | 'typed'
+
+/** The words an order's marker carries for an untapped origin, right before ", order <id>]" (that stays last: scanMessages and turns.ts). */
+export const untappedMark = (u: Untapped) => `Quick request (${u}, not tapped)`
 
 export interface OrderView {
   orderId: string
@@ -158,6 +169,11 @@ export interface Order {
    * is closed only when its line can no longer run (its turn ended, the chat stopped, or the line never entered and the box is empty), never by a clock.
    */
   spoken?: boolean
+  /**
+   * oc58f follow-up (B2): a request Quick passed on by itself (HandOffOptions.untapped), or an order the Orchestrator gave while one was open. Kept
+   * on disk with the order. It never holds tools; it only travels in the marker of the orders given while it is open (untappedFor).
+   */
+  untapped?: Untapped
   /** F-221 (fix round 2): he let its hold go (Let go): the chat's tools are its own again; the order still answers. */
   letGo?: boolean
   /**
@@ -319,9 +335,19 @@ export interface Orders {
    * line and whether it is his spoken words, not tapped. F-221 (fix round 3): true when it is saved on disk (or there is no file to save it in);
    * false when the save did not land: a spoken line is then not typed at all (its hold would not survive a restart of the agent).
    */
-  open(id: string, from: string, to: OrderTarget, text: string, extra?: Pick<Order, 'kind' | 'origin' | 'queued' | 'direct' | 'spoken'>): boolean
+  open(id: string, from: string, to: OrderTarget, text: string, extra?: Pick<Order, 'kind' | 'origin' | 'queued' | 'direct' | 'spoken' | 'untapped'>): boolean
   /** The marker the message carries so the transcript shows where the order began. */
   marker(id: string): string
+  /**
+   * oc58f follow-up (B2): whether a chat is still working on a request Quick passed on by itself: an order TO that chat, marked untapped and not yet
+   * answered. 'spoken' wins over 'typed' (his voice may be misheard); null when none. An order that chat gives meanwhile carries it in its marker.
+   *
+   * KNOWN LIMITATION, kept on purpose (Lead, 16 Nov), not a to-do: an order given in a LATER turn, after the request was answered (for example the
+   * Assistant reacting to a worker's reply), is NOT marked. That order is the Assistant's own judgement rather than a relay of his untapped words, so
+   * the provenance attenuates rather than being lost; publish, Update, delete, pay, approve and send-as-him need his own word whatever a mark says;
+   * and turn tracking here to chase a weakening signal would cost more than it protects. If a real case shows it matters, design against that case.
+   */
+  untappedFor(sessionId: string): Untapped | null
   /** F-087: one order by id (a copy), for order_status. */
   get(id: string): Order | null
   /**
@@ -351,6 +377,7 @@ export interface Orders {
 }
 
 const makeId = () => `o${randomBytes(2).toString('hex')}`
+const isUntapped = (v: unknown): v is Untapped => v === 'spoken' || v === 'typed'
 
 export function createOrders(deps: OrderDeps): Orders {
   let orders: Order[] = load(deps.file)
@@ -690,10 +717,16 @@ export function createOrders(deps: OrderDeps): Orders {
     },
     open(id, from, to, text, extra) {
       // A second order to the same agent in the same turn is its own order: each has its own marker.
-      orders.push({ id, from, to, at: deps.now(), gist: text.replace(/\s+/g, ' ').trim().slice(0, 120), ...(extra?.kind ? { kind: extra.kind } : {}), ...(extra?.origin ? { origin: extra.origin } : {}), ...(extra?.queued ? { queued: true } : {}), ...(extra?.direct ? { direct: true } : {}), ...(extra?.spoken ? { spoken: true } : {}) })
+      orders.push({ id, from, to, at: deps.now(), gist: text.replace(/\s+/g, ' ').trim().slice(0, 120), ...(extra?.kind ? { kind: extra.kind } : {}), ...(extra?.origin ? { origin: extra.origin } : {}), ...(extra?.queued ? { queued: true } : {}), ...(extra?.direct ? { direct: true } : {}), ...(extra?.spoken ? { spoken: true } : {}), ...(isUntapped(extra?.untapped) ? { untapped: extra.untapped } : {}) })
       return save()
     },
     marker: id => `order ${id}`,
+    untappedFor(sessionId) {
+      // Read from disk too (a restart keeps it): only the two known words count, anything else is ignored.
+      const open = orders.filter(o => o.to.sessionId === sessionId && !o.pending && isUntapped(o.untapped))
+      if (open.some(o => o.untapped === 'spoken')) return 'spoken'
+      return open.length ? 'typed' : null
+    },
     get: id => {
       const o = orders.find(x => x.id === id)
       return o ? { ...o } : null

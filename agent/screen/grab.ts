@@ -19,7 +19,7 @@ export interface KeyGrab {
   close(): void
 }
 
-export function createKeyGrab(o: { log: Logger; postThreadMessage(thread: number, message: number): boolean; injected?: 'skip' | 'only' }): KeyGrab {
+export function createKeyGrab(o: { log: Logger; postThreadMessage(thread: number, message: number): boolean }): KeyGrab {
   const log = o.log
   let worker: Worker | null = null
   let thread: Promise<number> | null = null
@@ -36,7 +36,7 @@ export function createKeyGrab(o: { log: Logger; postThreadMessage(thread: number
   function start(): Promise<number> {
     if (thread) return thread
     const w = (worker = new Worker(new URL('./grab-worker.ts', import.meta.url), {
-      workerData: { codes: [...codesByScan(WIN_SCANCODE)], injected: o.injected ?? 'skip' },
+      workerData: { codes: [...codesByScan(WIN_SCANCODE)] },
     }))
     const t = new Promise<number>((resolve, reject) => {
       const gone = (why: string) => {

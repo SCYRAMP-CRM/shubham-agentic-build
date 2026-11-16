@@ -22,7 +22,31 @@ export interface BuildVersion {
   chatHost?: { protocol: number; version: number } | null
   /** F-126: SHA-256 of the CRM drive host (crm-fs/crm-fs.exe) this build ships; absent when the publishing PC could not build it. The agent checks the exe against it before starting it. */
   crmFsSha256?: string
+  /** obcbd: the checks decision that produced this artifact (absent in older builds). */
+  publishAudit?: PublishAudit
 }
+
+export type PublishChecks = 'full' | 'skip'
+export interface PublishActor {
+  kind: 'owner' | 'lead'
+  id: string
+  name: string
+}
+export interface PublishAudit {
+  checks: PublishChecks
+  by: PublishActor
+  at: string
+}
+export interface PublishRecord {
+  id: string
+  audit: PublishAudit
+  startedAt: string
+  endedAt: string | null
+  outcome: 'running' | 'published' | 'unchanged' | 'failed'
+  version: string | null
+  error: string | null
+}
+export const SKIP_TESTS_WARNING = 'No tests will run. Types, lint, themes, frontend, backend and try-it smoke checks will all be skipped. The app must still compile before it can be published.'
 
 export type UpdateState = 'unknown' | 'checking' | 'up-to-date' | 'available' | 'failed'
 export type PublishState = 'idle' | 'running' | 'done' | 'failed'
@@ -72,11 +96,17 @@ export interface BuildInfo {
     /** What the last publish that worked published. */
     published: BuildVersion | null
     error: string | null
+    /** Persisted attempts, newest first; records skipped checks even if compilation fails. */
+    history?: PublishRecord[]
   } | null
 }
 
 /** POST /build/publish */
 export interface PublishRequest {
-  /** Skip the type-check, lint and tests (a minute or two) for a quick rebuild. */
+  /** Missing means full. Never persisted as the next publish's preference. */
+  checks?: PublishChecks
+  /** Required on every skip request, after the explicit warning. Only the owner's own page may skip (obcbd); the machine channel is refused. */
+  confirmSkipTests?: boolean
+  /** Old full-check clients can still send false; true is refused, never a bypass. */
   skipChecks?: boolean
 }

@@ -5,13 +5,14 @@ import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { supervise, type Running, type Supervisor } from '../guard/supervisor.ts'
 import type { AnswerSource } from '../../shared/fast.ts'
-import { heardNote } from './fast-brief.ts'
+import { heardNote, SPOKEN_NOTE } from './fast-brief.ts'
 import { createMemoryGate, type GateView, type MemSample, type MemoryGate } from './fast-gate.ts'
+import type { QuickHistory } from './quick-history.ts'
 
-// F-087: the fast Assistant's process. It is NOT a chat: no terminal, no floor, no transcript file. One hidden
+// F-087: the fast Assistant's process. No terminal or floor. oc65c: Quick's app-owned per-person JSONL outlives every process. One hidden
 //   claude -p --input-format stream-json --output-format stream-json ...
-// per hub, a child of the agent (so Update ends it and it keeps nothing: the hub keeps the last turns and puts them in the
-// brief when it starts again). Modelled on the voice agent of agentic-claude-manager-build (read, never run), with this
+// per hub, a child of the agent (Update ends the process, never its journal; bounded recent context is restored from that journal).
+// Modelled on the voice agent of agentic-claude-manager-build (read, never run), with this
 // app's rules on top:
 //   - supervised with the guard's supervise() (backoff 0/2/5/10/20/30 s, an init timeout, a hung check);
 //   - o1cfa: the owner's Keep Quick running preference can keep this host warm without an open overlay/phone session;
@@ -66,6 +67,13 @@ export interface FastAsk {
    * and the history records that answer as cut off, with only these words.
    */
   heard?: string
+  /**
+   * F-221 (odcd9): he said it aloud in live talk (fast.ts, Lead's gate: via voice, the web's socket, a start that said talk); left out otherwise
+   * (typed, the Alt+K bar, the classic page, Chris: see fast-brief.ts SPOKEN_NOTE). The turn carries a fixed note of it right
+   * in front of his words (fast-brief.ts SPOKEN_NOTE), each time it is written: only then does the brief have Quick say one short line before a
+   * tool. His words alone are kept as his (the history), and a note turn (deliver: the hub's own o: turns) never carries it.
+   */
+  spoken?: boolean
 }
 
 export interface BriefContext {
@@ -77,6 +85,8 @@ export interface BriefContext {
 
 export interface FastDeps {
   now(): number
+  /** oc65c: durable per-person Quick history. The old-app reader is a different host and does not use it. */
+  history?: QuickHistory
   /** Usage (agent/usage): each turn's cumulative cost for this claude process. The totals only: no text, no token. Optional. */
   onCost?(r: { launchId: string; sessionId: string; totalCostUsd: number; at: number }): void
   spawn(file: string, args: string[], o: { cwd: string; env: NodeJS.ProcessEnv }): ChildProcess
@@ -198,10 +208,14 @@ interface Rec {
   snapshot: string | undefined
   /** F-221: what he heard of the answer before this one (a note goes in front of the turn). */
   heard: string | undefined
+  /** F-221 (odcd9): he said it aloud (SPOKEN_NOTE goes in front of his words). */
+  spoken: boolean
   /** F-221 (fix round 2): its place among the turns written to the process it was last written to (Proc.writes): after a cut or before it. */
   seq?: number
   attempts: number
   said: string
+  /** odcd9 (review): a text block of it has started and none of its words has come yet (they are kept apart from the words before: apart). */
+  textStart?: boolean
   startedAt: number
   /** When it first said a word (ms since the epoch), for the time to first token. */
   firstAt: number | null
@@ -241,6 +255,12 @@ interface Proc {
 
 const STDERR_KEEP = 2000
 const toolShort = (name: unknown) => (typeof name === 'string' ? name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '').slice(0, 80) : 'tool')
+/**
+ * odcd9 (review): words that follow words already said, with no space between them, get one in front. A tool turn's answer is a text block of the
+ * next message (after the tool's result), and its first words bring no space of their own: without this the lead-in and the answer ran together
+ * ("One moment.Lead and Web are running.") in done.text, the history, and what a client joins of the deltas (the bar's reply, Chris's text).
+ */
+const apart = (said: string, text: string) => (said !== '' && !/\s$/.test(said) && !/^\s/.test(text) ? ` ${text}` : text)
 
 /** Plain words for a failed turn (what the reference does too): never the raw error. */
 export function errorWords(result: { result?: unknown; errors?: unknown; subtype?: unknown }): { status: number; message: string } {
@@ -277,6 +297,11 @@ export function createFastHost(deps: FastDeps): FastHost {
   /** Which processes each turn was written to (so a restarted one gets it again, and the same one never twice). */
   const sentTo = new Map<string, string[]>()
   const history: BriefContext['history'] = []
+  // oc65c, fail-closed for the rest of this app run: nothing clears historyFailed, not even a later write that would succeed. The host is made once
+  // per app run, so only an app restart or an Update brings Quick back. The words say so, so he is told rather than finding it off on his own.
+  let historyFailed = false
+  const historyErrors = new Set<string>()
+  const HISTORY_FAILED = 'Quick could not save its conversation, so it stays off until the app restarts (an Update or a restart brings it back). Nothing new was sent or marked complete. Check the disk that holds its history.'
   let sup: Supervisor | null = null
   let proc: Proc | null = null
   let state: Internal = 'off'
@@ -365,17 +390,34 @@ export function createFastHost(deps: FastDeps): FastHost {
     turns.delete(r.id)
     sentTo.delete(r.id)
     try {
-      r.emit(f)
+      emitFrame(r, f)
     } catch {
       // A listener that throws must not stop the host.
     }
   }
 
+  function emitFrame(r: Rec, f: FastFrame) {
+    try {
+      if (historyFailed) throw new Error(HISTORY_FAILED)
+      deps.history?.frame(r.uuid, f)
+    } catch {
+      if (!historyErrors.has(r.uuid)) { historyErrors.add(r.uuid); try { r.emit({ t: 'error', id: r.id, status: 507, message: HISTORY_FAILED }) } catch { /* Page gone. */ } }
+      if (!historyFailed) { historyFailed = true; void sleep('failed', HISTORY_FAILED) }
+      return
+    }
+    try { r.emit(f) } catch { /* A closed page never ends the durable conversation. */ }
+  }
+
   function writeTurn(p: Proc, r: Rec): boolean {
     r.attempts++
-    // The snapshot goes in front only when this process has not been given this one. F-221: so does the note of what he heard of the last answer.
+    // The snapshot goes in front only when this process has not been given this one. F-221: so does the note of what he heard of the last answer;
+    // odcd9: and last, right in front of his words, the note that he said them aloud.
     const withSnap = r.snapshot !== undefined && r.snapshot !== p.snapshot
-    const front = [...(withSnap ? [{ type: 'text', text: r.snapshot }] : []), ...(r.heard ? [{ type: 'text', text: heardNote(r.heard) }] : [])]
+    const front = [
+      ...(withSnap ? [{ type: 'text', text: r.snapshot }] : []),
+      ...(r.heard ? [{ type: 'text', text: heardNote(r.heard) }] : []),
+      ...(r.spoken ? [{ type: 'text', text: SPOKEN_NOTE }] : []),
+    ]
     const content = front.length ? [...front, { type: 'text', text: r.text }] : r.text
     const ok = send(p, { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, uuid: r.uuid })
     if (ok) {
@@ -424,6 +466,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     } catch {
       return
     }
+    try { deps.history?.native(p.sid, m) } catch { historyFailed = true; void sleep('failed', HISTORY_FAILED); return }
     switch (m.type) {
       case 'control_response':
         return onControlResponse(p, m)
@@ -515,18 +558,22 @@ export function createFastHost(deps: FastDeps): FastHost {
       p.blocks.set(ev.index, kind)
       if (kind === 'tool_use') {
         const name = toolShort(ev.content_block?.name)
-        r.emit({ t: 'tool', id: r.id, name, label: deps.toolLabel?.(name) ?? name })
+        emitFrame(r, { t: 'tool', id: r.id, name, label: deps.toolLabel?.(name) ?? name })
       }
+      // odcd9 (review): its first words are kept apart from the words said before it (apart).
+      if (kind === 'text') r.textStart = true
       return
     }
     if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && typeof ev.delta.text === 'string' && ev.delta.text) {
       p.msgStreamed = true
       r.firstAt ??= deps.now()
-      r.said += ev.delta.text
-      r.emit({ t: 'delta', id: r.id, text: ev.delta.text })
+      const text = r.textStart ? apart(r.said, ev.delta.text) : ev.delta.text
+      r.textStart = false
+      r.said += text
+      emitFrame(r, { t: 'delta', id: r.id, text })
       return
     }
-    if (ev.type === 'content_block_stop' && typeof ev.index === 'number' && p.blocks.get(ev.index) === 'text') r.emit({ t: 'flush', id: r.id })
+    if (ev.type === 'content_block_stop' && typeof ev.index === 'number' && p.blocks.get(ev.index) === 'text') emitFrame(r, { t: 'flush', id: r.id })
   }
 
   // A whole message with no stream before it (the process did not stream this one).
@@ -545,9 +592,11 @@ export function createFastHost(deps: FastDeps): FastHost {
       .trim()
     if (!text) return
     r.firstAt ??= deps.now()
-    r.said += (r.said ? ' ' : '') + text
-    r.emit({ t: 'delta', id: r.id, text })
-    r.emit({ t: 'flush', id: r.id })
+    // odcd9 (review): the delta carries the space the turn's text keeps (apart), so what a client joins of the deltas is done.text.
+    const piece = apart(r.said, text)
+    r.said += piece
+    emitFrame(r, { t: 'delta', id: r.id, text: piece })
+    emitFrame(r, { t: 'flush', id: r.id })
   }
 
   function onResult(p: Proc, m: Record<string, unknown>) {
@@ -639,8 +688,16 @@ export function createFastHost(deps: FastDeps): FastHost {
     mkdirSync(deps.dir, { recursive: true })
     const room = path.join(deps.dir, 'room')
     mkdirSync(room, { recursive: true })
-    sweepOld()
     const sid = randomUUID()
+    if (historyFailed) throw new Error(HISTORY_FAILED)
+    if (deps.history) {
+      // The provider session is disposable; its process ID is chained in the stable journal, never substituted for it.
+      try {
+        if (!history.length) history.push(...deps.history.context())
+        deps.history.process(sid)
+      } catch { historyFailed = true; setState('failed', HISTORY_FAILED); throw new Error(HISTORY_FAILED) }
+    }
+    sweepOld()
     const key = `sad_fast_${randomBytes(24).toString('hex')}`
     const model = modelPin
     const names = deps.names?.() ?? 'old'
@@ -800,11 +857,18 @@ export function createFastHost(deps: FastDeps): FastHost {
   }
 
   function add(turn: FastAsk, kind: 'user' | 'note', emit: (f: FastFrame) => void): { ok: true } | { ok: false; reason: string } {
+    if (historyFailed) return { ok: false, reason: HISTORY_FAILED }
     if (stopped) return { ok: false, reason: 'The Assistant is off.' }
     if (state === 'paused' || state === 'failed' || state === 'off' || !sup) return { ok: false, reason: reason ?? 'The Assistant is not running.' }
     const model = turn.model ?? modelPin
     const heard = kind === 'user' && turn.heard?.trim() ? turn.heard.trim() : undefined
-    const r: Rec = { id: turn.id, uuid: randomUUID(), text: turn.text, kind, model, emit, snapshot: turn.snapshot, heard, attempts: 0, said: '', startedAt: deps.now(), firstAt: null }
+    // F-221 (odcd9): his ask only, never a note turn (the hub's own o: turns).
+    const spoken = kind === 'user' && turn.spoken === true
+    const r: Rec = { id: turn.id, uuid: randomUUID(), text: turn.text, kind, model, emit, snapshot: turn.snapshot, heard, spoken, attempts: 0, said: '', startedAt: deps.now(), firstAt: null }
+    try {
+      deps.history?.ask(r)
+      if (heard) deps.history?.heard(heard)
+    } catch { historyFailed = true; void sleep('failed', HISTORY_FAILED); return { ok: false, reason: HISTORY_FAILED } }
     // A turn still running is cut off by this one (a note never cuts anything off: it waits its turn).
     const interrupted = kind === 'user' ? cutOff([...turns.values()]) : false
     // F-221 (ob98a): the answer he spoke over is kept as he heard it (after the cut above, so a turn cut by this very ask counts).
@@ -832,6 +896,7 @@ export function createFastHost(deps: FastDeps): FastHost {
 
   return {
     async open(who) {
+      if (historyFailed) return { ok: false, reason: HISTORY_FAILED }
       if (stopped) return { ok: false, reason: 'The Assistant is off.' }
       owners.add(who)
       idleEndsAt = null
@@ -854,6 +919,7 @@ export function createFastHost(deps: FastDeps): FastHost {
       }
       wake(`opened by ${who}`)
       await sup?.tick()
+      if (historyFailed) return { ok: false, reason: HISTORY_FAILED }
       return { ok: true }
     },
     close(who) {
@@ -878,6 +944,12 @@ export function createFastHost(deps: FastDeps): FastHost {
     keyOwns: key => !!proc && !proc.dead && proc.key === key,
     async tick() {
       if (stopped) return
+      // oc65c: a Quick history that could not be saved dominates every demand, Keep Quick running included. A supervisor left behind (a start
+      // that could not be chained into the journal) is stopped, and nothing is started, retried or relabelled (a memory pause) after it.
+      if (historyFailed) {
+        if (sup) await sleep('failed', HISTORY_FAILED)
+        return
+      }
       const now = deps.now()
       const nextKeepRunning = deps.keepRunning?.() === true
       if (nextKeepRunning !== keepRunning) {

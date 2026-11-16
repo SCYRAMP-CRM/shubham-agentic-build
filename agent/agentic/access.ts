@@ -88,6 +88,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['DELETE', /^\/accounts\/vars\/([^/]+)$/, OWNER],
   ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
+  ['GET', /^\/fast\/forwarding$/, OWNER],
+  ['PUT', /^\/fast\/forwarding$/, OWNER],
   ['POST', /^\/fast\/names$/, OWNER],
   ['GET', /^\/fast\/settings$/, OWNER],
   ['PUT', /^\/fast\/settings$/, OWNER],
@@ -180,6 +182,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/staff\/preflight$/, OWNER],
   // Order oa09e: his overlay Assistant (the hub's Orchestrator), found or made by the hub from its whole list. His only (not in Settings › Access).
   ['POST', /^\/assistant$/, OWNER],
+  // The handler returns only this person's own bindings and journal, not shared chats or arbitrary files.
+  ['GET', /^\/assistant-history$/, SIGNED],
   ['GET', /^\/tasks$/, OWNER],
   ['POST', /^\/tasks$/, OWNER],
   ['PATCH', /^\/tasks\/([^/]+)$/, OWNER],

@@ -65,11 +65,19 @@ export function listensOf(sockets: ProcSocket[], pidOf: (inode: number) => numbe
 export interface LinuxScanDeps {
   /** /proc; tests give a folder of their own. */
   root?: string
+  /**
+   * Tests: how a link is read (node's readlink): /proc/<pid>/fd/<n> -> socket:[inode] in the fd walk, and /proc/<pid>/exe. A test on a
+   * PC that cannot make symlinks (Windows without the right) fakes it, so the walk and its parsing run everywhere.
+   */
+  readlink?: (file: string) => Promise<string>
+  /** Tests: this user's uid (process.getuid). Windows has none, and then no socket counts as this user's and no fd is walked. */
+  uid?: number
 }
 
 /** The two scanners for Linux. The inode -> PID map is kept between scans, so a port that stays does not cost a walk of every process's files again. */
 export function linuxScanners(d: LinuxScanDeps = {}): { net: NetScan; procs: ProcScan } {
   const root = d.root ?? '/proc'
+  const readLink = d.readlink ?? readlink
   const known = new Map<number, number>()
 
   async function socketsNow(): Promise<ProcSocket[]> {
@@ -86,7 +94,7 @@ export function linuxScanners(d: LinuxScanDeps = {}): { net: NetScan; procs: Pro
       const fds = await readdir(path.join(root, name, 'fd')).catch(() => null)
       if (!fds) continue
       for (const fd of fds) {
-        const link = await readlink(path.join(root, name, 'fd', fd)).catch(() => '')
+        const link = await readLink(path.join(root, name, 'fd', fd)).catch(() => '')
         const m = /^socket:\[(\d+)\]$/.exec(link)
         if (m && wanted.has(Number(m[1]))) {
           known.set(Number(m[1]), Number(name))
@@ -102,7 +110,7 @@ export function linuxScanners(d: LinuxScanDeps = {}): { net: NetScan; procs: Pro
     const live = new Set(sockets.map(s => s.inode))
     for (const inode of [...known.keys()]) if (!live.has(inode)) known.delete(inode)
     // Only sockets that could be ours: a system account's or another person's can't be read anyway.
-    const me = process.getuid?.() ?? -1
+    const me = d.uid ?? process.getuid?.() ?? -1
     await findPids(new Set(sockets.filter(s => s.uid === me && !known.has(s.inode)).map(s => s.inode)))
     return listensOf(sockets, inode => known.get(inode) ?? null)
   }
@@ -116,7 +124,7 @@ export function linuxScanners(d: LinuxScanDeps = {}): { net: NetScan; procs: Pro
         readFile(path.join(dir, 'status'), 'utf8').catch(() => null),
         readFile(path.join(dir, 'cmdline'), 'utf8').catch(() => null),
         readFile(path.join(dir, 'comm'), 'utf8').catch(() => null),
-        readlink(path.join(dir, 'exe')).catch(() => null),
+        readLink(path.join(dir, 'exe')).catch(() => null),
       ])
       if (status === null) continue
       const p = procOf(Number(name), status, cmdline, comm, exe)

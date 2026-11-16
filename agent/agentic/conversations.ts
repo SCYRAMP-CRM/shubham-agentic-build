@@ -272,6 +272,9 @@ const SSH_CALL = callOf('ssh_open|ssh_read|ssh_type|ssh_close')
 /** Order o68f0, slice 2: ui_control typing into the SSH terminal through the screen (ref s1). */
 const UI_IN_SSH = /"ref"\s*:\s*"s\d{1,3}"/
 const privateText = (s: string): boolean =>
+  // oc65c: per-token Quick fragments can split a private marker across rows. The full final/cancelled answer is a separate canonical row;
+  // keep intermediate fragments on the PC only, so a fragment of a private answer cannot bypass the normal full-row checks below.
+  /"type"\s*:\s*"quick-delta"/.test(s) ||
   s.includes(BROWSER_PRIVATE_MARK) ||
   BROWSER_CALL.test(s) ||
   (UI_CALL.test(s) && (UI_IN_BROWSER.test(s) || UI_IN_SSH.test(s))) ||

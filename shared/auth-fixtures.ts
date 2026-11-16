@@ -42,7 +42,7 @@ export function fixtureStatus(me: string | null | undefined, require: AuthRequir
     via,
     person,
     session: person ? { expiresAt: new Date(now + AUTH_SESSION_DAYS * 864e5).toISOString(), idleExpiresAt: new Date(now + AUTH_IDLE_HOURS * 36e5).toISOString() } : null,
-    canPublish: person?.canSeeAll === true,
+    canPublish: person?.id === SBSKRRT_ID, // the agent's rule (auth/index.ts): the owner by id, not canSeeAll
     mayShowCode: person?.canSeeAll === true,
     mayApprove: person?.canSeeAll === true,
     needsSignIn: needs,

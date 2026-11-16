@@ -28,7 +28,7 @@ export type HostResult = { ok: true } | { ok: false; reason: string }
 export interface FastHostLike {
   state(): HostState
   status(): HostStatus
-  ask(turn: { id: string; text: string; model: FastModel; snapshot?: string; heard?: string }, emit: (e: HostEvent) => void): HostResult
+  ask(turn: { id: string; text: string; model: FastModel; snapshot?: string; heard?: string; spoken?: boolean }, emit: (e: HostEvent) => void): HostResult
   interrupt(id?: string): void
   deliver(note: string, turnId: string, emit: (e: HostEvent) => void): HostResult
   /** Claims the process for a client (starts it when memory allows). */
@@ -99,6 +99,8 @@ interface Conn {
   opening: Promise<HostResult> | null
   /** F-221 (ob98a): the HOLD latch (the `hold` frame); it counts only while this connection owns the Assistant. */
   hold: boolean
+  /** F-221 (odcd9, Lead's gate): its last start said it is live talk (`talk: true`); see the ask's `spoken`. */
+  talk: boolean
   /** F-221: the hub's own turns (o:<orderId>) told on this connection and not over yet: the only o: ids its cancel may name. */
   told: Set<string>
 }
@@ -233,6 +235,8 @@ export function createFastSession(deps: FastDeps): FastSession {
       case 'start': {
         if (f.client !== c.kind) return send(c, { t: 'error', status: 400, message: `This socket is for the ${c.kind}; start says ${f.client}.` })
         c.clientId = f.id
+        // F-221 (odcd9, Lead's gate): each start says it again (a reconnect's too); a start without it turns it off.
+        c.talk = f.talk === true
         if (f.model) model = f.model
         // F-221 (review of T2): a reconnect holds as this client did before the blip, and owns that hold from now (fix round 3); it never lowers
         // hold (fix round 2). A plain start begins with this connection's hold off and leaves the client's sticky hold as it is (fix round 3).
@@ -288,6 +292,15 @@ export function createFastSession(deps: FastDeps): FastSession {
         const text = f.text
         const sonnet = f.thorough === true
         const heard = f.heard
+        // F-221 (odcd9): said aloud in live talk, the host tells the model so (fast-host.ts FastAsk.spoken), and only then does Quick say a
+        // short line before a tool; otherwise it is left out and the turn is as before. Lead's gate: all three must hold. Said aloud (via). On
+        // the web's socket: the phone's is told apart by its route, not by anything it sends, so Chris never gets it (its own barge-in has no
+        // handling of that line yet). And on a connection whose start said talk: only live talk sends that (src/talk/session.ts), the one client
+        // that takes his words over the line as over a filler (shared/talk.ts markLeadIn); without it his added words could be dropped or asked
+        // alone. So the Alt+K bar and the classic live page do not get the line either, nor the earlier first sound it brings: neither runs
+        // shared/talk.ts, and the classic page's own barge-in was not checked for it. `via` and `talk` are the client's word, trusted because
+        // this socket is the owner's alone; a client that sent talk without that handling would bring the dropped-words risk back on itself.
+        const spoken = f.via === 'voice' && c.kind === 'web' && c.talk
         void (async () => {
           if (c.opening) {
             const o = await c.opening
@@ -307,7 +320,7 @@ export function createFastSession(deps: FastDeps): FastSession {
             if (owner === c) send(c, { t: 'done', id: entry.id, text: '', cancelled: true })
             return
           }
-          const asked = host.ask({ id: entry.id, text, model: sonnet ? 'sonnet' : model, ...(snap ? { snapshot: snap } : {}), ...(heard ? { heard } : {}) }, forward(c, entry.id))
+          const asked = host.ask({ id: entry.id, text, model: sonnet ? 'sonnet' : model, ...(snap ? { snapshot: snap } : {}), ...(heard ? { heard } : {}), ...(spoken ? { spoken: true } : {}) }, forward(c, entry.id))
           if (!asked.ok) {
             active = null
             send(c, { t: 'error', id: entry.id, status: 503, message: asked.reason })
@@ -356,7 +369,7 @@ export function createFastSession(deps: FastDeps): FastSession {
     socket(kind) {
       if (!deps.host) return null
       return ws => {
-        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, told: new Set() }
+        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, told: new Set() }
         conns.add(c)
         send(c, stateFor(c))
         ws.onText(raw => onFrame(c, raw))

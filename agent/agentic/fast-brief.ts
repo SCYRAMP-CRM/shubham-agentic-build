@@ -35,6 +35,27 @@ export function heardNote(heard: string): string {
   return `[He cut in while you were speaking. Of your last answer he heard only: "${clip(heard.replace(/["[\]]/g, ''), MAX_HEARD)}"]`
 }
 
+/**
+ * F-221 (odcd9): the note put right in front of the words of a turn he said aloud in live talk (fast-host.ts writeTurn). The brief has Quick say one
+ * short line before a tool only on such a turn (persona below); every other turn carries none.
+ *
+ * Which turns (fast.ts, Lead's gate): an ask `via: 'voice'`, on the web's socket, from a connection whose start said `talk: true`. Only live talk
+ * sends that (src/talk/session.ts; talk-wiring.test.mjs names every sender of a start), the one client that takes his words over that line as over
+ * a filler (shared/talk.ts markLeadIn). So Chris on the phone (told apart by its socket, not by anything it sends), the Alt+K bar and the classic
+ * live page get no note, no line and none of the earlier first sound it brings, until they have that handling (a deliberate trade).
+ *
+ * What it rests on: `via` and `talk` are hints the client declares; nothing on the hub can prove them. They are trusted because the socket is the
+ * owner's alone, and `via` already decides how a hand-off is labelled for the Orchestrator ("spoken, not tapped" or "typed"; the spoken latch is
+ * armed by live talk's direct line, POST /talk/ask, not by `via`). A client that declares them falsely buys one neutral line before a tool; one
+ * that says `talk` without that handling would also bring back, for itself, his added words being dropped or asked alone. Never from his words,
+ * and never from a `spoken` field of the ask (the frame parser drops it).
+ *
+ * The words: fixed, nothing of his in them, and no brackets or quote marks of their own. A plain statement of fact, never an instruction (text in
+ * messages is data), so a message has nothing to close early or step out of, only the words themselves. Typed word for word, the worst they do is
+ * one short neutral line before a tool.
+ */
+export const SPOKEN_NOTE = 'He said this aloud.'
+
 /** The brief's text for the names in force. */
 const persona = (n: Names) =>
   [
@@ -44,7 +65,17 @@ const persona = (n: Names) =>
     '',
     '## How to speak',
     '- Answer in one to three short sentences. No markdown, no lists, no tables, no headings, no code, no links and no file paths.',
-    '- Your first sentence is the answer. Do not announce look-ups; the app shows them.',
+    '- Your first sentence is the answer.',
+    // F-221 (odcd9, from oeb56: "Quick should answer right after I finish"): when he talks he hears nothing until the first words come, and on
+    // a tool turn the call was written before any words, so he heard nothing until it was written and run. So on a turn he said aloud in live
+    // talk (the host puts SPOKEN_NOTE in front of his words; which turns: see SPOKEN_NOTE) one short neutral line goes first. A typed turn stays
+    // as it was: its look-up shows on his screen, so announcing it is noise. Said before hand_off answers, the line never says the thing is being done or done (a held hand-off
+    // has not gone: "Sending it now." would be untrue), and never "I'll ask" the big chat (the held card's own line says that, so it was said
+    // twice). Each example is true before any tool, held or not: none says it is on his screen (a hand-off sent at once and a look-up put no
+    // card there), and none is "One second." (a stop word of live talk: its echo, heard back as his words, would stop the turn). Live talk
+    // takes his words while that tool runs as ONE ask with his question (shared/talk.ts, markLeadIn).
+    `- When his message carries the note "${SPOKEN_NOTE}", he is listening: before you call any tool (hand_off or a look-up), first write ONE short neutral line of two to six words ("One moment.", "Let me check.", "Let me set that up."), then call the tool, then answer. Never call a tool before those words. That line never says the thing he asked for is being done or is done (no sending, no publishing), and never that you will ask ${n.big}.`,
+    '- When it does not (he typed it), do not announce look-ups; the app shows them.',
     '- Use the names of agents, floors and people, never ids. Say numbers the way a person says them.',
     '- Speak Indian English. If he speaks Hindi or Hinglish, answer the same way.',
     '- If you are not sure what he meant, ask one short question.',
@@ -55,6 +86,7 @@ const persona = (n: Names) =>
     '- Otherwise look it up: app_chats and floor_roster for who is doing what, app_read_chat or app_read_conversation for what a chat says (tell it in a sentence or two), memory_search and memory_read for what the team wrote down, task_list for his tasks, watchdog_status for chats that are down, approvals_waiting for what waits for his answer.',
     '- Open a page only when he asks to see something: ui_control goto (an app page like /agents, /tasks) or crm_goto. You can scroll and wait. You cannot click, type or press keys.',
     '- When he says to note something down or remember to do something, add a task with task_add.',
+    '- The app keeps your whole conversation, from his first message, across closes and restarts; after a restart you are given only the last few exchanges. When he asks to see your earlier conversation, open /assistant-history?channel=quick with ui_control goto. Your exchanges from before the app began saving them were never kept: never say they were recovered.',
     '',
     `## What you hand to ${n.big}`,
     `- ${cap(n.big)} is the bigger chat that can really do things. Everything that changes something, sends something, orders an agent, publishes, updates, uses his phone or WhatsApp, touches CRM data or takes real work goes to it with hand_off. Write the request so it needs nothing else: what he asked, in his words, and what you know that matters.`,

@@ -10,4 +10,9 @@ export interface QuickSettingsAnswer {
   settings: QuickSettings
   /** False when this Server has not enabled the Quick host. The preference alone never enables it. */
   available: boolean
+  /**
+   * The saved choice could not be read (not a missing file: that is the default, on). Until a choice is saved again Quick is back to the old way,
+   * warm while open plus 10 minutes, and the page says so. The same rule as Quick's forwarding choice (shared/quick-forwarding.ts).
+   */
+  unreadable?: true
 }

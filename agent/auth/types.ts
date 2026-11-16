@@ -35,10 +35,12 @@ export function isPageRequest(headers: Record<string, string | string[] | undefi
 }
 
 /**
- * F-119: whether this request may press Publish. A PAGE (a browser: it sends an Origin or fetch metadata, or the page server
- * tagged it as from the tailnet) may only when it is signed in as an admin (sbskrrt): "unsigned, so the open app" does not count,
- * since every tailnet device can open the Server's page. A program on the Server calling with the machine token and no page
- * headers (build-api.mjs) is not a page and keeps working.
+ * F-119: whether this request may press Update (F-173a: main.ts wires it for POST /update and /update-cancel). It was Publish's
+ * rule too until obcbd narrowed Publish to the owner signed in or the machine-token channel (publish-policy.ts publishActor); the
+ * name is older than that. A PAGE (a browser: it sends an Origin or fetch metadata, or the page server tagged it as from the
+ * tailnet) may only when it is signed in as an admin (sbskrrt): "unsigned, so the open app" does not count, since every tailnet
+ * device can open the Server's page. A program on the Server calling with the machine token and no page headers (build-api.mjs)
+ * is not a page and keeps working.
  */
 export function mayPublish(headers: Record<string, string | string[] | undefined>, caller: Caller | undefined): boolean {
   return !isPageRequest(headers) || caller?.person?.canSeeAll === true

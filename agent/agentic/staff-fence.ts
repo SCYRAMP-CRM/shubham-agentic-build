@@ -1,33 +1,23 @@
 import * as nodeFs from 'node:fs'
 import path from 'node:path'
 
-// Order o7e6d, S1 (Agent 3's re-review; Lead's F1 decision of 15 Nov): the staff fence, kept on disk so it outlives the agent (an Update, a crash).
-// A run of a staff Assistant found unsafe (started without the staff policy, or with one this build does not know) is fenced by its session id AND
-// that run's start time (its incarnation): it takes no input and no tool, whatever its floor entry says later (moved, deleted, bound to someone
-// else). The record lives in <state>/staff/fenced.json, private, written atomically, and is read before the chat host's chats are taken over.
-//
-// Failure is never a silent reset:
-//   - fenced.json missing: nothing was ever fenced here;
-//   - fenced.json unreadable or not a fence record: 'bad'. It is left exactly where and as it is (never renamed, removed or rewritten by the app),
-//     and every start reads it again and finds it bad again;
-//   - fenced.poison present: a write of the record began and may not have landed (the marker is written FIRST, durably, and taken away only
-//     after the record is in place): 'dirty';
-//   - bad or dirty, the fence fails CLOSED (F1): every chat taken over without the staff policy is fenced, the owner's too, until it is stopped
-//     and opened again (a new run is judged afresh). Only a person removes a bad file or a stale marker (an explicit, approved action);
-//   - a fence that could not be written at all (not even the marker) holds in memory and is reported (staffPreflight) as not durable.
-// An entry goes only on complete evidence from the chat host's own list of its chats (reconcile): that exact run is not there (it ended), or a
-// newer run of that session is. Never because a floor changed, nor on an incomplete list, a lost link or a timeout.
+// o25c1 C0: provenance, not the old broad S1 verdict, makes a runtime fence. Old fenced.json entries can name an ordinary/non-admin run or
+// an F1/unknown-origin finding. They are UNCLASSIFIED evidence: keep the file byte-for-byte, show it at staff preflight, never infer 'staff'.
+// New, typed evidence is additive, in provenance.json. It names an exact SID + run incarnation and survives rebind/delete. Neither an
+// unreadable record nor an unfinished write freezes an unrelated chat. They hold STAFF ACTIVATION; known unsafe staff runs stay guarded.
 
+export type FenceReason = 'staff' | 'unknown-policy'
 export interface FenceEntry {
   sessionId: string
-  /** The fenced run's start time, as its chat records it (ChatInfo.startedAt). */
+  /** ChatInfo.startedAt, not a mutable floor binding. */
   startedAt: string
   at: string
+  /** Absent on every old generic record. Only independently observed provenance may supply a reason. */
+  why?: FenceReason
 }
-
 export type FenceState = 'ok' | 'bad' | 'dirty'
+export type FenceProblem = 'fence-store-bad' | 'fence-store-dirty' | 'fence-not-durable' | 'fence-unclassified'
 
-/** The file operations the store uses (node:fs; a test hands in failing ones). */
 export interface FenceIo {
   readFileSync(file: string, enc: 'utf8'): string
   writeFileSync(file: string, data: string, opt: { mode: number; flush: boolean }): void
@@ -38,42 +28,38 @@ export interface FenceIo {
 }
 
 export interface FenceStore {
-  /** 'ok', or why it fails closed. */
   state(): FenceState
-  /** True when the store can't be trusted to name every fenced run: fence every taken-over chat without the staff policy. */
-  failClosed(): boolean
-  /** Is this exact run fenced here? */
+  /** Store safety is an activation condition, NEVER a generic runtime-input/tools verdict. */
+  activationBlocked(): boolean
+  /** Evidence exists (including unclassified history); not permission to fence a runtime. */
   has(sessionId: string, startedAt: string): boolean
-  /** Fences this run, durably: the poison marker first, then the record, then the marker goes. A failure leaves it fenced in memory (and dirty). */
-  add(sessionId: string, startedAt: string): void
-  /**
-   * The chat host's complete list of its chats now (session id → that run's start time, or null when its run could not be read): every entry whose
-   * run is not on it, or whose session runs as another (newer) run, goes. Only from a list known complete; nothing else ever removes an entry.
-   */
+  /** Only typed evidence for this exact incarnation. Old generic rows never supply a reason. */
+  reason(sessionId: string, startedAt: string): FenceReason | null
+  /** Poison first, then typed evidence. A failed write retains the reason in memory; a later observation retries it. */
+  add(sessionId: string, startedAt: string, why: FenceReason): void
+  /** Only a COMPLETE authoritative host enumeration may retire an ended/replaced incarnation. Legacy bytes are retained as history. */
   reconcile(hostRuns: ReadonlyMap<string, string | null>): void
-  /** What the preflight shows: the store's own problems (empty when it is sound). */
-  problems(): string[]
-  /** The entries held now (a test reads them). */
+  problems(): FenceProblem[]
   entries(): FenceEntry[]
 }
 
-const FILE = 'fenced.json'
-const POISON = 'fenced.poison'
+const LEGACY = 'fenced.json'
+const LEGACY_POISON = 'fenced.poison'
+const FILE = 'provenance.json'
+const POISON = 'provenance.poison'
 
-function parse(text: string): FenceEntry[] | null {
+function parse(text: string, typed: boolean): FenceEntry[] | null {
   let raw: unknown
-  try {
-    raw = JSON.parse(text)
-  } catch {
-    return null
-  }
+  try { raw = JSON.parse(text) } catch { return null }
   if (!raw || typeof raw !== 'object' || (raw as { version?: unknown }).version !== 1 || !Array.isArray((raw as { runs?: unknown }).runs)) return null
   const out: FenceEntry[] = []
   for (const r of (raw as { runs: unknown[] }).runs) {
     if (!r || typeof r !== 'object') return null
-    const { sessionId, startedAt, at } = r as Record<string, unknown>
+    const { sessionId, startedAt, at, why } = r as Record<string, unknown>
     if (typeof sessionId !== 'string' || !sessionId || typeof startedAt !== 'string' || !startedAt || typeof at !== 'string') return null
-    out.push({ sessionId, startedAt, at })
+    if (typed && why !== 'staff' && why !== 'unknown-policy') return null
+    // Even a reason-looking extra field on the OLD format is not trusted as provenance.
+    out.push({ sessionId, startedAt, at, ...(typed ? { why: why as FenceReason } : {}) })
   }
   return out
 }
@@ -81,93 +67,82 @@ function parse(text: string): FenceEntry[] | null {
 export function createFenceStore(dir: string, o: { io?: FenceIo; now?: () => Date; log?: { warn(m: string): void } } = {}): FenceStore {
   const io: FenceIo = o.io ?? nodeFs
   const now = o.now ?? (() => new Date())
-  const file = path.join(dir, FILE)
-  const poison = path.join(dir, POISON)
-  let entries: FenceEntry[] = []
-  let state: FenceState = 'ok'
-  /** Fences held only in memory: not even the poison marker could be written. */
-  let undurable = false
+  const file = path.join(dir, FILE), poison = path.join(dir, POISON)
+  let legacy: FenceEntry[] = [], typed: FenceEntry[] = []
+  let bad = false, typedBad = false, dirty = false, typedDirty = false, undurable = false, pending = false
 
-  // Read once, at the start, before any chat is taken over.
-  if (io.existsSync(poison)) state = 'dirty'
-  if (io.existsSync(file)) {
-    let text: string | null = null
+  // Both records are read BEFORE adoption. Do not move, delete, repair or reset bad evidence. New definite evidence can still be written
+  // beside a bad legacy file; otherwise a rebinding would lose a KNOWN staff finding just because old history is corrupt.
+  for (const name of [LEGACY_POISON, POISON]) {
     try {
-      text = io.readFileSync(file, 'utf8')
-    } catch {
-      text = null
-    }
-    const parsed = text === null ? null : parse(text)
-    if (parsed === null) state = 'bad'
-    else entries = parsed
+      if (io.existsSync(path.join(dir, name))) { dirty = true; if (name === POISON) typedDirty = true }
+    } catch { bad = true; if (name === POISON) typedBad = true }
   }
-  if (state !== 'ok') o.log?.warn(`staff fence: ${state === 'bad' ? `${file} can't be read as a fence record` : `${poison} is there (a write may not have landed)`}; every chat taken over without the staff policy is fenced until a person clears it`)
+  for (const name of [LEGACY, FILE]) {
+    try {
+      if (!io.existsSync(path.join(dir, name))) continue
+      const parsed = parse(io.readFileSync(path.join(dir, name), 'utf8'), name === FILE)
+      if (parsed === null) { bad = true; if (name === FILE) typedBad = true }
+      else if (name === FILE) typed = parsed
+      else legacy = parsed
+    } catch { bad = true; if (name === FILE) typedBad = true }
+  }
+  if (bad || dirty) o.log?.warn('staff provenance: unreadable evidence or an unfinished write holds staff activation; ordinary chats are not fenced by it')
 
-  /** Written whole to a temporary file (flushed to the disk), then put in place by a rename: never half a file. */
   const atomic = (target: string, data: string) => {
     io.mkdirSync(dir, { recursive: true })
     const tmp = `${target}.${process.pid}.tmp`
     io.writeFileSync(tmp, data, { mode: 0o600, flush: true })
     io.renameSync(tmp, target)
   }
-  const record = () => `${JSON.stringify({ version: 1, runs: entries }, null, 2)}\n`
-
-  /**
-   * The record, written in the poison-marker protocol: the marker first (durably), then the record, then the marker goes, only while the store is
-   * sound. Once dirty (found so at the start, or a write failed here), the marker stays for good: a later good write can't prove nothing was lost,
-   * so every later start fails closed too, until a person clears it. A bad record is never overwritten (it stays the evidence).
-   */
   function persist(): boolean {
-    if (state === 'bad') return false
-    try {
-      atomic(poison, `${JSON.stringify({ at: now().toISOString() })}\n`)
-    } catch {
-      undurable = true
-      return false
+    if (typedBad) { undurable = true; return false }
+    try { atomic(poison, `${JSON.stringify({ at: now().toISOString() })}\n`) }
+    catch { undurable = true; return false }
+    try { atomic(file, `${JSON.stringify({ version: 1, runs: typed }, null, 2)}\n`) }
+    catch { dirty = typedDirty = true; return false }
+    pending = false
+    // A marker found at boot or left by a failed write stays: a subsequent success cannot prove that nothing else was lost. Never touch the
+    // legacy record/marker. Removing only our OWN successful marker does not certify or clear old evidence.
+    if (!typedDirty) {
+      try { io.rmSync(poison, { force: true }) } catch { dirty = typedDirty = true }
     }
-    try {
-      atomic(file, record())
-    } catch {
-      // The marker stays: the next start finds it and fails closed.
-      state = 'dirty'
-      return false
-    }
-    if (state !== 'ok') return true
-    try {
-      io.rmSync(poison, { force: true })
-    } catch {
-      // Left behind: the next start fails closed (a stale marker is cleared only by a person).
-      state = 'dirty'
-    }
+    // A failed FIRST poison write remains an activation problem for this agent lifetime even if an explicit later observation persists it.
     return true
+  }
+  const entries = () => [...legacy, ...typed]
+  const problems = (): FenceProblem[] => {
+    const out: FenceProblem[] = []
+    if (bad) out.push('fence-store-bad')
+    if (dirty) out.push('fence-store-dirty')
+    if (undurable) out.push('fence-not-durable')
+    if (legacy.length) out.push('fence-unclassified')
+    return out
   }
 
   return {
-    state: () => state,
-    failClosed: () => state !== 'ok',
-    has: (sessionId, startedAt) => entries.some(e => e.sessionId === sessionId && e.startedAt === startedAt),
-    add(sessionId, startedAt) {
-      if (entries.some(e => e.sessionId === sessionId && e.startedAt === startedAt)) return
-      entries = [...entries, { sessionId, startedAt, at: now().toISOString() }]
-      if (!persist()) o.log?.warn(`staff fence: chat ${sessionId.slice(0, 8)} is fenced, but the record could not be written (${state === 'bad' ? 'the record is bad' : undurable ? 'not even its marker' : 'the marker stays'})`)
+    state: () => bad ? 'bad' : dirty ? 'dirty' : 'ok',
+    activationBlocked: () => problems().length !== 0,
+    has: (sid, start) => entries().some(e => e.sessionId === sid && e.startedAt === start),
+    reason: (sid, start) => typed.find(e => e.sessionId === sid && e.startedAt === start)?.why ?? null,
+    add(sessionId, startedAt, why) {
+      if (why !== 'staff' && why !== 'unknown-policy') throw new Error('A staff fence needs independently observed provenance')
+      if (!typed.some(e => e.sessionId === sessionId && e.startedAt === startedAt)) {
+        typed = [...typed, { sessionId, startedAt, at: now().toISOString(), why }]
+        pending = true
+      }
+      if (pending && !persist()) o.log?.warn(`staff provenance: chat ${sessionId.slice(0, 8)} is guarded but its typed evidence is not durable; staff activation is held`)
     },
     reconcile(hostRuns) {
-      const keep = entries.filter(e => {
-        if (!hostRuns.has(e.sessionId)) return false
-        const run = hostRuns.get(e.sessionId)
-        return run === null || run === e.startedAt
-      })
-      if (keep.length === entries.length) return
-      entries = keep
-      persist()
+      const live = (e: FenceEntry) => hostRuns.has(e.sessionId) && (hostRuns.get(e.sessionId) === null || hostRuns.get(e.sessionId) === e.startedAt)
+      // Suppress ended legacy findings in this view only. On the next boot the complete enumeration must prove it again; the original bytes
+      // remain intact. A floor move/delete/rebind, disconnection or partial host list is never evidence that an incarnation ended.
+      legacy = legacy.filter(live)
+      const keep = typed.filter(live)
+      if (keep.length !== typed.length) { typed = keep; pending = true }
+      if (pending) persist()
     },
-    problems() {
-      const out: string[] = []
-      if (state === 'bad') out.push('fence-store-bad')
-      if (state === 'dirty') out.push('fence-store-dirty')
-      if (undurable) out.push('fence-not-durable')
-      return out
-    },
-    entries: () => entries.map(e => ({ ...e })),
+    problems,
+    entries: () => entries().map(e => ({ ...e })),
   }
 }

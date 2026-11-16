@@ -96,7 +96,7 @@ export const FEATURES: readonly Feature[] = [
   { key: 'pc-resources', group: 'pc-control', label: 'Resources', blurb: 'Each PC’s CPU, memory, drives and processes, read only.', needs: 'pc-control' },
   { key: 'pc-deps', group: 'pc-control', label: 'Dependencies', blurb: 'What the app needs on each PC and the command that fixes a missing one, read only.', needs: 'pc-control' },
   // The Assistant, voice and talk.
-  { key: 'assistant', group: 'assistant', label: 'Their own Assistant', blurb: 'The Assistant overlay, with each person’s own Assistant (it comes with F-162).' },
+  { key: 'assistant', group: 'assistant', pages: ['/assistant-history'], label: 'Their own Assistant', blurb: 'The Assistant overlay, with each person’s own Assistant (it comes with F-162).' },
   { key: 'voice', group: 'assistant', label: 'Voice typing', blurb: 'Speaking into a chat’s message box (the PC’s speech engine).' },
   { key: 'talk', group: 'assistant', label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to your own Assistant and its orders.' },
   // Settings.
@@ -182,6 +182,7 @@ export const ROUTES: readonly RouteRule[] = [
   // F-162 slice A: a person's own Assistant floor (agent/agentic/own-assistant.ts): read it, and make it on their first open.
   r('GET', `${A}\\/own-assistant`, ['assistant']),
   r('POST', `${A}\\/own-assistant`, ['assistant']),
+  r('GET', `${A}\\/assistant-history`, ['assistant']),
   // PC control: the page, its chats, and the read-only tabs. Order o68f0: SSH (its mount checks each PC: allows(caller, 'pc-ssh', pcId)).
   r('GET', '\\/pc-ssh\\/pcs\\/[^/]+\\/(target|sessions|status)', ['pc-ssh']),
   r('POST', '\\/pc-ssh\\/pcs\\/[^/]+\\/(session|test)', ['pc-ssh']),
