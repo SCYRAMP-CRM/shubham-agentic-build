@@ -1,1 +1,0 @@
-import{i as e,t}from"./react-sySUN5R7.js";var n=e(t(),1);function r(e){return(0,n.useSyncExternalStore)(t=>{let n=matchMedia(e);return n.addEventListener(`change`,t),()=>n.removeEventListener(`change`,t)},()=>matchMedia(e).matches)}var i=`(pointer: coarse), (max-width: 639px)`,a=()=>r(i);export{a as n,r as t};
