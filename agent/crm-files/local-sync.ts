@@ -88,6 +88,12 @@ export interface LocalSyncOptions {
   freeBytes?: (dir: string) => Promise<number>
   /** Where CRM_DRIVE is set for the chats this app starts (default: this process's environment). */
   env?: NodeJS.ProcessEnv
+  /**
+   * Where a link at the folder's place points (default: node's readlink). Only the link's TARGET comes from here; whether the place is a link (lstat) and the move aside (rename)
+   * stay node's own. Tests on Windows give the target a Linux link to the mounted drive has ("/run/user/<uid>/gvfs/..."), the one fact a Windows link cannot hold: Node stores
+   * such a target as "\\?\C:\run\...", and this PC may make junctions but not symlinks.
+   */
+  readlink?: (p: string) => Promise<string>
 }
 
 export interface LocalSync {
@@ -220,7 +226,7 @@ export function createLocalSync(o: LocalSyncOptions): LocalSync {
   async function ready(root: string): Promise<string | null> {
     const st = await lstat(root).catch(() => null)
     if (st?.isSymbolicLink()) {
-      const target = await readlink(root).catch(() => '')
+      const target = await (o.readlink ?? readlink)(root).catch(() => '')
       if (osName === 'linux' && /^\/run\/user\/\d+\/gvfs\//.test(target)) {
         const aside = `${root} (mounted)`
         if (await lstat(aside).catch(() => null)) return `${root} is a link to the mounted CRM drive, and "${aside}" is taken: move one of them, then the folder syncs.`

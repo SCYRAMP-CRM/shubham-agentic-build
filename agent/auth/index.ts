@@ -37,6 +37,8 @@ const IDLE_MS = AUTH_IDLE_HOURS * 60 * 60 * 1000
 const TRIAL_MS = AUTH_TRIAL_SECONDS * 1000
 /** lastSeen is kept in memory; it is written out at most this often. */
 const SAVE_EVERY_MS = 60_000
+/** G1: how often a session past its 7 days or 12 h idle is ended without waiting for its cookie's next request. */
+const SWEEP_EVERY_MS = 60_000
 const FAILS_MAX = 5
 const FAILS_ALL_MAX = 30
 const FAILS_WINDOW_MS = 60_000
@@ -190,6 +192,13 @@ export function createAuth(o: AuthOptions): Auth {
   const fails = new Map<string, number[]>()
   const watchers = new Set<{ c: Caller; end: (why: AuthEnded) => void }>()
   let glass = { at: 0, on: false }
+  // G1 (16 Nov 2026, Agent 3's review): expiry and idle were checked only when the cookie next made a request (or at someone's sign-in), so a
+  // session used only by its sockets outlived 12 h idle and 7 days. This sweep ends it within a minute and tells its sockets. unref: it never
+  // keeps the process alive (`?.` because node:test's mocked setInterval may hand back a timer without it). close() stops it.
+  // A sweep cannot end a session a request is using: caller() refreshes lastSeen synchronously when the request arrives, before any await,
+  // and this timer runs only on a later turn.
+  const sweepTimer = setInterval(sweep, SWEEP_EVERY_MS)
+  sweepTimer.unref?.()
 
   function load(): FileShape {
     try {
@@ -540,6 +549,7 @@ export function createAuth(o: AuthOptions): Auth {
       log?.warn(`auth ${status} ${code}: ${who} ${route.slice(0, 120)}${chatId ? ` chat ${chatId.slice(0, 8)}` : ''}`)
     },
     close() {
+      clearInterval(sweepTimer)
       viewerSessions.clear()
       if (dirty) save()
       watchers.clear()

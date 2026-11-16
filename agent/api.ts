@@ -36,6 +36,7 @@ import { isBlock, type StableChangeRequest, type StableSettingsRequest } from '.
 import type { Auth } from './auth/index.ts'
 import { authRoute } from './auth/routes.ts'
 import type { FeatureAccess } from './auth/feature-access.ts'
+import type { BuildBadge } from '../shared/build.ts'
 import { authError, isPageRequest, OPEN, type Caller } from './auth/types.ts'
 import { routeRule } from '../shared/access.ts'
 import { ROUTES } from './config.ts'
@@ -158,6 +159,8 @@ export interface ApiOptions {
   auth?: Auth
   /** Order o9465: what is open to whom (Settings › Access, agent/auth/feature-access.ts). Left out, a person who is not the owner has what F-118 gave them. */
   access?: FeatureAccess
+  /** Order odb34: this PC's build and any newer one, told to every signed-in person in /auth/status (versions only). */
+  buildBadge?: () => BuildBadge | null
   /** F-057, tests: how often a text WebSocket client is pinged, and how long one may stay silent before it is dropped. */
   wsPingMs?: number
   wsDeadMs?: number
@@ -777,7 +780,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       // Only these two carry a body; sign-out and confirm take none (a bare POST is fine).
       const body = (method === 'POST' && rest === '/auth/sign-in') || method === 'PUT' ? await readJson(req) : undefined
       const secure = typeof req.headers.origin === 'string' && req.headers.origin.startsWith('https:')
-      const answer = await authRoute(o.auth, { method, rest: rest.slice('/auth'.length), query: url.searchParams, body, caller, secure, access: o.access })
+      const answer = await authRoute(o.auth, { method, rest: rest.slice('/auth'.length), query: url.searchParams, body, caller, secure, access: o.access, build: o.buildBadge })
       if (answer) {
         const headers: http.OutgoingHttpHeaders = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
         if (answer.setCookie) headers['Set-Cookie'] = answer.setCookie

@@ -43,6 +43,8 @@
 // elsewhere, 7 days, 12 h unused, signed out everywhere) or the sign-in level is raised past it, the
 // socket first gets {t:'auth', ended: AuthEnded} and is then closed with code 4401.
 
+import type { BuildBadge } from './build.ts'
+
 /** The cookie the agent sets on sign-in: httpOnly, SameSite=Strict, Path=/, Secure over https. */
 export const AUTH_COOKIE = 'sad_session'
 /** Set by the page servers (never by a client) on a request that came over the tailnet; absent for this PC's own browser. */
@@ -105,6 +107,8 @@ export interface AuthStatus {
    * (the owner, the open app, or an agent before Access).
    */
   features?: string[] | null
+  /** Order odb34: this PC's build and any newer one, for a signed-in person (absent for nobody, and from agents before it). */
+  build?: BuildBadge | null
 }
 
 export interface AuthSettings {

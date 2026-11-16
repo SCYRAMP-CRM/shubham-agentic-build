@@ -101,6 +101,17 @@ export interface BuildInfo {
   } | null
 }
 
+/**
+ * Order odb34 (Shubham: "can you give the build icon with update for everyone, so they know an update is available."): what every signed-in
+ * person's page is told about this PC's build, in /auth/status. Versions only: nothing about publishing, Dev, or who may update.
+ */
+export interface BuildBadge {
+  /** The build this PC runs ("2026.11.16-1806"); null when it runs from Dev's source. */
+  current: string | null
+  /** A newer published build this PC has seen (it looks every 15 minutes); null when there is none. */
+  available: string | null
+}
+
 /** POST /build/publish */
 export interface PublishRequest {
   /** Missing means full. Never persisted as the next publish's preference. */

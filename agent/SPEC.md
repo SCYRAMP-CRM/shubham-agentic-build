@@ -44,7 +44,10 @@ punching (never: pure Node on Windows can't).
   certificates come from our own tiny DER builder (Ed25519), with no certificate library.
 - Tests: `node:test` + `node:assert/strict`, files `agent/**/*.test.ts` (and, since F-005,
   `shared/**/*.test.ts`), run with `npm run test:agent`. The slow end-to-end test with real
-  hbbs/hbbr is `agent/test/e2e.ts`, run with `npm run test:e2e`.
+  hbbs/hbbr is `agent/test/e2e.ts`, run with `npm run test:e2e`. It is not named `*.test.ts`, so
+  neither the merge queue nor the skip list sees it, and nothing runs it unless a person does
+  (last logged run: 11 Nov 2026, 12 of 12 on a rerun). `agent/test/rustdesk-server-real.ts` and
+  `agent/test/codex-real.ts` are manual tools of the same kind.
 - Code style: match `src/` and `feature-log.ts`. Short comments that say why. No classes
   where a function will do.
 
@@ -586,7 +589,9 @@ a member leaving a relay has two for a moment). A new TLS peer:
   - No LAN address yet: hbbs stays `stopped`, with that as `lastError`, and starts when the
     LAN poll (every 10 s) finds one. Missing exes: `missing`, looked at again every 30 s.
 - **Run:**
-  - Children are **not** detached, so they die with the agent (tested on Windows).
+  - Children are **not** detached, so they die with the agent (tested on Windows on every merge
+    with fake servers: `rustdesk-server.test.ts`, "they die with the agent"; the real servers
+    only by hand, see the end of this section).
   - Pipe stdout/stderr to `logs/hbbs-YYYYMMDD.log` and `logs/hbbr-YYYYMMDD.log`.
   - Restart with backoff of 1, 2, 5, 10 and 30 s (reset after 60 s running). `restarts`
     counts restarts after a crash; `lastError` keeps the reason until it runs again.
@@ -601,8 +606,15 @@ a member leaving a relay has two for a moment). A new TLS peer:
   `workDir`, `exeDir`, `onChange`, `log` and test-only overrides.
 - Measured on this PC (1.1.16, idle): hbbs about 22 MB, hbbr about 7 MB of RAM; the key,
   mask, local-ip and relay lines appear in the hbbs log within a second.
-- The real-exe test is `agent/hub/rustdesk-server.real.test.ts`, opt-in because it takes
-  21316/21317: `SAD_TEST_REAL_SERVERS=1 node --test agent/hub/rustdesk-server.real.test.ts`.
+- **Nothing in the suite, the merge queue or any schedule starts the real hbbs/hbbr** (decision D
+  for row 7 of the 16 Nov 2026 self-skip audit). The pinned 1.1.16 programs have no bind-address
+  option (`hbbs.exe --help` lists only -c -k --mask -p -r -R -M -s -u, `hbbr.exe --help` only -k -p),
+  so any real run listens on every interface; and no log kept in C:\saw shows the old opt-in test
+  ever running. What does check them: the product itself at every hub start (the key gate, the port
+  gate, `crashed`/`missing` and `lastError` in the status), and `npm run test:e2e` when a person
+  runs it by hand. The old test is kept as a manual tool that nothing runs:
+  `node --test --test-timeout=120000 agent/test/rustdesk-server-real.ts` (needs `npm run setup:hub`;
+  hbbs 21316 and hbbr 21317, or SAD_HBBS_PORT / SAD_HBBR_PORT; every interface).
 
 ## LAN discovery (discovery.ts)
 
@@ -660,6 +672,12 @@ a member leaving a relay has two for a moment). A new TLS peer:
 - `http.createServer` on **127.0.0.1:<api>** only, with the paths and types in
   `shared/agent-api.ts`:
   - `GET  /agent-api/health` → `{ok:true}` (no token)
+  - `POST /agent-api/diag/cpu-profile {"seconds": 1-120, default 30}` (Lead, 16 Nov, the Y: stalls: agent/diag-profile.ts): a
+    CPU profile of the agent's MAIN thread, taken in-process through node:inspector's Session, so NO inspector port is
+    ever opened. For the program on this PC only: the machine token and no page marker (the owner's own pages get 403).
+    OFF unless `<state>/cpu-profile.on` exists (fail-closed). One at a time (409). Writes the whole profile to
+    `<state>/diag/cpu-<time>.cpuprofile` and answers `{file, seconds, samples, top}`, where top is the 15 functions with
+    the most time of their own (name, file:line, ms, %).
   - `GET  /agent-api/state` → `AgentState`
   - `WS   /agent-api/ws` → sends `{type:'state', state}` on connect and on every change,
     debounced to 100 ms. Use the minimal WebSocket server below; no `ws` dependency.
@@ -1278,7 +1296,11 @@ CRM goals, hooks, Skills and MCP are the later phases (features.html › F-018).
 - **What a chat is doing**, from what it prints (ANSI-stripped, whitespace squashed, decided by
   the newest chunk, with 96 characters carried for a split marker): `question` (Enter to confirm,
   Do you want, the trust menu), else `running` (esc to interrupt), else `idle` (· done, ? for
-  shortcuts, auto mode on). Pushed to the page 150 ms after it settles.
+  shortcuts, auto mode on). Pushed to the page 150 ms after it settles. The rendered screen then has
+  the last word (`readTurnState`): a finished line or an Esc's "⎿ Interrupted" is `idle`; a spinner
+  with its running clock ("* Deliberating… (11m 56s · ↓ 68.2k tokens …)") right above the drawn input
+  box is `running` (oea35: Claude 2.1.325 with "bypass permissions on" writes "esc to interrupt"
+  nowhere while it works); a spinner over a question menu or without its clock decides nothing.
 - **Typing into a chat** (`send_to_chat`, `typeWhenReady`): a bracketed paste (the end marker
   stripped from the text), Enter 300 ms later. `typeWhenReady` waits (polling 400 ms, 90 s at most)
   for a prompt on screen and no trust menu, then 800 ms more. A viewer gets the last 256 KB of
@@ -1387,6 +1409,12 @@ says how it is used; this is how it works.
   pushed from `<state>/publish/repo`, reset to `origin/main` first, every file but `.git` replaced,
   committed as Dev's git author (`user.name`, `user.email` from Dev), unless only `RELEASE.json`
   changed. The repo is made (private, with `gh`) when it doesn't exist.
+- **The build icon (order odb34, 16 Nov)**: every signed-in person's `/auth/status` (and the sign-in answer) carries
+  `build: {current, available}`: this PC's build, and a newer published one it has seen (its 15-minute look), or null. These are
+  versions only, from the same `currentBuild`/`newerBuild` the heartbeat uses (`main.ts`, `startApi({buildBadge})`,
+  `auth/routes.ts`). Nobody signed in is told nothing (order oc186), and an agent with no build to tell adds nothing. It
+  grants nothing: `/build/*` stays behind the locked "Build" feature, and `POST /build/update` stays the owner's
+  (`build-badge.test.ts`).
 - **Publish choices (obcbd, superseding o9a09)**: **who may publish is narrowed.** Only the owner (sbskrrt) signed in,
   or the authenticated local machine-token channel, may publish; that channel is a request with no page markers and no
   person (Lead's channel, and every local program's). Before obcbd any administrator's signed-in page could publish,
@@ -1757,7 +1785,8 @@ MB (`GET .../messages` was bounded to its last 8 MB for the same reason).
   `screen(sessionId)` returns its lines. `readMenu(lines)`: the footer ("Enter to select|confirm" or
   "Esc to cancel"), the numbered options above it (with their notes and which one the cursor is on), the
   question and the chip (`☐ Color`); `multi` for boxes to tick. `readStatus(lines)`: the spinner line
-  ("✽ Pollinating… (5s · ↓ 167 tokens)"), only while the footer says "esc to interrupt". The feed polls them
+  ("✽ Pollinating… (5s · ↓ 167 tokens)"), only while the footer says "esc to interrupt" or the spinner shows its
+  running clock right above the drawn input box (oea35, Claude 2.1.325). The feed polls them
   with the file and says a change once. A chat on another PC has no screen here (no menu, no status).
 - **Found in claude 2.1.316** (recordings in `screen.fixture.ts`): in its plain screen it writes an answer in
   one piece when the turn ends (no words stream), the question menu says "Enter to select" (the state
@@ -3031,7 +3060,10 @@ agent, on HTTP, on every WebSocket and in the chats' tools, never only hidden in
   sbskrrt), deleted only by someone who owns every chat on it. `POLICY` lists every route of the agentic table with its rule; a route
   not listed is for sbskrrt only, and `access.test.ts` holds POLICY and the table equal. Lists, `/events`, previews, runs, transcripts
   and the live states are filtered per connection; floors with nothing visible are hidden; a share taken back closes the sharee's open
-  terminal and chat sockets (4403) and a downgrade to view stops their typing at once.
+  terminal and chat sockets (4403) and a downgrade to view stops their typing at once. A socket whose session is no chat's any more (its
+  agent taken off, its floor deleted, its session replaced or cleared) is closed the same way unless its holder is an administrator
+  (sbskrrt): the handshake's own rule, judged again at every floors change (G2). So what such a chat still writes, if it runs on (a stop
+  on another PC that failed), reaches nobody else.
 - **Tools**: `app_chats`, `list_chats` and `floor_roster` list only what the chat's owner may see; reading, typing, stopping, opening and
   setting effort on another chat need the matching right; `agent_hire` makes the hire the owner's; the task list, the phone, the screen,
   WhatsApp, the watchdog and the app's memory are for sbskrrt's chats only.

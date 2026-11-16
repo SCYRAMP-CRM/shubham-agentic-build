@@ -1,4 +1,5 @@
 import type { AuthStatus } from '../../shared/auth.ts'
+import type { BuildBadge } from '../../shared/build.ts'
 import type { FeatureAccess } from './feature-access.ts'
 import type { Auth } from './index.ts'
 import { authError, type Caller } from './types.ts'
@@ -18,6 +19,8 @@ export interface AuthRouteRequest {
   secure: boolean
   /** Order o9465: Settings › Access (what is open to whom); left out (tests, an older wiring), every status says nothing of it. */
   access?: FeatureAccess
+  /** Order odb34: this PC's build and any newer one (agent/build.ts, via main.ts); left out, no status carries it. */
+  build?: () => BuildBadge | null
 }
 
 export interface AuthAnswer {
@@ -31,14 +34,18 @@ export async function authRoute(auth: Auth, r: AuthRouteRequest): Promise<AuthAn
   const { method, rest, caller } = r
   // Order o9465: every status carries the features this person's page shows (null: every one, the owner's).
   const withFeatures = (s: AuthStatus): AuthStatus => (r.access ? { ...s, features: r.access.features({ ...caller, person: s.person }) } : s)
-  if (method === 'GET' && rest === '/status') return { status: 200, data: withFeatures(auth.status(caller)) }
+  // Order odb34: a signed-in person's status also says which build this PC runs and whether a newer one is out (versions only). Nobody signed
+  // in is told nothing (order oc186: logged out is nothing).
+  const withBuild = (s: AuthStatus): AuthStatus => (r.build && s.person ? { ...s, build: r.build() } : s)
+  const told = (s: AuthStatus) => withBuild(withFeatures(s))
+  if (method === 'GET' && rest === '/status') return { status: 200, data: told(auth.status(caller)) }
   if (method === 'POST' && rest === '/sign-in') {
     const done = await auth.signIn(caller, r.body, r.secure)
-    return { status: 200, data: withFeatures(done.status), setCookie: done.cookie }
+    return { status: 200, data: told(done.status), setCookie: done.cookie }
   }
   if (method === 'POST' && rest === '/sign-out') {
     const out = auth.signOut(caller)
-    return { status: 200, data: withFeatures(out.status), setCookie: out.cookie }
+    return { status: 200, data: told(out.status), setCookie: out.cookie }
   }
   // Order o9465: Settings › Access, the owner's only (the module refuses everyone else).
   if (r.access && method === 'GET' && rest === '/access') return { status: 200, data: r.access.view(caller) }

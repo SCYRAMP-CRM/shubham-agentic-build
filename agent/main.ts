@@ -45,6 +45,7 @@ import { loadConfig, loadOrCreateApiToken, stableOf, statePaths, updateConfig, t
 import { ensureChatHost } from './chathost/ensure.ts'
 import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, normalizeHubAddress, type HubBundle } from './devices.ts'
+import { createCpuProfileMount } from './diag-profile.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
 import { armExitWatchdog, processStartedAt } from './exit-watchdog.ts'
 import { hardExit } from './hard-exit.ts'
@@ -1209,7 +1210,13 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
+    // Order odb34: every signed-in person's /auth/status says which build this PC runs and whether a newer one is out (versions only).
+    const buildBadge = () => {
+      const current = extras.currentBuild?.() ?? null
+      const available = extras.newerBuild?.() ?? null
+      return current === null && available === null ? null : { current, available }
+    }
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, buildBadge, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), createCpuProfileMount({ dir: paths.agent, log: log.child('diag') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: process.env.WA_BACKEND_DIR ?? path.join(paths.root, 'whatsapp-backend') }), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()

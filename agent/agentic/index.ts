@@ -878,10 +878,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
     viewers.add(entry)
     ws.onClose(() => viewers.delete(entry))
   }
+  /**
+   * Each open socket judged again by the rule that let it in (wsAllow): a session that is a chat's is for the people with rights to that chat; one
+   * that is no chat's any more (its agent taken off, its floor deleted, its session replaced or cleared) is the owner of the app's only, as at the
+   * handshake. G2 (16 Nov): before, such a socket was skipped and stayed open, so what that chat still wrote afterwards (a chat on another PC whose
+   * stop failed runs on: its relay and its mirrored transcript go on) reached people whose right to it had ended. Judged on the same view of the
+   * floors as the handshake, a member's too: its copy of the Server's floors changes only by the Server's own word (a whole state frame of the
+   * current stream, or a whole floor the Server answered with), so a chat the Server still has never drops out of it for a moment.
+   */
   function recheckSockets() {
     for (const e of [...viewers]) {
       const at = bySession(e.sid)
-      if (at && access.rights(e.caller, at.agent) === null) {
+      if (at ? access.rights(e.caller, at.agent) === null : !access.isAdmin(e.caller)) {
         viewers.delete(e)
         e.ws.close(4403, "That chat isn't yours any more")
       }

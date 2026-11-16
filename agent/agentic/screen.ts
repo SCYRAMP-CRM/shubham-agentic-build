@@ -436,28 +436,43 @@ export function findMenu(lines: string[]): MenuAt | null {
 
 const SPINNER_RE = /^\s*[✻✽✶✢✳·*⏺]\s+(\S.*?…)\s*(?:\(([^)]*)\))?\s*$/
 const INTERRUPT_RE = /esc to interrupt/i
+/**
+ * Order oea35 (16 Nov): the running clock in a spinner's brackets, "(11m 56s · ↓ 68.2k tokens · thought for 9s)". Claude 2.1.325 with the footer
+ * "⏵⏵ bypass permissions on (shift+tab to cycle)" writes "esc to interrupt" nowhere while it works (real screens: a working chat and an idle one, in
+ * screen.test.ts), so the interrupt hint alone left every working chat read as idle. A spinner with its clock, drawn in the newest frame right
+ * above the input box, is Claude working. A spinner left above a question menu (no input box then) or without a clock still decides nothing.
+ */
+const SPINNER_CLOCK_RE = /^\s*(?:\d+h\s*)?(?:\d+m\s*)?\d+s\b/
+/** The line Claude leaves when Esc stopped the turn: "⎿  Interrupted · What should Claude do instead?" (the same words in 2.1.322 and 2.1.325). */
+const INTERRUPTED_RE = /^\s*⎿\s+Interrupted\b/
 // Claude varies the verb (Crunched, Cooked, Worked, ...). The completion shape,
 // not a particular verb or the optional middle dot, establishes a finished turn.
 const FINISHED_RE = /^\s*(?:[✻✽✶✢✳·*⏺]\s+)?[a-z][a-z -]*\s+for\s+<?(?:\d+h\s*)?(?:\d+m\s*)?\d+(?:\.\d+)?(?:ms|s)\s*(?:[·•]\s*)?done(?:\s+\d{1,2}:\d{2}(?:\s*[ap]m)?)?\s*$/i
 
-/** The newest input box separates response/activity rows from typed draft and footer rows. */
-function activityFrame(lines: readonly string[]): { body: readonly string[]; footer: readonly string[] } {
+/** The newest input box separates response/activity rows from typed draft and footer rows. `boxed`: that box is drawn (a menu replaces it). */
+function activityFrame(lines: readonly string[]): { body: readonly string[]; footer: readonly string[]; boxed: boolean } {
   for (let i = lines.length - 1; i >= 1; i--) {
     if (!RULE_RE.test(lines[i - 1]) || !/^\s*❯(?!\s*\d{1,2}\.\s)/.test(lines[i])) continue
     const end = lines.findIndex((line, n) => n > i && RULE_RE.test(line))
-    if (end >= 0) return { body: lines.slice(0, i - 1), footer: lines.slice(end + 1) }
+    if (end >= 0) return { body: lines.slice(0, i - 1), footer: lines.slice(end + 1), boxed: true }
   }
-  return { body: lines, footer: [] }
+  return { body: lines, footer: [], boxed: false }
 }
+
+/** oea35: a spinner Claude is still turning: its clock in the brackets, in a frame whose input box is drawn. */
+const liveSpinner = (extra: string | undefined, boxed: boolean) => boxed && SPINNER_CLOCK_RE.test(extra ?? '')
 
 /** Explicit turn evidence on the rendered Claude screen; null during an incomplete paint. */
 export function readTurnState(lines: readonly string[]): 'running' | 'idle' | null {
-  const { body, footer } = activityFrame(lines)
+  const { body, footer, boxed } = activityFrame(lines)
   if (footer.some(line => INTERRUPT_RE.test(line))) return 'running'
   for (let i = body.length - 1; i >= 0; i--) {
     if (FINISHED_RE.test(body[i])) return 'idle'
-    // A newer spinner prevents an older completed turn from ending the new one.
-    if (SPINNER_RE.test(body[i])) return null
+    // oea35: Esc ended the turn (the newest evidence): idle, like a finished one.
+    if (INTERRUPTED_RE.test(body[i])) return 'idle'
+    // A newer spinner prevents an older completed turn from ending the new one; with its clock above the input box, it is the turn running.
+    const spinner = SPINNER_RE.exec(body[i])
+    if (spinner) return liveSpinner(spinner[2], boxed) ? 'running' : null
     if (INTERRUPT_RE.test(body[i])) return 'running'
   }
   return null
@@ -465,15 +480,15 @@ export function readTurnState(lines: readonly string[]): 'running' | 'idle' | nu
 
 /** What claude says it is doing while it works: "Pollinating… (5s · ↓ 167 tokens)". Null when it isn't working. */
 export function readStatus(lines: string[]): ChatStatus | null {
-  const { body, footer } = activityFrame(lines)
+  const { body, footer, boxed } = activityFrame(lines)
   let interrupt = footer.some(line => INTERRUPT_RE.test(line))
   for (let i = body.length - 1; i >= 0; i--) {
-    // Neither an older spinner nor its old interrupt footer survives a newer completion.
-    if (FINISHED_RE.test(body[i])) return null
+    // Neither an older spinner nor its old interrupt footer survives a newer completion (or an Esc that ended the turn).
+    if (FINISHED_RE.test(body[i]) || INTERRUPTED_RE.test(body[i])) return null
     if (INTERRUPT_RE.test(body[i])) interrupt = true
     const m = SPINNER_RE.exec(body[i])
     if (!m) continue
-    if (!interrupt) return null
+    if (!interrupt && !liveSpinner(m[2], boxed)) return null
     const extra = m[2] ?? ''
     const time = /(?:(\d+)m\s*)?(\d+)s/.exec(extra)
     const tokens = /([\d.,]+k?)\s*tokens/i.exec(extra)
