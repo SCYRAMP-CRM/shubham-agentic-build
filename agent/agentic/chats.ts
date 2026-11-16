@@ -753,6 +753,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     const running = (() => {
       try {
         const lines = c.screen.lines()
+        if (c.engine === 'codex') {
+          const state = cxs.readTurnState(lines)
+          if (state) return state === 'running'
+        }
         return c.engine === 'claude' ? readTurnState(lines) === 'running' : lines.some(l => /esc to interrupt/i.test(l))
       } catch {
         return false
@@ -810,8 +814,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     // The PTY/host can coalesce an old running paint with the later completed
     // one (including on adoption). Trust their final rendered order, not the
     // presence of any historical interrupt marker in the whole stream chunk.
-    // Question/menu handling keeps its existing fail-closed/grace behaviour.
+    // This includes Codex on adoption: one replay slice can contain both the
+    // old interrupt paint and the newer "Worked for" row. Menus keep their
+    // existing fail-closed/grace behaviour; no terminal action follows here.
     if (c.engine === 'claude' && c.state !== 'question') c.state = readTurnState(c.screen.lines()) ?? c.state
+    if (c.engine === 'codex' && c.state !== 'question') c.state = cxs.readTurnState(c.screen.lines()) ?? c.state
     if (c.state === 'question' && before !== 'question') c.questionAt = Date.now()
     if (c.state !== before) {
       c.lastActive = Date.now() // a turn started or ended

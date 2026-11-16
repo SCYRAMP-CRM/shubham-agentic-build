@@ -89,6 +89,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
   ['POST', /^\/fast\/names$/, OWNER],
+  ['GET', /^\/fast\/settings$/, OWNER],
+  ['PUT', /^\/fast\/settings$/, OWNER],
   ['GET', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/morning$/, OWNER],
   ['PATCH', /^\/heartbeat$/, OWNER],

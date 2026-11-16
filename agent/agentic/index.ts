@@ -153,6 +153,7 @@ import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
+import { createQuickSettings } from './quick-settings.ts'
 import { createToolsSeen, needsRefresh, toolsVersion } from './tools-seen.ts'
 import { TOOLS } from './tools.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
@@ -4611,6 +4612,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const input: SnapshotInput = { agents, approvals, tasks: { open: count, first: open.map(t => t.text) }, phones, build: o.currentBuild?.() ?? null, orders }
     return buildSnapshot(input, namesFor(fastNames))
   }
+  const quickSettings = createQuickSettings(path.join(o.dir, 'quick-settings.json'))
   const fastOn = o.fastAssistant ?? (process.env.SAD_FAST_ASSISTANT === '1' || existsSync(path.join(o.dir, '..', 'fast-assistant.on')))
   const fastHost: FastHost | undefined =
     fastOn && mode() !== 'member'
@@ -4632,6 +4634,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           names: () => fastNames,
           toolLabel: name => FAST_LABELS[name] ?? 'One moment',
           onState: st => fastSession?.hostState(st),
+          keepRunning: () => quickSettings.get().keepRunning,
           // Order ofedf (usage): the turn's running cost, filed under the one person whose Assistant is open (agent/usage; totals only, no text).
           onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: '' }),
           context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
@@ -6996,6 +6999,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/watchdog$/, () => watchdogView()],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
     ['GET', /^\/fast\/names$/, () => ({ choice: fastNames })],
+    // o1cfa: the owner's hub preference, shared by desktop and APK; not a client ownership or microphone switch.
+    ['GET', /^\/fast\/settings$/, () => ({ settings: quickSettings.get(), available: !!fastHost })],
+    ['PUT', /^\/fast\/settings$/, (_, r) => ({ settings: quickSettings.set(r.body), available: !!fastHost })],
     [
       'POST',
       /^\/fast\/names$/,

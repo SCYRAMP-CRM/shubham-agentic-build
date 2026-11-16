@@ -14,7 +14,8 @@ import { createMemoryGate, type GateView, type MemSample, type MemoryGate } from
 // brief when it starts again). Modelled on the voice agent of agentic-claude-manager-build (read, never run), with this
 // app's rules on top:
 //   - supervised with the guard's supervise() (backoff 0/2/5/10/20/30 s, an init timeout, a hung check);
-//   - started only while someone has it open (a panel, a phone voice session) and for 10 minutes after the last one closed;
+//   - o1cfa: the owner's Keep Quick running preference can keep this host warm without an open overlay/phone session;
+//     otherwise it starts while someone has it open and ends 10 minutes after the last one closed (the old reader keeps that default);
 //   - not started below 2.5 GB of available RAM; the first thing ended when available RAM stays under 1.2 GB for 30 s
 //     (fast-gate.ts), long before any chat of Shubham's is touched;
 //   - ended by exact PID and start time (proc-tree.ts), never by name, pattern, port or taskkill /T;
@@ -111,6 +112,8 @@ export interface FastDeps {
   log?: { info(m: string): void; warn(m: string): void }
   /** Shortened in tests. */
   idleMs?: number
+  /** Owner's hub preference. Absent/false preserves the old open + 10-minute idle behaviour (including the old-app reader). */
+  keepRunning?(): boolean
   initTimeoutMs?: number
   interruptMs?: number
   holdMs?: number
@@ -130,6 +133,8 @@ export interface FastStatus {
   /** How long the last start took until it answered `initialize`, ms. */
   readyMs: number | null
   owners: number
+  /** A warm-process preference, NOT a page/phone owner or a microphone. */
+  keepRunning?: boolean
   /** When it will end if nobody opens it again, ms since the epoch; null while somebody has it open or it is off. */
   idleEndsAt: number | null
   restarts: number
@@ -278,6 +283,7 @@ export function createFastHost(deps: FastDeps): FastHost {
   let reason: string | null = null
   let modelPin: FastModel = defaultModel
   let idleEndsAt: number | null = null
+  let keepRunning = deps.keepRunning?.() === true
   let lastMemAt = 0
   let stopped = false
   let readyMs: number | null = null
@@ -300,6 +306,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     startedAt: proc && !proc.dead ? proc.startedAt : null,
     readyMs,
     owners: owners.size,
+    keepRunning,
     idleEndsAt,
     restarts,
     pending: turns.size,
@@ -740,7 +747,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     return true
   }
 
-  const wanted = () => !stopped && (owners.size > 0 || (idleEndsAt !== null && deps.now() < idleEndsAt))
+  const wanted = () => !stopped && (keepRunning || owners.size > 0 || (idleEndsAt !== null && deps.now() < idleEndsAt))
 
   async function sample(): Promise<MemSample> {
     lastMemAt = deps.now()
@@ -835,6 +842,11 @@ export function createFastHost(deps: FastDeps): FastHost {
         setState('off')
       }
       const s = await sample()
+      // The last page may close, or the application may stop, while Windows is
+      // sampling memory. A stale opener must not start an ownerless process or
+      // undo stop(). Keep-running demand is handled independently by tick().
+      if (stopped) return { ok: false, reason: 'The Assistant is off.' }
+      if (!owners.has(who)) return { ok: false, reason: 'That Assistant session closed before it was ready.' }
       const v = gate.canStart(s)
       if (!v.ok) {
         setState('paused', v.why)
@@ -846,7 +858,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     },
     close(who) {
       owners.delete(who)
-      if (owners.size === 0 && idleEndsAt === null && (sup || state === 'paused')) {
+      if (!keepRunning && owners.size === 0 && idleEndsAt === null && (sup || state === 'paused')) {
         idleEndsAt = deps.now() + idleMs
         changed()
       }
@@ -867,6 +879,13 @@ export function createFastHost(deps: FastDeps): FastHost {
     async tick() {
       if (stopped) return
       const now = deps.now()
+      const nextKeepRunning = deps.keepRunning?.() === true
+      if (nextKeepRunning !== keepRunning) {
+        keepRunning = nextKeepRunning
+        if (keepRunning) idleEndsAt = null
+        else if (!owners.size && (sup || state === 'paused')) idleEndsAt = now + idleMs
+        changed()
+      }
       if (!wanted()) {
         // Idle time is over (or nobody ever opened it): the process ends.
         if (sup) {
@@ -883,8 +902,12 @@ export function createFastHost(deps: FastDeps): FastHost {
         await sleep('failed', why)
         return
       }
+      // Keep-running prewarms on this same schedule (the first look, then every memoryEveryMs). tick() comes every second and a Windows
+      // commit read can take seconds, so a look never starts a read sooner: no pile of PowerShell reads while it warms.
       if (now - lastMemAt >= memoryEveryMs) {
         const s = await sample()
+        // The app may have stopped (or the last opener closed) while memory was sampled.
+        if (stopped || !wanted()) return
         if (sup) {
           const v = gate.check(s, now)
           if (v.end) {
@@ -893,12 +916,14 @@ export function createFastHost(deps: FastDeps): FastHost {
             await sleep('paused', why)
             return
           }
-        } else if (state === 'paused') {
-          // Memory came back while somebody still has it open.
-          if (owners.size > 0 && gate.canStart(s).ok) {
+        } else if ((state === 'off' && keepRunning) || (state === 'paused' && (keepRunning || owners.size > 0))) {
+          // The same memory start gate applies to prewarming and recovery with
+          // zero overlay owners. Browser sessions never determine this demand.
+          const v = gate.canStart(s)
+          if (v.ok) {
             setState('off')
-            wake('memory is back')
-          }
+            wake(keepRunning ? 'Keep Quick running' : 'memory is back')
+          } else setState('paused', v.why)
         }
       }
       // The naming choice changed: the process is started again with the new words once nothing is being said.

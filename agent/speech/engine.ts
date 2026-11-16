@@ -8,11 +8,14 @@ import type { Logger } from '../log.ts'
 import { IDENTITY_MS, listProcesses, type Proc } from '../proc-tree.ts'
 import { pcmMs, pcmToWav } from './wav.ts'
 import { cleanWords, promptFor, whisperLang } from './words.ts'
+import { speechPaths } from './paths.ts'
 
 // F-080: Whisper on this PC, through whisper.cpp's own server program (ggml-org's official Windows
 // build), kept OUTSIDE the app and outside git: %LOCALAPPDATA%\shubham-agentic\speech-bin\whisper\Release
-// and the models in %LOCALAPPDATA%\shubham-agentic\models. Neither is part of a publish: a PC without
-// them says "not available" and the mic keeps using the phone's own recogniser.
+// and the models in %LOCALAPPDATA%\shubham-agentic\models (speech/paths.ts). Neither is part of a publish: a PC
+// without them says "not available" and the mic keeps using the phone's own recogniser. F-251: the app installs
+// them as a dependency (agent/whisper-install: Install.cmd's last step, or the Dependencies tab's fix), pinned,
+// checked and only where missing.
 //
 // Memory on this PC is tight (Android builds), so the model is loaded only when someone speaks, is
 // refused when there isn't room, and is let go after a few idle minutes. One sentence at a time.
@@ -107,6 +110,7 @@ export interface TranscribeJob {
 
 export interface EngineDeps {
   root?: string
+  platform?: string
   model?: string
   threads?: number
   idleMs?: number
@@ -157,10 +161,8 @@ function freePort(): Promise<number> {
 export const modelFromEnv = (v: string | undefined) => (v && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(v) && !v.includes('..') ? v : DEFAULT_MODEL)
 
 export function createEngine(d: EngineDeps = {}): Engine {
-  const root = d.root ?? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'shubham-agentic')
-  const exe = path.join(root, 'speech-bin', 'whisper', 'Release', 'whisper-server.exe')
   const model = d.model ?? modelFromEnv(process.env.SAD_WHISPER_MODEL)
-  const modelFile = path.join(root, 'models', `ggml-${model}.bin`)
+  const { root, exe, model: modelFile } = speechPaths(model, d.root, d.platform)
   const threads = d.threads ?? Math.max(2, Math.min(8, os.cpus().length - 4))
   const idleMs = d.idleMs ?? idleMsFromEnv(process.env.SAD_WHISPER_IDLE_MIN)
   const exists = d.exists ?? existsSync
@@ -235,7 +237,7 @@ export function createEngine(d: EngineDeps = {}): Engine {
       }
       // Its agent is still running (the other agent on this PC, or this one): its server is its own business.
       if (alive(s.agentPid, s.agentCreated) || (s.agentPid === self.pid && s.agentCreated === self.created)) continue
-      if (alive(s.pid, s.created, /^whisper-server.exe$/i)) {
+      if (alive(s.pid, s.created, (d.platform ?? process.platform) === 'win32' ? /^whisper-server\.exe$/i : /^whisper-server$/)) {
         log?.warn(`speech: ending the Whisper server a stopped agent left behind (PID ${s.pid})`)
         try {
           ;(d.kill ?? (pid => process.kill(pid)))(s.pid!)

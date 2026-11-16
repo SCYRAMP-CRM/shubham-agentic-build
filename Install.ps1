@@ -2,6 +2,7 @@
 #   Install.cmd                 install, and start it now
 #   Install.cmd -Role hub       the first time on the hub (the role is remembered after that)
 #   Install.cmd -Remove         stop it and take it out of the logon programs
+#   Install.cmd -NoWhisper      all of it but step 5 (the old way: Whisper by hand, or never)
 # What it does:
 #   1. installs the build's packages (npm ci), when they aren't there yet;
 #   2. stops Shubham Agentic Dev if it is running on this PC (its agent, the loop that restarts
@@ -9,8 +10,13 @@
 #   3. starts this build at logon instead of Dev: a launcher in the Startup folder runs
 #      "Start hidden.vbs" here, and Dev's launcher (shubham-agentic-hub.vbs) comes out. To go
 #      back to Dev: run Dev's agent\scripts\install-hub-startup.ps1, and Install.cmd -Remove here;
-#   4. starts it, and opens http://localhost:5173 when it answers.
-param([string]$Role = '', [switch]$Remove)
+#   4. starts it, and opens http://localhost:5173 when it answers;
+#   5. F-251: fetches Whisper (speech to text) when this PC doesn't have it yet: the official whisper.cpp
+#      program and its small model, about 497 MB, each checked against its pinned SHA-256, into
+#      %LOCALAPPDATA%\shubham-agentic (agent\scripts\fetch-whisper.ts). What is there already is kept as it
+#      is. The app is up by then and finds it by itself; a failure doesn't fail the install (the mic then
+#      uses the phone's recogniser, and PC control > Dependencies has the command to try again).
+param([string]$Role = '', [switch]$Remove, [switch]$NoWhisper)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $startup = [Environment]::GetFolderPath('Startup')
@@ -89,4 +95,14 @@ if ($up) {
   Start-Process 'http://localhost:5173'
 } else {
   "  It hasn't answered yet: see $env:LOCALAPPDATA\shubham-agentic\agent-console.log"
+}
+
+'5. Whisper (speech to text), if this PC does not have it yet...'
+if ($NoWhisper) {
+  '  Skipped (-NoWhisper). PC control > Dependencies has the command for it.'
+} else {
+  # Never fatal: its result is read from $LASTEXITCODE, and what it says on its error stream is only shown.
+  $ErrorActionPreference = 'Continue'
+  & node (Join-Path $here 'agent\scripts\fetch-whisper.ts') --part all
+  if ($LASTEXITCODE -ne 0) { "  Whisper isn't installed (see above). The app works without it; PC control > Dependencies has the command to try again." }
 }

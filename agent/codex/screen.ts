@@ -120,6 +120,42 @@ export function working(lines: readonly string[]): boolean {
   return bottom(lines, 14).some(l => WORKING_LINE.test(l))
 }
 
+const TURN_DONE_LINE = /^\s*(?:[─━·•-]+\s*)?Worked\s+for\s+<?\d/i
+const TURN_INTERRUPT_LINE = /\besc\s+to\s+interrupt\b/i
+const TURN_START_LINE = /^\s*(?:[•■]\s*)?Working\s*\(/i
+
+/** Turn status from the final rendered screen, not every old paint in a PTY replay.
+ * A newer completion supersedes an older interrupt line, and a newer turn does
+ * the reverse. Draft/footer words are not activity. A partial paint or a menu
+ * supplies no replacement state; in particular a prompt alone does not mean idle.
+ * This is status projection only, not the sender's working/composer evidence.
+ */
+export function readTurnState(lines: readonly string[]): 'running' | 'idle' | null {
+  if (menuOnScreen(lines)) return null
+  const current = composerFrame(lines)
+  let end = current?.index ?? lines.length
+  let ambiguousInput = false
+  if (!current) {
+    // The sender rejects activity-looking continuations in a draft. That does
+    // NOT make the rejected input tail authoritative activity for status.
+    // Bound it separately without accepting it as a safe/readable composer.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!INPUT_LINE.test(lines[i])) continue
+      end = i
+      ambiguousInput = true
+      break
+    }
+  }
+  for (let i = end - 1; i >= 0; i--) {
+    // Without a complete current frame, an older completion cannot prove idle.
+    if (TURN_DONE_LINE.test(lines[i])) return ambiguousInput ? null : 'idle'
+    if (TURN_INTERRUPT_LINE.test(lines[i])) return 'running'
+    // Do not let an older completed turn end a new spinner mid-redraw.
+    if (TURN_START_LINE.test(lines[i])) return null
+  }
+  return null
+}
+
 /** Work going on in the background (a shell the model started), or null. */
 export function backgroundWork(lines: readonly string[]): string | null {
   for (const l of bottom(lines, 14)) if (BACKGROUND.test(l)) return 'a background terminal'

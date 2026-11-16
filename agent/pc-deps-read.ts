@@ -2,6 +2,7 @@ import path from 'node:path'
 import { meetsRange, type DepRow, type DepState, type PcDepsReport } from '../shared/pc-deps.ts'
 import { depFix, type FixContext, type FixOs } from './pc-deps-fixes.ts'
 import type { SshFacts } from './pc-ssh-read.ts'
+import { speechPaths } from './speech/paths.ts'
 
 // Order oc7c9: what the app needs on this PC and what it has (shared/pc-deps.ts). READ ONLY: version questions (`--version`, `npm --version` run once
 // to prove npm loads), file and folder checks, and on Windows WinFsp's version from its DLL and the voices from the registry. Nothing is
@@ -271,8 +272,8 @@ export async function readDeps(d: DepsReadDeps): Promise<Pick<PcDepsReport, 'os'
   }
 
   if (windows) {
-    const whisper = P.join(d.stateRoot, 'speech-bin', 'whisper', 'Release', 'whisper-server.exe')
-    const model = P.join(d.stateRoot, 'models', `ggml-${d.whisperModel}.bin`)
+    // F-251: the very places speech/engine.ts runs them from and the installer puts them (speech/paths.ts).
+    const { exe: whisper, model } = speechPaths(d.whisperModel, d.stateRoot, d.platform)
     const hasWhisper = await d.exists(whisper)
     const hasModel = await d.exists(model)
     rows.push(row({

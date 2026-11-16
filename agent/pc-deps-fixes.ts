@@ -34,6 +34,11 @@ export interface FixSpec {
 }
 
 const fixed = (command: string, rights: FixRights): FixSpec => ({ command: () => command, rights })
+/** PowerShell's literal string: nothing in it is expanded, and a ' is written twice. */
+const psQuote = (value: string) => `'${value.replaceAll("'", "''")}'`
+/** F-251: the app's own Whisper installer for THIS PC (agent/scripts/fetch-whisper.ts), from the app's own folder. */
+const whisperFix = (c: FixContext, part: 'program' | 'model') =>
+  `& node ${psQuote(`${c.appRoot.replace(/[\\/]+$/, '')}\\agent\\scripts\\fetch-whisper.ts`)} --part ${part} --model ${psQuote(c.whisperModel)}`
 
 /** Row id → its fix on each system. A row with no entry for a system has no command there (it is ok or not used there). */
 export const DEP_FIXES: Readonly<Record<string, Partial<Record<FixOs, FixSpec>>>> = {
@@ -106,15 +111,11 @@ export const DEP_FIXES: Readonly<Record<string, Partial<Record<FixOs, FixSpec>>>
   'linux-drive': {
     linux: fixed('sudo apt install libglib2.0-bin gvfs-backends gvfs-fuse fuse3', 'sudo'),
   },
-  whisper: {
-    windows: {
-      command: c => `Invoke-WebRequest https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip -OutFile "$env:TEMP\\whisper-bin-x64.zip"; Expand-Archive "$env:TEMP\\whisper-bin-x64.zip" -DestinationPath "${c.stateRoot}\\speech-bin\\whisper" -Force`,
-      rights: 'none',
-    },
-  },
-  'whisper-model': {
-    windows: { command: c => `Invoke-WebRequest https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${c.whisperModel}.bin -OutFile "${c.stateRoot}\\models\\ggml-${c.whisperModel}.bin"`, rights: 'none' },
-  },
+  // F-251: Whisper as a dependency. The pinned whisper.cpp b5454 program and the small model (whisper-install/manifest.ts), each checked by
+  // SHA-256 and added only where missing; what is there is kept. Was a `latest` download unchecked (that release now has no binaries).
+  // Windows only for now: Linux (the Z800) waits for its own approval.
+  whisper: { windows: { command: c => whisperFix(c, 'program'), rights: 'none' } },
+  'whisper-model': { windows: { command: c => whisperFix(c, 'model'), rights: 'none' } },
   voices: {
     windows: { command: c => c.voices.map(l => `Add-WindowsCapability -Online -Name Language.TextToSpeech~~~${l}~0.0.1.0`).join('; '), rights: 'admin' },
   },

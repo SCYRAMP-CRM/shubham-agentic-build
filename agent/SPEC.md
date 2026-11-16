@@ -2909,6 +2909,20 @@ Resources (a phone's tab says "Deps"). READ ONLY: no install button; an install 
 - **The fix commands**: one table, `pc-deps-fixes.ts` (`DEP_FIXES`: row id → the Windows and the Linux command and what it needs: admin, sudo, none,
   or person), worked out from that PC (its Node folder and version, the app folder, a lock file or not). Agent 6's installer (order o20e2) imports
   this table rather than keeping a copy. The page shows each as text to copy, with what it needs; nothing is run from it.
+- **Whisper as a dependency (F-251, Windows x64; Linux waits for its own approval).** Both Whisper rows' fix is the app's own installer for
+  that PC, `node <app>\agent\scripts\fetch-whisper.ts --part program|model` (agent/whisper-install), and Install.ps1 runs it with
+  `--part all` as its last step, after the app is up (`-NoWhisper` skips it; a failure never fails the install). Update.cmd does not: an
+  update restarts the app, and a 497 MB download there would hold it down. Pinned (manifest.ts): whisper.cpp b5454 (1.9.5)
+  `whisper-bin-x64.zip` and `ggml-small.bin` at a fixed revision, each by size and SHA-256, and the program's 41 files each by SHA-256
+  (payloads.ts; its whisper-server.exe is the Server's own). **Missing only:** it adds what is not there and keeps whatever is (another
+  build, a custom or damaged model) as it is, saying so, so a file the speech engine may be using is never touched. Downloads stream into
+  its own staging folder `speech-bin\whisper\.install-<id>-*` (public origins only, no credentials; given up after 2 minutes without data
+  or 2 hours in all); the archive is read as data (no traversal, nested folder, link or reparse point); the program folder moves into
+  place in one rename (Windows never renames a folder over another), the model by an exclusive hard link. One install at a time
+  (`.install.lock`: owner id, PID, start time): a lock whose install has ended (PID gone, or reused by a later process) is taken over and
+  the staging folders left behind are removed; one it can't read, or whose process may still run, is refused. Ctrl+C stops it cleanly.
+  Its result says `appTranscription: not-run`: a checked payload is not a transcription. Tests: `whisper-install/*.test.ts`
+  (`wiring.test.ts` reads Install.ps1 and Update.cmd, never runs them), `scripts/fetch-whisper.test.ts`, `speech/paths.test.ts`.
 - **Route** `GET /agent-api/pc-deps/pcs/<id>` (`?fresh=1` asks again; a PC's own list is kept a minute): not a scoped mount, so the owner only. The
   Server asks a member on a `pc-deps-v1` stream (`answerOnce`/`exchange` from pc-ports.ts); off, an older build or a wrong answer is said so.
   Checked by the Server and again by the page (`cleanDepsReport`).

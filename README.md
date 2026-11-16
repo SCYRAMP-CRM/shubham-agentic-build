@@ -16,6 +16,11 @@ Install.cmd
 `Install.cmd` installs its packages, stops Dev if it runs on this PC, makes this build start at
 logon (hidden), starts it and opens **http://localhost:5173**. On the hub, the first time:
 `Install.cmd -Role hub`. `Install.cmd -Remove` stops it and takes it out of the logon programs.
+Last, it fetches **Whisper** (speech to text) if the PC doesn't have it: the official whisper.cpp program
+and its small model, about 497 MB, each checked against its pinned SHA-256, into
+`%LOCALAPPDATA%\shubham-agentic`; whatever is there already is kept as it is. A failed download doesn't
+fail the install, and PC control › Dependencies has the command to try again. `Install.cmd -NoWhisper`
+leaves it out. **Update** doesn't fetch it (an update restarts the app, and this would hold it down).
 
 | File | Does |
 |---|---|
