@@ -234,6 +234,10 @@ export interface WaMessage {
   ack: number
   hasMedia: boolean
   filename: string | null
+  /** Order oWA S3: a media message's kind (image/jpeg, audio/ogg, application/pdf...) when WhatsApp says; absent otherwise. */
+  mimetype?: string | null
+  /** Order oWA S3: a media message's size in bytes as WhatsApp says it (before anything is downloaded); absent when it does not say. */
+  size?: number | null
 }
 
 /** A message the Assistant proposes. Nothing sends it but his own tap (a signed send). */
@@ -263,6 +267,27 @@ export type WaLive =
   | { t: 'status'; status: WaStatus }
   | { t: 'message'; message: WaMessage }
   | { t: 'ack'; id: string; chatId: string; ack: number }
+
+/**
+ * Order oWA S7: what happens on WhatsApp that the page follows live (a message, a tick), as the backend keeps it for GET /events. The status is not one: the page polls that.
+ */
+export type WaEvent = Exclude<WaLive, { t: 'status' }>
+
+/** How many of the newest events the backend keeps in memory, and the longest an ask for new ones may wait. */
+export const WA_EVENTS_KEEP = 500
+export const WA_EVENTS_WAIT_MAX_MS = 20_000
+
+/** GET /events: what is new since a position. Ask again with `seq` (and this `run`). */
+export interface WaEvents {
+  /** This run of the backend: it changes when the backend restarts. */
+  run: string
+  /** Where the feed is now: the next ask's `since`. */
+  seq: number
+  /** The events after the position asked from, oldest first. */
+  events: WaEvent[]
+  /** The position was from another run, older than what is kept, or from the future: events were missed. Read the chat list and the open chat again, then carry on from `seq`. */
+  reset?: true
+}
 
 /** A message's text as a short line: what a chat list shows for it. */
 export function waPreview(m: Pick<WaMessage, 'type' | 'text' | 'filename'>): string {

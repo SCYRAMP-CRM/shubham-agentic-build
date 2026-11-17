@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
-import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaContactDetails, type WaDraft, type WaLive, type WaMediaFile, type WaMessage, type WaNewChat, type WaSendRequest, type WaRoute, type WaSetup, type WaStatus, type WaTunnelSeen } from '../../shared/whatsapp.ts'
+import { WA_EVENTS_WAIT_MAX_MS, WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaContactDetails, type WaDraft, type WaLive, type WaMediaFile, type WaMessage, type WaNewChat, type WaSendRequest, type WaRoute, type WaSetup, type WaStatus, type WaTunnelSeen } from '../../shared/whatsapp.ts'
 import type { ProofRequest } from '../agentic/index.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -10,6 +10,7 @@ import type { Logger } from '../log.ts'
 import { findChrome } from './chrome.ts'
 import { createDrafts } from './drafts.ts'
 import { message, type EngineStatus } from './engine.ts'
+import { createEventRing } from './events.ts'
 import { createHost, type HostOptions } from './host.ts'
 import { LOGIN_ID, type WorkerEvent } from './protocol.ts'
 import { installLib, libReady, MANIFEST_DIR } from './setup.ts'
@@ -100,6 +101,8 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   const drafts = createDrafts({ now })
   const sockets = new Set<WsSocket>()
   const waiters = new Set<() => void>()
+  // Order oWA S7: what happens on WhatsApp (a message, a tick), in memory only, for GET /events: the new page follows it live over plain HTTP (the proxy has no socket).
+  const events = createEventRing()
 
   let settings = readSettings()
   let engine: EngineStatus = { state: 'off', qr: null, pairingCode: null, me: null, reason: null, loading: null, linked: null }
@@ -180,8 +183,13 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       if (engine.linked === true && (!settings.linked || (engine.me?.name && engine.me.name !== settings.name))) saveSettings({ linked: true, name: engine.me?.name ?? settings.name })
       if (engine.linked === false && settings.linked) saveSettings({ linked: false })
       changed()
-    } else if (e.t === 'message') push({ t: 'message', message: e.message as WaMessage })
-    else if (e.t === 'ack') push({ t: 'ack', id: e.id, chatId: e.chatId, ack: e.ack })
+    } else if (e.t === 'message') {
+      push({ t: 'message', message: e.message as WaMessage })
+      events.add({ t: 'message', message: e.message as WaMessage })
+    } else if (e.t === 'ack') {
+      push({ t: 'ack', id: e.id, chatId: e.chatId, ack: e.ack })
+      events.add({ t: 'ack', id: e.id, chatId: e.chatId, ack: e.ack })
+    }
   }
 
   function status(): WaStatus {
@@ -462,6 +470,13 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       case 'GET /chats':
         await connected()
         return host.call<WaChat[]>('chats')
+      case 'GET /events': {
+        // Order oWA S7: what is new since a position (no position: where the feed is now). `wait` (ms, at most WA_EVENTS_WAIT_MAX_MS) makes an ask with nothing new wait for the next event.
+        const raw = query.get('since')
+        const since = raw !== null && /^\d{1,15}$/.test(raw) ? Number(raw) : null
+        const wait = Math.max(0, Math.min(Number(query.get('wait')) || 0, WA_EVENTS_WAIT_MAX_MS))
+        return events.read({ since, run: query.get('run'), waitMs: wait })
+      }
       case 'GET /messages': {
         const chatId = query.get('chat') ?? ''
         if (!CHAT_ID.test(chatId)) throw apiError(400, 'Expected ?chat=<chat id>')
@@ -590,6 +605,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     },
     async close() {
       clearIdle()
+      events.close()
       if (tunnelTimer) clearInterval(tunnelTimer)
       await host.quit()
     },

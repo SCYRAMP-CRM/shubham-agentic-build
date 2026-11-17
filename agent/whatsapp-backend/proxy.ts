@@ -32,6 +32,8 @@ const ROUTES: Route[] = [
   { method: 'PATCH', pattern: /^\/settings$/ },
   { method: 'GET', pattern: /^\/chats$/ },
   { method: 'GET', pattern: /^\/messages$/ },
+  // Order oWA S7: what is new since a position (a message, a tick), waiting a few seconds when there is nothing: the new page follows WhatsApp live with it. A read.
+  { method: 'GET', pattern: /^\/events$/ },
   { method: 'POST', pattern: /^\/send$/ },
   // Order oWA S4: the people behind the chats. The four that change something (or ask WhatsApp about a number) need a person's own request (CHANGES below).
   { method: 'GET', pattern: /^\/contact$/ },
@@ -80,6 +82,8 @@ export interface ProxyOptions {
   timeoutMs?: number
   /** Order oWA S3: how long a file may take to come (default 60 s). */
   mediaTimeoutMs?: number
+  /** Order oWA S7: how long a live-feed ask may take: it waits up to WA_EVENTS_WAIT_MAX_MS for the next event, so the usual 20 s would cut it off (default 30 s). */
+  eventsTimeoutMs?: number
 }
 
 const down = (code: WaBackendCode, message: string) => Object.assign(apiError(503, message), { code })
@@ -211,11 +215,13 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
       const json = method !== 'GET' && method !== 'HEAD' && body !== undefined
       const headers = { 'x-sad-token': token(), ...(json ? { 'content-type': 'application/json' } : {}), ...(ticket ? { [SEND_TICKET_HEADER]: ticket } : {}) }
       let res: Response
+      // A live-feed ask waits for the next event (up to WA_EVENTS_WAIT_MAX_MS) before it answers: it is given longer than an ordinary call, and only it.
+      const allowedMs = rest === '/events' ? (o.eventsTimeoutMs ?? 30_000) : timeoutMs
       try {
-        res = await doFetch(url, { method, cache: 'no-store', headers, body: json ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) })
+        res = await doFetch(url, { method, cache: 'no-store', headers, body: json ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(allowedMs) })
       } catch (e) {
         const cause = (e as { cause?: { code?: unknown } }).cause?.code
-        const what = (e as Error).name === 'TimeoutError' ? `no answer within ${Math.round(timeoutMs / 1000)} s` : typeof cause === 'string' ? cause : 'the connection failed'
+        const what = (e as Error).name === 'TimeoutError' ? `no answer within ${Math.round(allowedMs / 1000)} s` : typeof cause === 'string' ? cause : 'the connection failed'
         throw down('wa-backend-unreachable', `The WhatsApp backend did not answer (${what}).`)
       }
       const data = (await res.json().catch(() => null)) as unknown

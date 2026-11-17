@@ -159,6 +159,8 @@ export function toMessage(raw: unknown): WaMessage {
     ack: typeof m.ack === 'number' ? m.ack : 0,
     hasMedia: m.hasMedia === true || MEDIA.has(t),
     filename: str(data.filename) || null,
+    // Order oWA S3: what the page shows of a file before it is fetched (its kind, its size), only for a message that has one.
+    ...(m.hasMedia === true || MEDIA.has(t) ? { mimetype: str(data.mimetype) || null, size: num(data.size) || null } : {}),
   }
 }
 
