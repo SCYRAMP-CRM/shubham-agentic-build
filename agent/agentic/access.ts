@@ -88,6 +88,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PUT', /^\/accounts\/vars\/([^/]+)$/, OWNER],
   ['DELETE', /^\/accounts\/vars\/([^/]+)$/, OWNER],
   ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, OWNER],
+  // Order o94f3: the Env tab's "+" and its ".env" paste box, and "show all" (the owner's only; the routes are humanOnly as well).
+  ['POST', /^\/accounts\/codebases\/([^/]+)\/env$/, OWNER],
+  ['POST', /^\/accounts\/subsets\/([^/]+)\/reveal$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
   ['GET', /^\/fast\/forwarding$/, OWNER],
   ['PUT', /^\/fast\/forwarding$/, OWNER],

@@ -56,10 +56,48 @@ export function modelConfiguration(credential: OpenCodeCredential, selected: str
     } } } : {}),
   }
 }
+/** How many times a backend that exits before it answers is started: a fresh port each time. The port is asked for and closed before the child binds it, and another program can take it in that gap. */
+const START_TRIES = 3
+
+interface Launched { child: ChildProcess; client: OpenCodeClient; controller: AbortController; close: () => Promise<void> }
+
+/** One try: `opencode serve` on a fresh port, until it answers /global/health. An exit before that carries `earlyExit` (a fresh port may help), unless the program could not be started at all. */
+async function launch(o: BackendOptions, env: ReturnType<typeof isolatedEnvironment>, password: string, tried: number[], last: boolean): Promise<Launched> {
+  const p = await port()
+  tried.push(p)
+  const started = Date.now()
+  const child: ChildProcess = spawn(o.install.executable, ['serve', '--hostname', '127.0.0.1', '--port', String(p)], { cwd: o.cwd, env: providerEnvironment(env, o.credential), windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] })
+  if (child.pid) o.spawned?.(child.pid)
+  // No child output is logged: a provider's diagnostics may contain credentials.
+  let dead = false, closed = false, ready = false, unstartable = false
+  // An exit before it answered, with another try still to come, is not the backend dying: only the last try, or a backend that had answered, tells `exited`.
+  child.once('exit', () => { dead = true; if (!closed && (ready || last)) o.exited() })
+  child.once('error', () => { dead = true; unstartable = true; if (!closed) o.exited() })
+  const client = new OpenCodeClient(p, password, o.cwd), controller = new AbortController()
+  const close = async () => {
+    if (closed) return
+    closed = true; controller.abort()
+    if (child.pid && !dead) {
+      const descendants = killTree(child.pid, { since: started }).catch(() => {})
+      // End the exact child handle synchronously as well: an agent hard-exit
+      // must not leave its HTTP backend alive while tree discovery is pending.
+      child.kill()
+      await descendants
+    }
+  }
+  try {
+    for (let i = 0; i < 100; i++) {
+      if (dead) throw Object.assign(new Error(`OpenCode backend exited before becoming ready (port ${p}).`), { earlyExit: !unstartable })
+      try { const health = await client.request('/global/health', 'GET', undefined, 500); if (health.version !== o.install.version) throw new Error('version'); ready = true; break } catch { await new Promise(resolve => setTimeout(resolve, 100)) }
+    }
+    if (!ready) throw new Error('OpenCode did not become ready.')
+  } catch (error) { await close(); throw error }
+  return { child, client, controller, close }
+}
 /** One process, one isolated database, one provider credential, no credential files. */
 export async function startBackend(o: BackendOptions): Promise<Backend> {
   const selectedModel = o.credential.kind === 'free' ? freeModel(o.model) : o.model
-  const p = await port(), password = randomBytes(32).toString('hex')
+  const password = randomBytes(32).toString('hex')
   const env = isolatedEnvironment(o.root)
   env.OPENCODE_SERVER_PASSWORD = password
   env.SAD_AGENTIC_URL = o.toolsUrl; env.SAD_AGENTIC_KEY = o.chatKey
@@ -74,32 +112,16 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
     ...modelConfiguration(o.credential, selectedModel, o.mockBaseUrl),
     mcp,
   })
-  const started = Date.now()
-  const child: ChildProcess = spawn(o.install.executable, ['serve', '--hostname', '127.0.0.1', '--port', String(p)], { cwd: o.cwd, env: providerEnvironment(env, o.credential), windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] })
-  if (child.pid) o.spawned?.(child.pid)
-  // No child output is logged: a provider's diagnostics may contain credentials.
-  let dead = false, closed = false
-  child.once('exit', () => { dead = true; if (!closed) o.exited() })
-  child.once('error', () => { dead = true; if (!closed) o.exited() })
-  const client = new OpenCodeClient(p, password, o.cwd), controller = new AbortController()
-  const close = async () => {
-    if (closed) return
-    closed = true; controller.abort()
-    if (child.pid && !dead) {
-      const descendants = killTree(child.pid, { since: started }).catch(() => {})
-      // End the exact child handle synchronously as well: an agent hard-exit
-      // must not leave its HTTP backend alive while tree discovery is pending.
-      child.kill()
-      await descendants
+  const tried: number[] = []
+  let run: Launched | undefined
+  for (let attempt = 1; !run; attempt++) {
+    try { run = await launch(o, env, password, tried, attempt === START_TRIES) } catch (error) {
+      if (!(error as { earlyExit?: boolean }).earlyExit) throw error
+      if (attempt === START_TRIES) throw new Error(`OpenCode backend exited before becoming ready on ${tried.length} tries (ports ${tried.join(', ')}); its output is not logged.`, { cause: error })
     }
   }
+  const { child, client, controller, close } = run
   try {
-    let ready = false
-    for (let i = 0; i < 100; i++) {
-      if (dead) throw new Error('OpenCode backend exited before becoming ready.')
-      try { const health = await client.request('/global/health', 'GET', undefined, 500); if (health.version !== o.install.version) throw new Error('version'); ready = true; break } catch { await new Promise(resolve => setTimeout(resolve, 100)) }
-    }
-    if (!ready) throw new Error('OpenCode did not become ready.')
     const providers = await client.request('/provider')
     const model = o.credential.kind === 'free' ? verifyFreeModel(providers, selectedModel) : selectedModel || providers.default?.[o.credential.provider]
     if (typeof model !== 'string' || !providers.all?.find((x: any) => x.id === o.credential.provider)?.models?.[model]) throw new Error('Choose a model supported by the installed OpenCode provider.')

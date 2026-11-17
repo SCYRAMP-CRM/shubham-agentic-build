@@ -41,6 +41,13 @@ import {
 // SAM CRM's own /v1/org routes. The rules, each enforced here and tested:
 // - It is the signed-in PERSON's own CRM session (auth.viewerCrm: the sign-in they made to this app), never a key of this app's or this PC's: the CRM itself decides what they may do.
 //   Every route needs a person (requireCrmHuman: a CRM-derived session; a chat's key is refused), and the mount is the owner's (it is not `scoped`).
+// - ORDER o0612 (Shubham, 17 Nov 2026: "C now, A later"): that person must be the OWNER or an ADMINISTRATOR of this app (auth.isAdmin), for every route, read or change. The CRM scopes leads and
+//   contacts by nothing beyond the organisation (sam-crm-be: listLeads, getLead, updateLead... check no per-person rule, and its per-person "Leads" switch only hides a sidebar entry), so a person who
+//   is signed in to the CRM can read and edit every lead through the API; "C" keeps this app from being the thing that puts them on a screen for anyone else. IT IS ENFORCED HERE, AT THE BRIDGE,
+//   AND NOT IN THE PAGE: a filter in a page over an API that returns everything is a curtain, not access control; the data would already be on the person's machine, and the page would LOOK
+//   correct, so nobody would go and fix the real hole. The pages (the Leads list, the Dashboard, the contact panel) draw what they are given and filter nothing. It protects THIS APP only: the
+//   rows stay reachable through the CRM itself by any member's own session until "A" (an assignee or hierarchy scope in sam-crm-be's lead and contact routes) is done, and nothing is pushed to
+//   the live CRM without his yes.
 // - A change is made only on a request of theirs, to one record, from named fields (map.ts): anything else in a body never reaches the CRM.
 // - Nothing is deleted. There is no delete route here, and every request out is judged by the same rule the crm_ tools keep (crm-catalog.ts: no delete, no money, no people's access).
 // - A lookup never says "not found" when the CRM could not be asked: it fails with the reason. A list is never cached half-read.
@@ -114,7 +121,8 @@ export function createWhatsAppCrm(o: WhatsAppCrmOptions): ApiMount {
   }
 
   function person(req: MountRequest): Person {
-    const caller = requireCrmHuman(o.auth, req)
+    // The owner or an administrator (order o0612): the same rule as the door in http() below, kept here as well so that a route which asked for its person could never go without it.
+    const caller = requireCrmHuman(o.auth, req, true)
     const s = o.auth?.viewerCrm(req.headers)
     if (!s) throw coded(401, 'crm-not-signed-in', "You are signed in here, but not to the CRM: sign in through the CRM to look up or add leads. Nothing was changed.")
     return { id: s.user.id.toLowerCase(), login: crmLoginOf(s), who: describeHuman(caller) }
@@ -398,10 +406,12 @@ export function createWhatsAppCrm(o: WhatsAppCrmOptions): ApiMount {
       const method = req.method.toUpperCase()
       const rest = req.rest.replace(/\/+$/, '') || '/'
       if (method === 'DELETE') throw apiError(405, 'Nothing is deleted from the CRM here.')
+      // THE DOOR (order o0612): before any route is looked at, and so before any path that does not exist yet could be: a signed-in person who is the owner or an administrator of this app, or nothing
+      // (403 "admin-only", and nothing is asked of the CRM). A route added later is behind it without having to remember it.
+      requireCrmHuman(o.auth, req, true)
       let m: RegExpExecArray | null
 
       if (method === 'GET' && rest === '/status') {
-        requireCrmHuman(o.auth, req)
         const s = o.auth?.viewerCrm(req.headers)
         return { signedIn: !!s, name: s ? (s.user.name ?? s.user.username ?? null) : null } satisfies CrmStatus
       }

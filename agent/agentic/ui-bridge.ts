@@ -57,6 +57,8 @@ interface Client {
   name: string
   /** Order o355e: whose page it is. */
   scope: string
+  /** o1e3c: until when a call to this page got no answer and it is passed over (a later time than now; 0: not). Any frame from the page ends it. */
+  suspectUntil: number
 }
 
 /** Order od371: a device that has the overlay open, as the other devices are told about it. */
@@ -77,6 +79,26 @@ interface Waiting {
 
 export const UI_CALL_TIMEOUT_MS = 25_000
 
+// o1e3c / F-273: when a call gets no answer. The page that did not answer may be dead (a network drop leaves its socket registered for up to about 85 s) or only slow, busy or
+// frozen, in which case it will still RUN the command later, from its queue. So:
+//   - only a READ (a call that looks and changes nothing) is ever tried on a second page; a click, a type, a key, an invoke is never sent twice;
+//   - a page that did not answer is passed over by the pick for UI_SUSPECT_MS (any frame from it ends that), so the call that follows a read (the Assistant always reads before it
+//     clicks) lands on the page that was read, and a write gets the benefit of the failover without ever being re-sent;
+//   - a read with another page ON SCREEN to try gives its first page only UI_READ_FIRST_TRY_MS; with no other page it waits as it always did; the whole call never takes longer than
+//     the timeout it was given; never another device, never a page that is hidden (a hidden page is driven only if it is the one picked, and a call to a hidden one is refused).
+// The answer of a read that was tried on a second page SAYS so in its first line.
+/** Calls that only look. */
+const READS = new Set(['screen', 'modules'])
+/**
+ * The first wait of a read that has another page on screen to try. MEASURED on real Chrome 157 tabs (a production build, headless=new, 17 Nov 2026, two runs of rig/bridge-proof.mjs): a `screen`
+ * call on a page in front answered in p50 13-16 ms, p95 19 ms, max 19 ms over 80 calls; a page in the BACKGROUND answered `screen` in about 110 ms and its slowest command (a goto, a smooth scroll) in
+ * 1.1-1.2 s (the browser's timer throttling). 5 s is about 260 times the slowest healthy answer in front and about four times the slowest hidden-page command; it is a JUDGEMENT anchored on
+ * those numbers (a phone is slower than this machine), not derived from them. A too-short wait moves the Assistant to another window for nothing (and says so); a too-long one only costs the wait.
+ */
+export const UI_READ_FIRST_TRY_MS = 5_000
+/** How long a page that did not answer is passed over: just more than the agent's sweep needs to drop a page that died without a sound (65 s of silence, checked every 20 s: agent/ws-live.ts). */
+export const UI_SUSPECT_MS = 90_000
+
 export interface UiBridge {
   /** The handler for a page's socket; `who` is whoever is signed in on that page (default: the owner's open app). */
   socket(): (ws: WsSocket, who?: UiWho) => void
@@ -92,7 +114,15 @@ export interface UiBridge {
   close(): void
 }
 
-export function createUiBridge(now: () => number = Date.now): UiBridge {
+/** o1e3c: what the answer of a read that had to be tried on another page begins with, so the Assistant can tell it moved (and tell him). */
+function answeredByAnother(result: unknown, skipped: number, ms: number): string {
+  const who = skipped === 1 ? 'the window he was last using did' : `${skipped} windows did`
+  const other = skipped === 1 ? 'the other' : 'another'
+  return `Note: ${who} not answer in ${(ms / 1000).toFixed(1)} s, so this is ${other} window that is on screen. The next actions go to this one.\n\n${typeof result === 'string' ? result : JSON.stringify(result)}`
+}
+
+export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?: number } = {}): UiBridge {
+  const firstTryMs = opts.firstTryMs ?? UI_READ_FIRST_TRY_MS
   const clients = new Set<Client>()
   const waiting = new Map<string, Waiting>()
   /** Order od371: the device he chose ("Act on this device"), per scope (o355e); none: the rule below decides. */
@@ -100,13 +130,40 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
 
   const inScope = (scope: string) => [...clients].filter(c => c.scope === scope)
 
-  function best(scope: string): Client | null {
+  const rank = (c: Client) => (c.visible ? 2 : 0) + (c.overlayOpen ? 1 : 0)
+  const suspect = (c: Client) => c.suspectUntil > now()
+  /** `a` is a better page to drive than `b`: on screen first, then the overlay open; then one that has not just failed to answer; then the one used last. */
+  const better = (a: Client, b: Client) => (rank(a) !== rank(b) ? rank(a) > rank(b) : suspect(a) !== suspect(b) ? !suspect(a) : a.activeAt > b.activeAt)
+
+  /**
+   * The page of `list` the person is most likely looking at.
+   *
+   * KNOWN WEAKNESS (o1e3c / F-273): this picks by what each page LAST REPORTED (on screen, overlay open, touched when), and the bridge has no liveness signal of its own: the
+   * agent's ping and its drop of a page that went silent for 65 s live in agent/ws-live.ts and never reach here. A page that died without a sound can therefore still be picked
+   * for up to about 85 s (the first 20 s sweep after 65 s of silence), and a call to it ends in 504 "The screen didn't answer in time". That was always so on the nothing-chosen
+   * path; a4744ca made it so with a device chosen too (the old pick, the first page registered, answered by luck when the NEWER page was the one that died). What lessens it
+   * now: a READ that gets no answer is tried on the next page on screen (run(), below), and the page that did not answer is passed over by this pick (`suspect`) for
+   * UI_SUSPECT_MS, so the click that follows the read lands on the page that was read; a write is never sent twice. NOT closed: a dead page whose only live sibling is HIDDEN
+   * is still picked (a hidden page is never tried unnamed).
+   */
+  function bestOf(list: Client[]): Client | null {
     let top: Client | null = null
-    const rank = (c: Client) => (c.visible ? 2 : 0) + (c.overlayOpen ? 1 : 0)
-    for (const c of inScope(scope)) {
-      if (!top || rank(c) > rank(top) || (rank(c) === rank(top) && c.activeAt > top.activeAt)) top = c
+    for (const c of list) {
+      if (!top || better(c, top)) top = c
     }
     return top
+  }
+
+  /** o1e3c: the pages a READ may be tried on when the one it went to does not answer: the same device's other pages that are on screen with the overlay open (never another device,
+   *  never a hidden page), and, for a staff call, only pages its guard allows; best first. */
+  function alternatives(from: Client, tried: Set<Client>, guard?: (route: string) => boolean): Client[] {
+    return openClients(from.scope)
+      .filter(x => x.device === from.device && x.visible && !tried.has(x) && (!guard || guard(x.route)))
+      .sort((a, b) => (better(a, b) ? -1 : better(b, a) ? 1 : 0))
+  }
+
+  function best(scope: string): Client | null {
+    return bestOf(inScope(scope))
   }
 
   const openClients = (scope: string): Client[] => inScope(scope).filter(c => c.overlayOpen)
@@ -128,7 +185,10 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
   function driving(scope: string): Client | null {
     const pick = chosen.get(scope)
     if (pick !== undefined) {
-      const c = openClients(scope).find(x => x.device === pick)
+      // The chosen DEVICE is a browser, and a browser can hold several pages (two tabs; a reload's dead one for up to a minute): the Assistant drives the page
+      // that is on screen or was used last, as it does when no device is chosen, never just the first one registered (an older hidden tab was refused as "open
+      // but hidden" while he looked at another tab of the same browser).
+      const c = bestOf(openClients(scope).filter(x => x.device === pick))
       if (c) return c
     }
     if (ambiguous(scope)) return null
@@ -164,6 +224,55 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
     return s
   }
 
+  /** One command to one page, for `ms`: its answer, or 504 (no answer in time), or 409 (the screen went away). */
+  function attempt(c: Client, cmd: string, args: unknown, ms: number, guard?: (route: string) => boolean): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const id = randomUUID()
+      const timer = setTimeout(() => {
+        waiting.delete(id)
+        reject(apiError(504, "The screen didn't answer in time"))
+      }, ms)
+      waiting.set(id, { client: c, resolve, reject, timer, guard })
+      try {
+        // o7e6d: a staff call says so, and the page checks its own route before it runs anything (no field for the owner: unchanged).
+        c.ws.sendText(JSON.stringify(guard ? { t: 'cmd', id, cmd, args, staff: true } : { t: 'cmd', id, cmd, args }))
+      } catch {
+        clearTimeout(timer)
+        waiting.delete(id)
+        reject(apiError(409, 'The screen went away'))
+      }
+    })
+  }
+
+  /** A call to `first` and, for a READ that gets no answer, to the next page on screen of the same device (the note above UI_READ_FIRST_TRY_MS says why only a read). */
+  async function run(first: Client, cmd: string, args: unknown, timeoutMs: number, guard?: (route: string) => boolean): Promise<unknown> {
+    const read = READS.has(cmd)
+    const tried = new Set<Client>()
+    let budget = timeoutMs
+    let lost = 0
+    let c = first
+    for (;;) {
+      tried.add(c)
+      // With another page on screen to try, a read waits only the short first wait; with none, as long as the call allows.
+      const wait = read && alternatives(c, tried, guard).length > 0 ? Math.min(budget, firstTryMs) : budget
+      const began = Date.now()
+      try {
+        const result = await attempt(c, cmd, args, wait, guard)
+        return tried.size > 1 ? answeredByAnother(result, tried.size - 1, lost) : result
+      } catch (e) {
+        const status = (e as { status?: unknown } | null)?.status
+        // Whatever the call was, the page that did not answer is passed over by the next pick: the call that follows a read lands on the page that was read.
+        if (status === 504) c.suspectUntil = now() + UI_SUSPECT_MS
+        const spent = Date.now() - began
+        lost += spent
+        budget -= spent
+        const next = read && (status === 504 || status === 409) ? alternatives(c, tried, guard)[0] : undefined
+        if (!next || budget <= 0) throw e
+        c = next
+      }
+    }
+  }
+
   return {
     socket: () => (ws, who = UI_OWNER) => {
       const scope = uiScope(who)
@@ -173,9 +282,11 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
         return
       }
       const id = randomUUID()
-      const me: Client = { id, ws, visible: false, overlayOpen: false, route: '', phone: false, activeAt: now(), device: id, name: 'a device', scope }
+      const me: Client = { id, ws, visible: false, overlayOpen: false, route: '', phone: false, activeAt: now(), device: id, name: 'a device', scope, suspectUntil: 0 }
       clients.add(me)
       ws.onText(text => {
+        // o1e3c: a frame of any kind proves this page is alive: it is no longer passed over for not having answered.
+        me.suspectUntil = 0
         let m: { t?: unknown; id?: unknown; visible?: unknown; active?: unknown; overlayOpen?: unknown; route?: unknown; phone?: unknown; ok?: unknown; result?: unknown; error?: unknown; device?: unknown; name?: unknown }
         try {
           m = JSON.parse(text)
@@ -235,22 +346,7 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
       if (!c.visible) return Promise.reject(apiError(409, "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
       // F-162 o7e6d: a guard (a staff chat's page rule) is checked against the page that will be driven, in the same step as the pick. Refused, fail closed.
       if (guard && !guard(c.route)) return Promise.reject(apiError(403, 'That page is not open to your Assistant; it can look at the app\'s main pages only.'))
-      return new Promise((resolve, reject) => {
-        const id = randomUUID()
-        const timer = setTimeout(() => {
-          waiting.delete(id)
-          reject(apiError(504, "The screen didn't answer in time"))
-        }, timeoutMs)
-        waiting.set(id, { client: c, resolve, reject, timer, guard })
-        try {
-          // o7e6d: a staff call says so, and the page checks its own route before it runs anything (no field for the owner: unchanged).
-          c.ws.sendText(JSON.stringify(guard ? { t: 'cmd', id, cmd, args, staff: true } : { t: 'cmd', id, cmd, args }))
-        } catch {
-          clearTimeout(timer)
-          waiting.delete(id)
-          reject(apiError(409, 'The screen went away'))
-        }
-      })
+      return run(c, cmd, args, timeoutMs, guard)
     },
 
     onPhone(as = UI_OWNER) {

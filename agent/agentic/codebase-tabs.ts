@@ -1,5 +1,6 @@
 import { apiError } from '../api.ts'
-import { checkDescription, checkLink, checkSubsetName, checkVarName, checkVarValue, isSecretName, isSection, type Checked, type TabSection, type TabsAnswer, type TabsVar } from '../../shared/codebase-tabs.ts'
+import { checkDescription, checkLink, checkSubsetName, checkVarName, checkVarValue, mayShowName, mayShowValue, isSection, type Checked, type TabSection, type TabsAnswer, type TabsVar } from '../../shared/codebase-tabs.ts'
+import { ENV_PASTE_MAX_VARS } from '../../shared/env-paste.ts'
 import { decryptPassword, encryptPassword } from './accounts-crypto.ts'
 import { openAccountsDb, readAccountsDb, readAccountsKey, reasonOf, WORDS, type AccountsSql, type Row, type Tx } from './accounts-db.ts'
 
@@ -7,9 +8,9 @@ import { openAccountsDb, readAccountsDb, readAccountsKey, reasonOf, WORDS, type 
 // (the person the agent says is asking) reads or changes them: row-level security decides, the same as the other Accounts tables.
 // DELETE IS SOFT: nothing is deleted from the database. A delete sets deleted_at (an UPDATE); every read leaves those rows out; a deleted name does not
 // count as taken, and adding a name again brings its deleted row back with the new value (no second row). The app's login has no delete right.
-// The rules: a variable's VALUE is stored only encrypted (the Accounts key file, the same code as the mailbox passwords); a secret-looking name's value
-// is never given back except by an explicit reveal; a non-secret value is given with the list. Nothing is logged but a reason and a code, and no error
-// text names a value. The .env of the CRM is never read here.
+// The rules: a variable's VALUE is stored only encrypted (the Accounts key file, the same code as the mailbox passwords); a value is given back with the list
+// ONLY when the allowlist says it is safe to show (shared/codebase-tabs.ts: mayShowName / mayShowValue: FAIL CLOSED); every other value comes back only by an
+// explicit reveal. Nothing is logged but a reason and a code, and no error text names a value. The .env of the CRM is never read here.
 
 export interface CodebaseTabsOptions {
   dir: string
@@ -107,12 +108,18 @@ async function codebaseOr404(tx: Tx, cb: string) {
         const varsBy = new Map<string, TabsVar[]>()
         for (const v of vars) {
           const name = str(v.name)
-          const secret = isSecretName(name)
+          // FAIL CLOSED (order o94f3, Lead's rule, 17 Nov): a value is given with the list only when the ALLOWLIST says it is safe to show (mayShowName / mayShowValue: a framework's public prefix or a plain
+          // name like NODE_ENV, no secret word in the name, nothing secret in its shape). Everything else is masked: no value in the answer, hidden on the page until his own signed-in tap asks for it (reveal).
+          let secret = !mayShowName(name)
           let value: string | null = null
           if (!secret && key.ok) {
             try {
               value = decryptPassword(key.key, str(v.value_sealed))
             } catch {
+              value = null
+            }
+            if (value !== null && !mayShowValue(name, value)) {
+              secret = true
               value = null
             }
           }
@@ -255,6 +262,62 @@ async function codebaseOr404(tx: Tx, cb: string) {
       })
     },
 
+    /**
+     * Order o94f3 (the Env tab's "+" and its paste box for NAME=VALUE lines): adds one variable or many to the set called `environment` (Dev, Prod, Preview or his own name), making the set when it is not there yet. A name
+     * that a live variable of that set already has is left as it is and reported (never overwritten: changing a value is Edit's job). One transaction: all of it or none. Values are sealed before they are
+     * written. WHAT COMES BACK IS NAMES AND COUNTS ONLY, never a value; a name that cannot be used is reported by its place in the list, not by its text.
+     */
+    async addEnv(person: string, codebaseId: string, input: unknown): Promise<{ subsetId: string; created: boolean; added: string[]; skipped: { name: string; why: string }[] }> {
+      const cb = uuid(codebaseId)
+      if (!cb) throw apiError(400, 'That codebase id is not valid.')
+      const { environment: wanted, vars: given } = (typeof input === 'object' && input !== null ? input : {}) as { environment?: unknown; vars?: unknown }
+      const environment = need(checkSubsetName(wanted))
+      const list = Array.isArray(given) ? given : []
+      if (list.length === 0) throw apiError(400, 'There is nothing to add.')
+      if (list.length > ENV_PASTE_MAX_VARS) throw apiError(400, `At most ${ENV_PASTE_MAX_VARS} variables at a time.`)
+      const skipped: { name: string; why: string }[] = []
+      const usable: { name: string; value: string }[] = []
+      const seen = new Set<string>()
+      list.forEach((item, i) => {
+        const o = (typeof item === 'object' && item !== null ? item : {}) as Record<string, unknown>
+        const n = checkVarName(o.name)
+        if (!n.ok) return void skipped.push({ name: `#${i + 1}`, why: n.message })
+        const v = checkVarValue(o.value ?? '')
+        if (!v.ok) return void skipped.push({ name: n.value, why: v.message })
+        if (seen.has(n.value)) return void skipped.push({ name: n.value, why: 'given twice' })
+        seen.add(n.value)
+        usable.push({ name: n.value, value: v.value })
+      })
+      if (usable.length === 0) throw apiError(400, `None of the variables can be used (${skipped.map(s => `${s.name}: ${s.why}`).join('; ')}).`)
+      const key = keyOrRefuse()
+      return run(person, async tx => {
+        await codebaseOr404(tx, cb)
+        const found: Row[] = await tx`select id from sad.account_env_subset where codebase_id = ${cb} and deleted_at is null and lower(name) = lower(${environment}) order by sort_order, created_at limit 1`
+        let subsetId = found.length > 0 ? str(found[0].id) : ''
+        let created = false
+        if (!subsetId) {
+          const next: Row[] = await tx`select coalesce(max(sort_order), 0) + 1 as n from sad.account_env_subset where codebase_id = ${cb}`
+          const made: Row[] = await tx`insert into sad.account_env_subset (owner_id, codebase_id, name, sort_order) values (${person}, ${cb}, ${environment}, ${Number(next[0]?.n ?? 1)}) returning id`
+          subsetId = str(made[0]?.id)
+          created = true
+        }
+        const live: Row[] = await tx`select name from sad.account_env_var where subset_id = ${subsetId} and deleted_at is null`
+        const taken = new Set(live.map(x => str(x.name)))
+        const added: string[] = []
+        for (const { name, value } of usable) {
+          if (taken.has(name)) {
+            skipped.push({ name, why: 'already in this set' })
+            continue
+          }
+          const sealed = encryptPassword(key, value)
+          const back: Row[] = await tx`update sad.account_env_var set deleted_at = null, value_sealed = ${sealed}, updated_at = now() where subset_id = ${subsetId} and name = ${name} and deleted_at is not null returning id`
+          if (back.length === 0) await tx`insert into sad.account_env_var (owner_id, subset_id, name, value_sealed) values (${person}, ${subsetId}, ${name}, ${sealed})`
+          added.push(name)
+        }
+        return { subsetId, created, added, skipped }
+      })
+    },
+
     /** Changes a variable's name and/or value (a value left out keeps the old one). */
     async updateVar(person: string, varId: string, input: unknown): Promise<{ ok: true; id: string }> {
       const id = uuid(varId)
@@ -313,6 +376,33 @@ async function codebaseOr404(tx: Tx, cb: string) {
       })
       // The reveal is logged: who, which row, when. Never the value.
       o.log?.info?.(`environment variable revealed: row ${id} by ${person} at ${new Date().toISOString()}`)
+      return out
+    },
+
+    /**
+     * Order o94f3, "show all" (Lead, 17 Nov: seeing his own values at a glance is his to choose): the values of ONE set in one call, for his own tap on "Show all" (or the device setting that taps for him).
+     * Keyed by the variable's id; a value that will not open is listed in `unreadable`, never described. Like reveal it is humanOnly, and it is logged as one line (who, which set, how many), never a value.
+     */
+    async revealSet(person: string, subsetId: string): Promise<{ values: Record<string, string>; unreadable: string[] }> {
+      const id = uuid(subsetId)
+      if (!id) throw apiError(400, 'That subset id is not valid.')
+      const key = keyOrRefuse()
+      const out = await run(person, async tx => {
+        const sub: Row[] = await tx`select id from sad.account_env_subset where id = ${id} and deleted_at is null`
+        if (sub.length === 0) throw apiError(404, NO_ROW)
+        const rows: Row[] = await tx`select id, value_sealed from sad.account_env_var where subset_id = ${id} and deleted_at is null`
+        const values: Record<string, string> = {}
+        const unreadable: string[] = []
+        for (const r of rows) {
+          try {
+            values[str(r.id)] = decryptPassword(key, str(r.value_sealed))
+          } catch {
+            unreadable.push(str(r.id))
+          }
+        }
+        return { values, unreadable }
+      })
+      o.log?.info?.(`environment set revealed: set ${id} by ${person} at ${new Date().toISOString()}: ${Object.keys(out.values).length} values`)
       return out
     },
   }

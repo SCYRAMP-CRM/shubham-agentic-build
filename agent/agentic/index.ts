@@ -5885,6 +5885,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
+        // R1b: a personal Assistant's floor takes no other chats, from a chat either (its owner's rights are the chat's, not the app's).
+        refuseAssistantFloorChange(me, floor)
         const model = args.model
         if (model !== undefined && !(AGENT_MODELS as readonly unknown[]).includes(model)) throw apiError(400, 'model is opus, sonnet or haiku')
         // F-049: hired onto an effort, as on a model.
@@ -6206,6 +6208,41 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } finally { reconcilingSwitches = false }
   }
   setImmediate(() => { void reconcileSwitchFences().catch(error => log?.warn('Engine-switch recovery remains fenced: ' + message(error))) })
+
+  /**
+   * R1b (order o3b2f; Agent 3's design, adopted by Lead 17 Nov as a hard prerequisite before staff Assistants are activated): the agent LIST of a
+   * floor currently holding a person's own Assistant ("My Assistant", duty 'person-assistant', set ONLY by own-assistant.ts's
+   * setPersonAssistantDuty; floors.ts:613 copies duty forward from `before` on every chart, so a chart can neither set nor clear it) changes for
+   * nobody but the owner of this app. Its maker keeps floor('manage') there whatever Settings › Access says (the `share` rules, shared/access.ts),
+   * and a chat added there would be an ordinary chat of theirs: with C0 and of95c's "A" live, one typed into with the Server's own tools is a
+   * shell on the Server as its Windows user.
+   * Keyed on the duty (the Server's own, never the subject's to clear) and read from the floor's state BEFORE the change: a drop of the Assistant
+   * itself is an agent-LIST change, caught by the very read that would otherwise let a later add through. The condition can never be falsified by
+   * the request trying to act on it.
+   * Every way the list changes, each call site below: POST /floors/:id/agents (an add), a chart (PATCH /floors/:id) that adds or drops an agent,
+   * a move onto or off the floor (moveAgent, when the target floor differs: a same-floor reorder changes neither floor's agent set), and
+   * agent_hire (a chat's own tool, "me" is the hiring chat's caller). A floor that cannot be read is refused before this (floorOf throws 404).
+   */
+  function refuseAssistantFloorChange(c: Caller, floor: Floor) {
+    if (!access.isAdmin(c) && floor.agents.some(a => isPersonAssistant(a))) {
+      throw authError(403, "Only the owner of this app changes who is on a personal Assistant's floor.", 'admin-only')
+    }
+  }
+  /**
+   * Whether a chart's `agents` would change WHICH agents are on the floor (never mind a field edited on one that stays): a rename or a model
+   * change, with every current id present once and nothing else, is not a change. Anything this cannot tell for certain — not a list, a missing
+   * or non-string id, a repeated id — counts as a change (refused on an Assistant floor), never as "the same": an ambiguous chart must not be the
+   * way around the guard above it.
+   */
+  function agentListChanges(before: readonly FloorAgent[], rawAgents: unknown): boolean {
+    if (!Array.isArray(rawAgents)) return true
+    const ids = rawAgents.map(a => (isObject(a) && typeof a.id === 'string' && a.id ? a.id : null))
+    if (ids.some(id => id === null)) return true
+    const next = new Set(ids as string[])
+    if (next.size !== ids.length) return true
+    const have = new Set(before.map(a => a.id))
+    return next.size !== have.size || [...have].some(id => !next.has(id))
+  }
 
   function patchFloor(id: string, body: unknown, as?: ChatOwner) {
     const pending = (floorMutations.get(id) ?? Promise.resolve()).catch(() => {}).then(() => patchFloorPrepared(id, body, as))
@@ -7490,7 +7527,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { floors: floors.reorder(r.body.order as string[]) }
       },
     ],
-    ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body, access.ownerOf(callerOf(r)))],
+    ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => {
+      // R1b: a chart that would change WHICH agents are on a personal Assistant's floor is refused the same as an add or a drop is below; a
+      // rename, or a chart naming the exact same agents, passes (agentListChanges decides; anything ambiguous counts as a change).
+      const before = floorOf(id)
+      if (isObject(r.body) && r.body.agents !== undefined && agentListChanges(before.agents, r.body.agents)) refuseAssistantFloorChange(callerOf(r), before)
+      return patchFloor(id, r.body, access.ownerOf(callerOf(r)))
+    }],
     [
       // F-067: Settings › Chats: what an agent set to Default gets. Read from this PC's copy; changed on the hub.
       'GET',
@@ -7596,6 +7639,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id], r) => {
         const b = isObject(r.body) ? r.body : {}
         if (b.model !== undefined && !(AGENT_MODELS as readonly unknown[]).includes(b.model)) throw apiError(400, 'model is opus, sonnet or haiku')
+        // R1b: an add to a personal Assistant's floor is refused the same as agent_hire's.
+        refuseAssistantFloorChange(callerOf(r), floorOf(id))
         return floors.addAgent(id, b as NewAgent, access.ownerOf(callerOf(r)))
       },
     ],
@@ -7606,6 +7651,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-033: dragged: reordered on its floor, or onto another (its chat goes on as it is).
         const b = isObject(r.body) ? r.body : {}
         const to = typeof b.floorId === 'string' && b.floorId ? b.floorId : id
+        // R1b: onto another floor changes BOTH floors' agent lists (a same-floor reorder changes neither, so it is not guarded).
+        if (to !== id) { const c = callerOf(r); refuseAssistantFloorChange(c, floorOf(id)); refuseAssistantFloorChange(c, floorOf(to)) }
         return floors.moveAgent(id, agentId, to, typeof b.before === 'string' ? b.before : null)
       },
     ],
@@ -7794,18 +7841,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).
     ['POST', /^\/accounts\/codebases\/import$/, (_, r) => codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // Order ocf00: the codebase tabs. The owner's only (POLICY); every write is checked by the database's rules too (codebase-tabs.ts).
-    ['GET', /^\/accounts\/codebases\/([^/]+)\/tabs$/, ([id], r) => codebaseTabs.read(access.ownerOf(callerOf(r)).id, id), 'local'],
+    // Order o94f3 (Shubham: values are never for agents, Assistants or chats): everything that reads or writes a VARIABLE (the tabs read, the sets, the variables, the reveal, the "+" and the paste box) is also
+    // humanOnly: his own signed-in page session, never a chat's key and never a program that has only the app's token. A chat sees names and counts through the list; nothing here.
+    ['GET', /^\/accounts\/codebases\/([^/]+)\/tabs$/, ([id], r) => (humanOnly(r), codebaseTabs.read(access.ownerOf(callerOf(r)).id, id)), 'local'],
     ['PUT', /^\/accounts\/codebases\/([^/]+)\/sections\/([^/]+)$/, ([id, section], r) => codebaseTabs.setSection(access.ownerOf(callerOf(r)).id, id, section, isObject(r.body) ? r.body.description : undefined), 'local'],
     ['POST', /^\/accounts\/codebases\/([^/]+)\/links$/, ([id], r) => codebaseTabs.addLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     ['PUT', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.updateLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     ['DELETE', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.deleteLink(access.ownerOf(callerOf(r)).id, id), 'local'],
-    ['POST', /^\/accounts\/codebases\/([^/]+)\/subsets$/, ([id], r) => codebaseTabs.addSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined), 'local'],
-    ['PUT', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => codebaseTabs.renameSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined), 'local'],
-    ['DELETE', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => codebaseTabs.deleteSubset(access.ownerOf(callerOf(r)).id, id), 'local'],
-    ['POST', /^\/accounts\/subsets\/([^/]+)\/vars$/, ([id], r) => codebaseTabs.addVar(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['PUT', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => codebaseTabs.updateVar(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['DELETE', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => codebaseTabs.deleteVar(access.ownerOf(callerOf(r)).id, id), 'local'],
-    ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, ([id], r) => codebaseTabs.reveal(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/codebases\/([^/]+)\/subsets$/, ([id], r) => (humanOnly(r), codebaseTabs.addSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined)), 'local'],
+    ['PUT', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.renameSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined)), 'local'],
+    ['DELETE', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.deleteSubset(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/subsets\/([^/]+)\/vars$/, ([id], r) => (humanOnly(r), codebaseTabs.addVar(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
+    ['PUT', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.updateVar(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
+    ['DELETE', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.deleteVar(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), codebaseTabs.reveal(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    // Order o94f3 "show all": every value of one set in one call, for his own tap (or his device setting); humanOnly like reveal, logged as a count only.
+    ['POST', /^\/accounts\/subsets\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), codebaseTabs.revealSet(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    // Order o94f3: the Env tab's "+" and its ".env" paste box: one call adds one variable or many to the set named in the body (made when it is not there yet). Names and counts only come back.
+    ['POST', /^\/accounts\/codebases\/([^/]+)\/env$/, ([id], r) => (humanOnly(r), codebaseTabs.addEnv(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
     // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
     [
       'GET',

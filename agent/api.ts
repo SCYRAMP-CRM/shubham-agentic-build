@@ -164,6 +164,8 @@ export interface ApiOptions {
   /** F-057, tests: how often a text WebSocket client is pinged, and how long one may stay silent before it is dropped. */
   wsPingMs?: number
   wsDeadMs?: number
+  /** Tests: false lets a request target with dot segments (or that is no path) through to the gate, to prove the gate alone closes the way out (order o2d3c). Default true. */
+  refuseOddTargets?: boolean
 }
 
 /** One HTTP request to a mount: `rest` is the path after its prefix, `body` the JSON of a POST, PATCH or PUT. */
@@ -243,6 +245,24 @@ function tokenOk(given: unknown, token: string) {
   const a = Buffer.from(given)
   const b = Buffer.from(token)
   return a.length === b.length && timingSafeEqual(a, b)
+}
+
+/** A dot segment as a URL parser reads it: "." or "..", either dot also written "%2e" (any case). */
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i
+
+/**
+ * Order o2d3c: what is refused about a request target before anything is decided from it. The agent decides in two places, who may have a route (gate()) and which route it is
+ * (the parsed path), and they used to read different strings: the raw target for the gate, `new URL().pathname` for the route, so "/crm-proxy/../../state" was authorised as
+ * crm-proxy and dispatched as /state. Both now read the parsed pathname; this is the second layer, so that no target a URL parser would rewrite gets as far as either.
+ * Refused: a target that is not a path on this agent (it must start with ONE "/": "//host/x", "/\host/x" and "http://host/x" make a URL parser read a host) and any path segment that is "." or
+ * ".." in any spelling, "\" counting as "/" because a URL parser reads it so. Everything else passes untouched, because the URL parser does not decode it either: "%2F", "%20", "%2e"
+ * inside a longer name, "a..b", a query ("?next=../x") and a fragment are not a way out. A legitimate client cannot send a dot segment (a browser or any URL library resolves it first).
+ */
+export function targetProblem(target: string | undefined): string | null {
+  const t = target ?? '/'
+  if (!t.startsWith('/') || /^\/[/\\]/.test(t)) return 'The request target is not a path on this agent.'
+  const p = t.split(/[?#]/, 1)[0]
+  return p.split(/[/\\]/).some(segment => DOT_SEGMENT.test(segment)) ? 'A path with "." or ".." in it is not accepted.' : null
 }
 
 function send(res: ServerResponse, status: number, data: unknown) {
@@ -596,15 +616,20 @@ export function startApi(o: ApiOptions): Promise<Api> {
     return o.auth && !c.person && !isPageRequest(req.headers) ? { ...c, machine: true } : c
   }
 
+  /** Order o2d3c: see targetProblem(). Only a test turns it off, to prove that the gate alone, reading the parsed pathname, closes the way out. */
+  const refuseOddTargets = o.refuseOddTargets !== false
+
   /**
    * F-118: the sign-in gate for what a page asks of the PC. 401 (code sign-in) when this request has to be signed in
    * and is not; 403 (admin-only) for the PC's own routes when the person is not the owner. Every refusal is logged
    * (who, the route; never a cookie or a token).
+   * Order o2d3c: `path` is the PARSED pathname, the very value the route, mount or WebSocket is chosen from, never the raw request target: the gate used to read the raw one, so
+   * "/crm-proxy/../../state" was authorised as crm-proxy and dispatched as /state. Every caller passes it (a missed one is a type error).
    */
-  function gate(c: Caller, req: IncomingMessage, ownerOnly: boolean) {
+  function gate(c: Caller, req: IncomingMessage, ownerOnly: boolean, path: string) {
     const auth = o.auth
     if (!auth) return
-    const route = `${req.method ?? 'GET'} ${(req.url ?? '').split('?')[0]}`
+    const route = `${req.method ?? 'GET'} ${path}`
     if (!c.person && !c.machine && auth.needsSignIn(c.via)) {
       auth.deny(c, 401, 'sign-in', route)
       throw authError(401, 'Sign in first.', 'sign-in')
@@ -614,7 +639,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
     // owner-only wall for that feature's routes. A route that is no feature's stays as before for the PC's own routes (403 admin-only) and is
     // refused on a mount that decides by person (fail closed).
     if (o.access && c.person && !auth.isAdmin(c)) {
-      const apiPath = (req.url ?? '').split('?')[0].slice(AGENT_API_PREFIX.length)
+      const apiPath = path.slice(AGENT_API_PREFIX.length)
       const method = typeof req.headers.upgrade === 'string' && req.headers.upgrade.toLowerCase() === 'websocket' ? 'WS' : (req.method ?? 'GET')
       if (o.access.opensRoute(c, method, apiPath)) return
       if (ownerOnly && !routeRule(method, apiPath)) {
@@ -675,7 +700,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       if (foreignOrigin(req)) throw apiError(403, 'Requests from pages on other sites are refused')
       if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
       caller = callerOf(req)
-      gate(caller, req, !m.scoped)
+      gate(caller, req, !m.scoped, url.pathname)
     }
     const method = req.method ?? 'GET'
     const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? await readJson(req, m.maxBody?.(rest)) : undefined
@@ -742,6 +767,9 @@ export function startApi(o: ApiOptions): Promise<Api> {
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse) {
+    // Order o2d3c: a target a URL parser would rewrite (dot segments, a smuggled host) is refused before anything is decided from it; see targetProblem().
+    const odd = refuseOddTargets ? targetProblem(req.url) : null
+    if (odd) return send(res, 400, { error: odd })
     const url = new URL(req.url ?? '/', 'http://agent')
     const path = url.pathname
     if (path === `${AGENT_API_PREFIX}/health` && req.method === 'GET') return send(res, 200, { ok: true })
@@ -762,7 +790,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
         if (foreignOrigin(req)) throw apiError(403, 'Requests from pages on other sites are refused')
         if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
         const caller = callerOf(req)
-        gate(caller, req, !mount.scoped)
+        gate(caller, req, !mount.scoped, path)
         return raw(req, res, caller)
       }
       const result = await answerMount(mount, req, url)
@@ -791,7 +819,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       }
       return send(res, 404, { error: `No such path: ${path}` })
     }
-    gate(callerOf(req), req, true)
+    gate(callerOf(req), req, true, path)
     let methodMismatch = false
     for (const [method, pattern, run] of routes) {
       const m = pattern.exec(rest)
@@ -956,6 +984,8 @@ export function startApi(o: ApiOptions): Promise<Api> {
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     socket.on('error', () => {})
+    const odd = refuseOddTargets ? targetProblem(req.url) : null
+    if (odd) return refuse(socket, 400, odd)
     const url = new URL(req.url ?? '/', 'http://agent')
     const path = url.pathname
     const remote = remotePath.exec(path)
@@ -976,7 +1006,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       // F-118: who is asking, and may they have this socket (the mount decides which chat).
       caller = callerOf(req)
       try {
-        gate(caller, req, !mount?.scoped)
+        gate(caller, req, !mount?.scoped, path)
         if (mount && mountWs) mount.wsAllow?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url.searchParams, caller)
       } catch (e) {
         const status = (e as { status?: unknown }).status

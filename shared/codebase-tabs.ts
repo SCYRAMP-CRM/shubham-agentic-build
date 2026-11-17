@@ -2,6 +2,8 @@
 // The rules both the agent and the page use: the sections, the limits, which variable names look like secrets (their values are masked by default and
 // never sent to the page unless he asks for them), and the checks on a link, a name and a value. Pure: no network, no database.
 
+import { looksSecret } from './codebase-accounts.ts'
+
 export const TAB_SECTIONS = ['be', 'fe', 'deployment', 'database'] as const
 export type TabSection = (typeof TAB_SECTIONS)[number]
 export const SECTION_WORDS: Record<TabSection, string> = { be: 'BE', fe: 'FE', deployment: 'Deployment', database: 'Database' }
@@ -19,9 +21,39 @@ export const TAB_LIMITS = {
 /** A variable name: letters, digits, _ . - (not starting with a digit), as an .env file has them. */
 export const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/
 
-/** Names that look like they hold a secret. Their values are masked on the page by default, and only given when he asks (reveal). */
-const SECRET_NAME = /KEY|SECRET|TOKEN|PASS|PWD|PRIVATE|CREDENTIAL|AUTH|DSN|CONNECTION|COOKIE|SESSION|SIGNATURE|CERT/i
+/**
+ * Names that look like they hold a secret. Their values are masked on the page by default, and only given when he asks (reveal). A connection string is one whatever it is called: DATABASE_URL has no
+ * secret word in it but holds the database's login (17 Nov 2026: the first sets that held one showed it in plain), so the names of such addresses are listed here too.
+ */
+const SECRET_NAME = /KEY|SECRET|TOKEN|PASS|PWD|PRIVATE|CREDENTIAL|AUTH|DSN|CONNECTION|COOKIE|SESSION|SIGNATURE|CERT|DATABASE_URL|DATABASE_URI|DB_URL|DB_URI|REDIS_URL|MONGO/i
 export const isSecretName = (name: string): boolean => SECRET_NAME.test(name)
+
+/**
+ * A VALUE that is secret by its SHAPE, whatever its name says: a connection string (postgres://, mongodb://, redis://...), an address with a user name and password in it, a token or key of a known
+ * shape, a private key block, a long bare key (the same test the Codebases tab holds its notes and addresses to). It is masked like a secret-named one and given only by reveal.
+ */
+export const valueLooksSecret = (value: string): boolean => value !== '' && looksSecret(value)
+
+/**
+ * WHAT MAY BE SHOWN (order o94f3, Lead's rule of 17 Nov: fail closed). Not a list of what to hide but a short list of what is safe to show; everything else is masked, with a reveal that only his own
+ * signed-in tap can make. A name nobody has classified (a webhook address with its key in the path, a login code, anything a project invents) is therefore hidden by default, never shown by default.
+ * The list is structural, not per project: the names a build tool publishes to every browser by definition (its own public prefixes) and a few plain ones every project has (NODE_ENV, PORT...).
+ * Even those are hidden when the name has a secret word in it or the value is secret by its shape (the two detectors above can only HIDE something the list would show, never show something it hides).
+ */
+const PUBLIC_PREFIX = /^(NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VITE|PUBLIC)_/
+const PLAIN_NAME = /^(NODE_ENV|PORT|TZ|LOG_LEVEL|LANG|VERCEL_ENV|NEXT_TELEMETRY_DISABLED|CI)$/
+export const mayShowName = (name: string): boolean => (PUBLIC_PREFIX.test(name) || PLAIN_NAME.test(name)) && !isSecretName(name)
+export const mayShowValue = (name: string, value: string): boolean => mayShowName(name) && !valueLooksSecret(value)
+
+/** The environments the "+" offers to start with; his own names are allowed too. */
+export const ENV_SUGGESTIONS = ['Dev', 'Prod', 'Preview'] as const
+/** The order of the sets on the Env tab: Dev, then Prod, then Preview (staging), then the rest, each group in the order the sets were made. */
+export function envRank(setName: string): number {
+  if (/\b(dev|development|local)\b/i.test(setName)) return 0
+  if (/\b(prod|production|live)\b/i.test(setName)) return 1
+  if (/\b(preview|staging|stage|test)\b/i.test(setName)) return 2
+  return 3
+}
 
 export type Checked<T> = { ok: true; value: T } | { ok: false; message: string }
 

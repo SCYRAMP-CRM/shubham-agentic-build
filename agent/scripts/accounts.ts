@@ -1,9 +1,10 @@
 // order o4857, o28a6: the Accounts setup and copy as a command. Run it from the app's own folder (the one with package.json), on the PC that holds the CRM sign-in (the Server):
 //   node agent/scripts/accounts.ts help
 // The logic and its tests are agent/agentic/accounts-cli.ts; this file only connects it to the terminal, the state folder and the real database package. Passwords are typed with no echo
-// (never as an argument or an environment variable), and nothing here prints one.
-import { createInterface } from 'node:readline'
+// (never as an argument or an environment variable), and nothing here prints one. The prompts are agent/agentic/hidden-prompt.ts: a hidden answer closes the readline interface FIRST (a paused one still
+// echoed every key, found 17 Nov 2026 with a throwaway string in a pseudo-terminal), and its test types a string at a fake terminal and checks it never comes back out.
 import path from 'node:path'
+import { createPrompter } from '../agentic/hidden-prompt.ts'
 import { statePaths } from '../config.ts'
 import { createAccountsEmail } from '../agentic/accounts-email.ts'
 import { createAccountsImport } from '../agentic/accounts-import.ts'
@@ -16,36 +17,11 @@ import { createCrmProxy } from '../agentic/crmproxy.ts'
 const paths = statePaths()
 const proxy = createCrmProxy({ file: paths.crmSession })
 
-const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY) })
+const prompter = createPrompter({ input: process.stdin, output: process.stdout })
 const io: Io = {
   say: line => console.log(line),
-  ask: q => new Promise(resolve => rl.question(q, a => resolve(a))),
-  askHidden: q =>
-    new Promise((resolve, reject) => {
-      const stdin = process.stdin
-      if (!stdin.isTTY) return reject(new Error('A password is typed in a terminal (no echo). Run this command in one.'))
-      process.stdout.write(q)
-      rl.pause()
-      let typed = ''
-      stdin.setRawMode(true)
-      stdin.resume()
-      stdin.setEncoding('utf8')
-      const onData = (chunk: string) => {
-        for (const c of chunk) {
-          if (c === '\r' || c === '\n' || c === '\u0004') {
-            stdin.setRawMode(false)
-            stdin.off('data', onData)
-            process.stdout.write('\n')
-            rl.resume()
-            return resolve(typed)
-          }
-          if (c === '\u0003') process.exit(130)
-          if (c === '\u007f' || c === '\b') typed = typed.slice(0, -1)
-          else typed += c
-        }
-      }
-      stdin.on('data', onData)
-    }),
+  ask: q => prompter.ask(q),
+  askHidden: q => prompter.askHidden(q),
 }
 
 // The package is loaded only when it is used (it is the app's pinned postgres 3.4.8).
@@ -79,10 +55,10 @@ try {
     crmSignedIn: () => proxy.session().signedIn,
     packageThere: () => loadPackage().then(() => true, () => false),
   })
-  rl.close()
+  prompter.close()
   process.exit(code)
 } catch (e) {
-  rl.close()
+  prompter.close()
   // Only the message of OUR errors; never a stack (it could carry a host or a login).
   console.log(e instanceof Error ? e.message : 'Something went wrong.')
   process.exit(1)
