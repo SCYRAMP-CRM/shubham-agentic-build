@@ -71,7 +71,11 @@ import { createTts, type Tts } from './speech/tts.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { createWhatsAppBackendProxy } from './whatsapp-backend/proxy.ts'
+import { createSendSwitch } from './whatsapp-backend/send-switch.ts'
+import { createNotes } from './whatsapp-backend/notes.ts'
+import { createSends } from './whatsapp-backend/sends.ts'
 import { createBackendSupervisor, type BackendView } from './whatsapp-backend/supervisor.ts'
+import { createWhatsAppCrm } from './whatsapp-crm/crm.ts'
 import { createAssistantTools, type AssistantTools } from './whatsapp-backend/assistant-tools.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts, DEFAULT_GATE_PORT } from './ports/index.ts'
@@ -434,6 +438,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // Order of5a0 (A2): F-079's login until the page's WhatsApp is linked and answering; then that one (whatsapp-backend/assistant-tools.ts). The
   // page's WhatsApp has never been linked, so until he links it this changes nothing.
   if (role === 'hub' && agentic && whatsapp) waAssistant = createAssistantTools({ inApp: whatsapp.tools, dir: waBackendDir, backend: () => waBackend?.view() ?? waBackendOffView, log: log.child('wa-assistant') })
+  // Order obf15 (oWA S2): sending from the page's WhatsApp is OFF until a signed-in administrator switches it on (sending.json beside the backend's token; missing or unreadable
+  // is OFF), and even then the backend sends only against a ticket made for each message after that request was a person's own (whatsapp-backend/sends.ts, send-ticket.ts).
+  // The key for the tickets is made new each time it is switched ON, handed to the backend over the supervisor's private channel, and taken away when it is switched OFF.
+  // Order oWA S6: the person's private notes about chats (notes.json beside the backend's state): on the hub, where the page is served; never sent to WhatsApp, the CRM or a cloud.
+  const waNotes = role === 'hub' && agentic ? createNotes(path.join(waBackendDir, 'notes.json'), log.child('wa-notes')) : undefined
+  const waSends = waBackend && agentic ? createSends({ sw: createSendSwitch(path.join(waBackendDir, 'sending.json'), log.child('wa-backend')), backend: waBackend, human: req => agentic.humanProof('wa-send', [], undefined, req) }) : undefined
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
   // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this
@@ -1249,7 +1259,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       return current === null && available === null ? null : { current, available }
     }
     api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, buildBadge, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount, pcDesktop.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), createCpuProfileMount({ dir: paths.agent, log: log.child('diag') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
-      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: waBackendDir, backend: () => waBackend?.view() ?? waBackendOffView, assistantTools: () => waAssistant }), ...(extras.mounts ?? [])] })
+      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: waBackendDir, backend: () => waBackend?.view() ?? waBackendOffView, assistantTools: () => waAssistant, sends: waSends, notes: waNotes }), ...(agentic ? [createWhatsAppCrm({ auth, proxy: agentic.crmProxy, log: log.child('wa-crm') })] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })

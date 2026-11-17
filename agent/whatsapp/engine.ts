@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { rmSync } from 'node:fs'
 import path from 'node:path'
-import { waPreview, type WaChat, type WaMe, type WaMessage, type WaMessageType, type WaState } from '../../shared/whatsapp.ts'
+import { waPreview, WA_MEDIA_GONE, WA_MEDIA_MAX_BYTES, WA_MEDIA_TOO_BIG, type WaChat, type WaContactDetails, type WaGroupParticipant, type WaMe, type WaMediaFile, type WaMessage, type WaMessageType, type WaNewChat, type WaState } from '../../shared/whatsapp.ts'
 
 // F-079: one linked WhatsApp device, driven through whatsapp-web.js (WhatsApp Web in the PC's own Chrome).
 // Ported from techserverbz/whatsapp-backend src/engines/webjs/engine.ts (Oct 2026), keeping what it learned
@@ -29,6 +29,19 @@ export interface WaClient {
   getChatById(id: string): Promise<unknown>
   sendMessage(chatId: string, content: string): Promise<unknown>
   requestPairingCode(phone: string, showNotification?: boolean): Promise<unknown>
+  // Order oWA S4: what the contact panel, the chat list's numbers and the chat's own actions use. Optional: a program that lacks one answers "it cannot do that", never a crash.
+  getContactById?(id: string): Promise<unknown>
+  /** Privacy ids (…@lid) to what WhatsApp Web knows of them: [{ lid, pn }] in the order asked, `pn` the phone number's id (…@c.us). */
+  getContactLidAndPhone?(ids: string[]): Promise<unknown>
+  getProfilePicUrl?(id: string): Promise<unknown>
+  sendSeen?(chatId: string): Promise<unknown>
+  archiveChat?(chatId: string): Promise<unknown>
+  unarchiveChat?(chatId: string): Promise<unknown>
+  pinChat?(chatId: string): Promise<unknown>
+  unpinChat?(chatId: string): Promise<unknown>
+  getNumberId?(number: string): Promise<unknown>
+  // Order oWA S3: a message by its id (to open its file).
+  getMessageById?(id: string): Promise<unknown>
   info?: unknown
   pupBrowser?: unknown
 }
@@ -46,6 +59,14 @@ export interface EngineOptions {
   pollMs?: number
   pollTries?: number
   retryMs?: number
+  /** Order o714a: how long a caller waits for the chat list before being told it is still being read (default 12 s: under the callers' own 20 s). */
+  chatsWaitMs?: number
+  /** Order o714a: a list read this recently is served as it is (default 2 s). */
+  chatsFreshMs?: number
+  /** Order o714a: a read that has run this long is given up on, and the next caller starts another (default 5 minutes). */
+  chatsStuckMs?: number
+  /** Order oWA S4: how long a read of the chat list waits for the phone numbers behind its privacy ids (default 1.5 s; they are filled in as they come, and a later read has them). */
+  numbersWaitMs?: number
 }
 
 export interface EngineStatus {
@@ -92,6 +113,27 @@ const TYPES = new Set<WaMessageType>(['chat', 'image', 'video', 'audio', 'ptt', 
 const MEDIA = new Set(['image', 'video', 'audio', 'ptt', 'document', 'sticker'])
 /** Chats that aren't conversations: status updates, channels. */
 const NOT_A_CHAT = /@(broadcast|newsletter)$/
+/** Order oWA S4: a number WhatsApp Web could not place behind a privacy id is asked for again after this. */
+const NUMBER_MISS_MS = 10 * 60_000
+/** Privacy ids asked about in one go (one that WhatsApp Web cannot place fails the answer, and is then asked alone). */
+const NUMBER_BATCH = 25
+/** The numbers kept (a privacy id and its number do not change): enough for any chat list, and emptied if it ever grows past this. */
+const NUMBERS_KEPT = 5000
+/** Members of a group whose names and numbers are looked up for the contact panel, and the most that panel's read may take. */
+const MEMBERS_NAMED = 64
+const CONTACT_BUDGET_MS = 12_000
+
+/**
+ * Digits of a phone number's id (…@c.us, …@s.whatsapp.net) or of a typed number; '' for any other id: the digits of a privacy id (…@lid) or of a group's id are not a number and must
+ * never be taken for one.
+ */
+export function numberFromId(id: string): string {
+  const [user, domain] = id.split('@')
+  if (domain !== undefined && domain !== 'c.us' && domain !== 's.whatsapp.net') return ''
+  return user.replace(/\D/g, '')
+}
+
+const unsupported = (what: string) => Object.assign(new Error(`This WhatsApp program cannot ${what}.`), { status: 501 })
 
 /** Whether a message is one a person wrote (not a notification of WhatsApp's own: a key change, a group event, ...). */
 export function shown(raw: unknown): boolean {
@@ -162,9 +204,32 @@ function reasonOf(raw: unknown): string {
 
 const notReady = () => Object.assign(new Error('WhatsApp is not open yet: it opens when it is used. Try again in a moment.'), { status: 409 })
 
+/**
+ * Order o714a (17 Nov 2026): the chat list is still being read. The FIRST read after a link is slow (whatsapp-web.js's getChats() waits on WhatsApp for every
+ * group's details while WhatsApp Web is still doing its first sync: the backend log showed ready at 11:24:09 and its first error exactly 60 s later), so a caller
+ * is told so in plain words, with a code the page reads to wait and ask again by itself. It is a 409 (not ready yet), never a 500 "could not answer".
+ */
+export const CHATS_LOADING = 'wa-chats-loading'
+const stillReading = () =>
+  Object.assign(new Error('WhatsApp is still reading your chats. The first time after linking this can take a few minutes. Nothing is lost: it opens by itself, or try again in a minute.'), { status: 409, code: CHATS_LOADING })
+
+interface ChatsRead {
+  promise: Promise<WaChat[]>
+  /** When it began, and in which generation (a stop or an unlink ends it). */
+  at: number
+  gen: number
+}
+
 export class WaEngine extends EventEmitter<EngineEvents> {
-  private readonly o: EngineOptions & { pollMs: number; pollTries: number; retryMs: number }
+  private readonly o: EngineOptions & { pollMs: number; pollTries: number; retryMs: number; chatsWaitMs: number; chatsFreshMs: number; chatsStuckMs: number; numbersWaitMs: number }
   private client: WaClient | null = null
+  /** Order oWA S4: the phone number behind each privacy id WhatsApp Web has placed, the ones it could not (until when not to ask again), and the run asking for the chat list's. */
+  private readonly numbers = new Map<string, string>()
+  private readonly numberMiss = new Map<string, number>()
+  private numberFill: Promise<void> | null = null
+  /** The one read of the chat list under way (everyone who asks while it runs is given THAT read), and the list it last gave. */
+  private chatsRead: ChatsRead | null = null
+  private chatsLast: { list: WaChat[]; at: number; gen: number } | null = null
   /** Goes up at every launch and stop: a client's events count only while their generation is the current one. */
   private gen = 0
   private st: EngineStatus = { state: 'off', qr: null, pairingCode: null, me: null, reason: null, loading: null, linked: null }
@@ -175,7 +240,7 @@ export class WaEngine extends EventEmitter<EngineEvents> {
 
   constructor(o: EngineOptions) {
     super()
-    this.o = { pollMs: 3000, pollTries: 30, retryMs: 1500, ...o }
+    this.o = { pollMs: 3000, pollTries: 30, retryMs: 1500, chatsWaitMs: 12_000, chatsFreshMs: 2_000, chatsStuckMs: 5 * 60_000, numbersWaitMs: 1_500, ...o }
   }
 
   status(): EngineStatus {
@@ -226,13 +291,66 @@ export class WaEngine extends EventEmitter<EngineEvents> {
     return code
   }
 
-  /** The chats, newest first (no status updates or channels). */
+  /**
+   * The chats, newest first (no status updates or channels). Order o714a: ONE read of them at a time, for everyone who asks (a second "Try again" while the
+   * first is still running used to start another inside WhatsApp Web, which only made the wait longer), and the list is kept:
+   * - one read a moment ago is served as it is;
+   * - a read that finishes within the caller's wait is its answer;
+   * - a read still going after it (the cold first read after a link): the list he last saw if there is one, else a plain "still reading" (409, code
+   *   wa-chats-loading), while the read itself goes on and is there for the next caller;
+   * - a read that fails is not remembered (its error is the caller's), and one that never answers is given up on after a while (WhatsApp Web wedged).
+   */
   async chats(): Promise<WaChat[]> {
-    const raw = await this.need().getChats()
-    return raw
-      .map(toChat)
-      .filter(c => c.id && !NOT_A_CHAT.test(c.id))
-      .sort((a, b) => b.at - a.at)
+    const client = this.need()
+    const gen = this.gen
+    const last = this.chatsLast
+    if (last && last.gen === gen && Date.now() - last.at < this.o.chatsFreshMs) return last.list
+    const read = this.readChats(client, gen)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const waited = new Promise<null>(resolve => {
+      timer = setTimeout(() => resolve(null), this.o.chatsWaitMs)
+      timer.unref()
+    })
+    try {
+      const got = await Promise.race([read.promise.then(list => ({ list })), waited])
+      if (got) return got.list
+    } finally {
+      clearTimeout(timer)
+    }
+    if (this.chatsLast && this.chatsLast.gen === gen) return this.chatsLast.list
+    throw stillReading()
+  }
+
+  /** The read under way, or a new one when there is none (or the one there is has run past chatsStuckMs, or belongs to a closed session). */
+  private readChats(client: WaClient, gen: number): ChatsRead {
+    const cur = this.chatsRead
+    if (cur && cur.gen === gen && Date.now() - cur.at < this.o.chatsStuckMs) return cur
+    const promise = client.getChats().then(async raw => {
+      const list = raw
+        .map(toChat)
+        .filter(c => c.id && !NOT_A_CHAT.test(c.id))
+        .sort((a, b) => b.at - a.at)
+      if (gen === this.gen) this.chatsLast = { list, at: Date.now(), gen }
+      // Order oWA S4: the number behind each privacy id, so the CRM can be matched by it. Waited for only a moment: WhatsApp Web answers as it can, each answer goes into THIS list as it
+      // comes, and the next read of the list has them all.
+      const learning = this.fillNumbers(client, gen, list)
+      if (learning) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const moment = new Promise<void>(resolve => {
+          timer = setTimeout(resolve, this.o.numbersWaitMs)
+          timer.unref()
+        })
+        await Promise.race([learning, moment]).finally(() => clearTimeout(timer))
+      }
+      return list
+    })
+    const read: ChatsRead = { promise, at: Date.now(), gen }
+    this.chatsRead = read
+    const done = () => {
+      if (this.chatsRead === read) this.chatsRead = null
+    }
+    promise.then(done, done)
+    return read
   }
 
   /**
@@ -271,6 +389,208 @@ export class WaEngine extends EventEmitter<EngineEvents> {
     return toMessage(await this.need().sendMessage(chatId, text))
   }
 
+  // --- Order oWA S4: the people behind the chats ---------------------------------------------------------------------------------------------
+
+  /** What is known of the number of a chat's person without asking: its id's own digits, or what WhatsApp Web placed behind a privacy id. '' when it is not known (and for a group). */
+  private numberKnown(id: string): string {
+    return numberFromId(id) || this.numbers.get(id) || ''
+  }
+
+  /** The phone number behind a chat id (digits), asking WhatsApp Web when it is a privacy id; '' when it cannot be known. A success is kept; a miss is not asked again for ten minutes. */
+  async numberOf(chatId: string): Promise<string> {
+    const known = this.numberKnown(chatId)
+    if (known || !chatId.endsWith('@lid')) return known
+    const client = this.client
+    if (!client || typeof client.getContactLidAndPhone !== 'function' || (this.numberMiss.get(chatId) ?? 0) > Date.now()) return ''
+    await this.learnNumbers(client, this.gen, [chatId])
+    return this.numbers.get(chatId) ?? ''
+  }
+
+  /** Asks WhatsApp Web for the numbers behind these privacy ids, in batches, and keeps what it says (a batch that fails is asked again one id at a time, so one it cannot place costs only itself). */
+  private async learnNumbers(client: WaClient, gen: number, ids: string[], into: WaChat[] = []): Promise<void> {
+    const ask = client.getContactLidAndPhone
+    if (typeof ask !== 'function') return
+    const keep = (id: string, row: unknown) => {
+      const digits = numberFromId(str(obj(row).pn))
+      if (!digits) {
+        this.numberMiss.set(id, Date.now() + NUMBER_MISS_MS)
+        return
+      }
+      if (this.numbers.size >= NUMBERS_KEPT) this.numbers.clear()
+      this.numbers.set(id, digits)
+      this.numberMiss.delete(id)
+      for (const c of into) if (c.id === id) c.number = digits
+    }
+    for (let i = 0; i < ids.length; i += NUMBER_BATCH) {
+      if (gen !== this.gen) return
+      const batch = ids.slice(i, i + NUMBER_BATCH)
+      try {
+        const rows = await ask.call(client, batch)
+        const answers = Array.isArray(rows) ? rows : []
+        batch.forEach((id, k) => keep(id, answers[k]))
+      } catch {
+        for (const id of batch) {
+          if (gen !== this.gen) return
+          try {
+            const rows = await ask.call(client, [id])
+            keep(id, Array.isArray(rows) ? rows[0] : undefined)
+          } catch {
+            this.numberMiss.set(id, Date.now() + NUMBER_MISS_MS)
+          }
+        }
+      }
+    }
+  }
+
+  /** For the chat list: the numbers known now go into it, and those of the privacy-id chats not yet placed are asked for (one run at a time). Resolves when that run is done; null: nothing to ask. */
+  private fillNumbers(client: WaClient, gen: number, list: WaChat[]): Promise<void> | null {
+    for (const c of list) {
+      const n = c.isGroup ? '' : this.numberKnown(c.id)
+      if (n) c.number = n
+    }
+    if (this.numberFill) return this.numberFill
+    const now = Date.now()
+    const ids = list.filter(c => !c.isGroup && c.id.endsWith('@lid') && !c.number && (this.numberMiss.get(c.id) ?? 0) <= now).map(c => c.id)
+    if (ids.length === 0 || typeof client.getContactLidAndPhone !== 'function') return null
+    const run: Promise<void> = this.learnNumbers(client, gen, ids, list)
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.numberFill === run) this.numberFill = null
+      })
+    this.numberFill = run
+    return run
+  }
+
+  /** A picture's address on WhatsApp's own servers (https only), or null: none, not allowed, or this program cannot ask. */
+  private async picOf(client: WaClient, id: string): Promise<string | null> {
+    if (typeof client.getProfilePicUrl !== 'function') return null
+    try {
+      const url = await client.getProfilePicUrl(id)
+      return typeof url === 'string' && /^https:\/\//.test(url) ? url : null
+    } catch {
+      return null
+    }
+  }
+
+  async profilePic(chatId: string): Promise<string | null> {
+    return this.picOf(this.need(), chatId)
+  }
+
+  /** What the contact panel shows for a chat: a person's (name, their own WhatsApp name, number, about, picture) or a group's (description, owner, members with names and numbers). */
+  async contact(chatId: string): Promise<WaContactDetails> {
+    const client = this.need()
+    const isGroup = chatId.endsWith('@g.us')
+    const c = obj(typeof client.getContactById === 'function' ? await client.getContactById(chatId).catch(() => null) : null)
+    const number = isGroup ? '' : await this.numberOf(chatId)
+    const about = typeof c.getAbout === 'function' ? str(await Promise.resolve((c.getAbout as () => unknown).call(c)).catch(() => null)).trim() : ''
+    const pushname = str(c.pushname).trim()
+    // Never a privacy id's or a group's digits as a name: they are not one.
+    const name = str(c.name).trim() || pushname || number || (isGroup ? 'Group' : chatId.endsWith('@lid') ? 'Unknown' : chatId.split('@')[0])
+    const details: WaContactDetails = {
+      id: chatId,
+      isGroup,
+      name,
+      ...(pushname && pushname !== name ? { pushname } : {}),
+      ...(number ? { number } : {}),
+      isBusiness: c.isBusiness === true,
+      isMyContact: c.isMyContact === true,
+      ...(about ? { about } : {}),
+      profilePic: await this.picOf(client, chatId),
+    }
+    if (isGroup) Object.assign(details, await this.groupOf(client, chatId))
+    return details
+  }
+
+  /** A group's description, owner and members. The first MEMBERS_NAMED are named and numbered, within CONTACT_BUDGET_MS; the rest are listed by id. */
+  private async groupOf(client: WaClient, chatId: string): Promise<Partial<WaContactDetails>> {
+    let chat: Obj
+    try {
+      chat = obj(await client.getChatById(chatId))
+    } catch {
+      return {}
+    }
+    const parts = Array.isArray(chat.participants) ? chat.participants : []
+    const members = parts
+      .slice(0, 1024)
+      .map(p => ({ id: idOf(obj(p).id), isAdmin: obj(p).isAdmin === true || obj(p).isSuperAdmin === true, isSuperAdmin: obj(p).isSuperAdmin === true }))
+      .filter(m => m.id)
+    const named = new Map<string, { name: string; number: string }>()
+    const until = Date.now() + CONTACT_BUDGET_MS
+    const ids = members.slice(0, MEMBERS_NAMED).map(m => m.id)
+    for (let i = 0; i < ids.length && Date.now() < until; i += 16) {
+      await Promise.all(
+        ids.slice(i, i + 16).map(async id => {
+          const m = obj(typeof client.getContactById === 'function' ? await client.getContactById(id).catch(() => null) : null)
+          const number = this.numberKnown(id) || str(m.number).replace(/\D/g, '') || (await this.numberOf(id))
+          named.set(id, { name: str(m.name).trim() || str(m.pushname).trim() || str(m.shortName).trim(), number })
+        }),
+      )
+    }
+    const participants: WaGroupParticipant[] = members.map(m => ({ id: m.id, number: named.get(m.id)?.number ?? this.numberKnown(m.id), name: named.get(m.id)?.name ?? '', isAdmin: m.isAdmin, isSuperAdmin: m.isSuperAdmin }))
+    const desc = str(chat.description).trim()
+    const owner = idOf(chat.owner)
+    return { ...(desc ? { groupDesc: desc } : {}), ...(owner ? { owner } : {}), participantsCount: parts.length, participants }
+  }
+
+  /** Tells the other side the chat was read (WhatsApp's read receipt): the person's own request, never a side effect of looking. */
+  async seen(chatId: string): Promise<void> {
+    const client = this.need()
+    if (typeof client.sendSeen !== 'function') throw unsupported('mark a chat as read')
+    await client.sendSeen(chatId)
+    this.chatsLast = null
+  }
+
+  async archive(chatId: string, on: boolean): Promise<void> {
+    const client = this.need()
+    const act = on ? client.archiveChat : client.unarchiveChat
+    if (typeof act !== 'function') throw unsupported(on ? 'archive a chat' : 'unarchive a chat')
+    await act.call(client, chatId)
+    this.chatsLast = null
+  }
+
+  async pin(chatId: string, on: boolean): Promise<void> {
+    const client = this.need()
+    const act = on ? client.pinChat : client.unpinChat
+    if (typeof act !== 'function') throw unsupported(on ? 'pin a chat' : 'unpin a chat')
+    // WhatsApp keeps at most three chats pinned: a fourth is answered with false.
+    if ((await act.call(client, chatId)) === false) throw Object.assign(new Error(on ? 'WhatsApp keeps at most three chats pinned: unpin one first.' : 'That chat could not be unpinned.'), { status: 409 })
+    this.chatsLast = null
+  }
+
+  /** A number typed for a new chat: its chat id when it is on WhatsApp, or that it is not. */
+  async newChat(number: string): Promise<WaNewChat> {
+    const client = this.need()
+    const digits = numberFromId(number)
+    if (digits.length < 8 || digits.length > 15) throw Object.assign(new Error('That is not a phone number: type its digits with the country code, for example 919820282994.'), { status: 400 })
+    if (typeof client.getNumberId !== 'function') throw unsupported('look a number up')
+    const id = idOf(await client.getNumberId(digits))
+    return id ? { ok: true, id, number: digits } : { ok: false, reason: 'not-on-whatsapp', number: digits }
+  }
+
+  /**
+   * Order oWA S3: the file of a message (a photo, a sticker, a video, a voice note, a document) of THIS chat. Asked before anything is downloaded: a message that is not in this chat or has no
+   * file is a 404; a file WhatsApp says is bigger than WA_MEDIA_MAX_BYTES is a 413 and is NOT downloaded (the page says "open it on your phone"); a file WhatsApp no longer has (it keeps them
+   * for a while) is a 404 saying so. Neither is a trouble to retry, so both carry a code the page reads.
+   */
+  async media(chatId: string, messageId: string): Promise<WaMediaFile> {
+    const client = this.need()
+    if (typeof client.getMessageById !== 'function') throw unsupported("open a message's file")
+    const m = obj(await client.getMessageById(messageId).catch(() => null))
+    const inChat = idOf(m.fromMe === true ? m.to : m.from)
+    if (!idOf(m.id) || inChat !== chatId) throw Object.assign(new Error('That message is not in this chat.'), { status: 404 })
+    if (m.hasMedia !== true || typeof m.downloadMedia !== 'function') throw Object.assign(new Error('That message has no file.'), { status: 404 })
+    const meta = obj(m._data)
+    const tooBig = (size: number) =>
+      Object.assign(new Error(`This file is too big to show here (${Math.ceil(size / 1024 / 1024)} MB): open it on your phone.`), { status: 413, code: WA_MEDIA_TOO_BIG })
+    if (num(meta.size) > WA_MEDIA_MAX_BYTES) throw tooBig(num(meta.size))
+    const got = obj(await Promise.resolve((m.downloadMedia as () => unknown).call(m)).catch(() => null))
+    const data = str(got.data)
+    if (!data) throw Object.assign(new Error('This file is no longer available: WhatsApp only keeps files for a while.'), { status: 404, code: WA_MEDIA_GONE })
+    const size = Buffer.byteLength(data, 'base64')
+    if (size > WA_MEDIA_MAX_BYTES) throw tooBig(size)
+    return { mimetype: str(got.mimetype) || str(meta.mimetype) || 'application/octet-stream', filename: str(got.filename) || str(meta.filename) || null, size, data }
+  }
+
   /** The PID of the Chrome this client launched, once there is one. */
   chromePid(): number | null {
     const browser = obj(this.client?.pupBrowser)
@@ -295,6 +615,9 @@ export class WaEngine extends EventEmitter<EngineEvents> {
     this.gen++
     this.stopPoll()
     clearTimeout(this.retry)
+    // The list and the read under way belong to this session: a later one (another login, after an unlink) never gets them.
+    this.chatsRead = null
+    this.chatsLast = null
     const c = this.client
     this.client = null
     return c

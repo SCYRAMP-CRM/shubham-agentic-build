@@ -29,7 +29,10 @@ export interface ApprovalItem {
   id: string
   /** Buttons can answer it (a numbered choice to pick one of); otherwise it is answered in the chat. */
   answerable: boolean
-  /** Its footer, drawn now, says "Esc to cancel": a Cancel (Esc) button can press Esc for him. On a permission prompt Esc means No. */
+  /**
+   * Its footer, drawn now, says "Esc to cancel" AND its menu was read AND none of its options leaves claude: a Cancel (Esc) button can press Esc for him. On a
+   * permission prompt Esc means No. Never for a prompt we cannot read (its keys are unknown: Esc on claude's "Adding a new directory" prompt exits claude).
+   */
   cancellable?: boolean
   /** o0c50 / o66aa: its floor's decisions go to these people ("Ravi Teja, Priya"; shared/question-routing.ts): shown to the owner looking at it. */
   routedTo?: string
@@ -67,7 +70,7 @@ export interface AnswerRequest {
   n: number
 }
 
-/** POST /agentic/approvals/cancel: Esc into the prompt `id` of that chat (only when its footer says "Esc to cancel"). Authorized by the current CRM session and target rights. */
+/** POST /agentic/approvals/cancel: Esc into the prompt `id` of that chat (only when it is `cancellable`: its menu read, its footer saying "Esc to cancel"). Authorized by the current CRM session and target rights. */
 export interface CancelRequest {
   sessionId: string
   id: string

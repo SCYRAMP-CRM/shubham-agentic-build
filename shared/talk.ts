@@ -1,4 +1,4 @@
-import { NAMES, takeSentences, type Names } from './assistant.ts'
+import { NAMES, spokenText, takeSentences, type Names } from './assistant.ts'
 import { MAX_TEXT, type CardGoneReason, type FastServerFrame, type HandoffPhase, type TalkCard } from './fast.ts'
 
 // F-221 (order ob98a, T3a): the talk brain of live voice. Pure: no DOM, no timers, no clock of its own, no randomness, so the same
@@ -83,8 +83,11 @@ export const TALK = {
   /** The ack waits this long for a first word or tool line (the setting's default; at 2.5 s about 1 turn in 6 gets one, by the logs). */
   ackDelayMs: 2500,
   ackDelayMaxMs: 60_000,
-  /** The quiet that ends his turn, as the setting offers it (700 ms is the classic's). */
-  endQuietOptionsMs: [700, 1000, 1500],
+  /**
+   * The quiet that ends his turn, as the setting offers it (700 ms is the classic's). oeb56: 550 ms first, his settings' default now (28
+   * frames: 27.5 rounded up): the o0de2 merge keeps a turn ended too early safe (his next words within mergeGapMs join the same question).
+   */
+  endQuietOptionsMs: [550, 700, 1000, 1500],
   /** Auto-end, when it is on: 2 minutes of silence (his decision 6; off by default: only End ends it). The setting takes 1 s to a day. */
   autoEndMs: 120_000,
   autoEndMinMs: 1000,
@@ -147,6 +150,14 @@ export const TALK = {
    * y-retry-thanks-nowords, y-late-thanks).
    */
   thanksAfterAnswerMs: 5000,
+  /**
+   * oeb56 ("Quick should answer right after I finish"): the FIRST piece of an answer is said at its first clause boundary (, ; : a dash, or a
+   * full stop) once it has this many words, instead of waiting for the whole first sentence; every later piece goes by sentence as before.
+   */
+  firstPieceWords: 3,
+  /** oeb56: with no such boundary yet, the first piece goes after this long of streaming, at its last word boundary, once it has this many words. */
+  firstPieceWaitMs: 1200,
+  firstPieceWaitWords: 5,
 } as const
 
 // --- options (Settings › Chats › Assistant › Live voice) --------------------------------------------------------------------
@@ -182,13 +193,17 @@ export interface TalkOptions {
   names: Names
 }
 
+/**
+ * The brain's own defaults, for an option not given: the classic's end of a turn (700 ms) and no early guess. oeb56: the page always gives
+ * both from his settings, whose defaults are 550 ms and the guess on (TALK_SETTINGS).
+ */
 export const TALK_DEFAULTS: TalkOptions = {
   mode: 'quick',
   cutIn: 'auto',
   device: 'pc',
   fillers: 'words',
   ackDelayMs: TALK.ackDelayMs,
-  endQuietMs: TALK.endQuietOptionsMs[0],
+  endQuietMs: 700,
   guess: false,
   autoEndMs: null,
   // o0de2 round 2: English unless he chose another (see TALK_SETTINGS.lang).
@@ -263,8 +278,16 @@ export const TALK_SETTINGS: TalkSettings = {
   cutIn: 'auto',
   fillers: 'words',
   ackDelayMs: 2500,
-  endQuietMs: 700,
-  guess: false,
+  /**
+   * oeb56: 550 ms (was the classic's 700): his words go to Whisper 150 ms sooner after he stops. A pause of his this long mid-question is
+   * still one question: the o0de2 merge joins his next words within TALK.mergeGapMs to it. 700, 1000 and 1500 stay choices.
+   */
+  endQuietMs: 550,
+  /**
+   * oeb56: on (was off): at 300 ms of quiet his words already go to Whisper, and when he says no more that is the transcription (no second
+   * job). Whisper refuses a guess at once while it has other work (409), so a guess never queues. Off stays a choice in Settings.
+   */
+  guess: true,
   end: 'button',
   /**
    * o0de2 round 2: English by default (Whisper gets 'en', as dictation's en-IN does). His PC's job log of 14 Nov: dictation's pieces with en
@@ -282,14 +305,21 @@ export const TALK_SETTINGS: TalkSettings = {
  * default was Auto, and every save of ANY Live voice option (the voice, cut in, fillers, the pause...) stored lang 'auto' with the rest: a
  * stored 'auto' without the version is not known to be his choice, so it is moved to English (round 2's default) once (loadTalkSettings),
  * and stored with the version. From then on his Auto, Hindi or Marathi is kept.
+ * oeb56: version 3. Every save stored the pause (700 ms) and the early guess (off) too, so a stored 700 or off from before it is not known
+ * to be his choice either: each is moved to the new default (550 ms, on) once. Any other pause (1000, 1500) or a guess he switched on is
+ * his, and kept; from version 3 on, whatever he picks (700 and off too) is kept.
  */
-export const TALK_SETTINGS_VERSION = 2
+export const TALK_SETTINGS_VERSION = 3
 
 /** His stored settings, checked (parseTalkSettings) and moved on to this version. `old`: stored before it (the page stores them again, once). */
 export function loadTalkSettings(raw: unknown): { settings: TalkSettings; old: boolean } {
   if (!isObject(raw)) return { settings: parseTalkSettings(raw), old: false }
-  const old = !(typeof raw.v === 'number' && raw.v >= TALK_SETTINGS_VERSION)
-  return { settings: parseTalkSettings(old && raw.lang === 'auto' ? { ...raw, lang: 'en' } : raw), old }
+  const v = typeof raw.v === 'number' && Number.isFinite(raw.v) ? raw.v : 0
+  const moved: Record<string, unknown> = { ...raw }
+  if (v < 2 && raw.lang === 'auto') moved.lang = 'en'
+  if (v < 3 && raw.endQuietMs === 700) moved.endQuietMs = TALK_SETTINGS.endQuietMs
+  if (v < 3 && raw.guess === false) moved.guess = TALK_SETTINGS.guess
+  return { settings: parseTalkSettings(moved), old: v < TALK_SETTINGS_VERSION }
 }
 
 /** His settings as they are stored: with their version. */
@@ -311,7 +341,8 @@ export function parseTalkSettings(raw: unknown): TalkSettings {
     fillers: oneOf(o.fillers, ['words', 'tone', 'off'] as const, d.fillers),
     ackDelayMs: oneOf(o.ackDelayMs, TALK_ACK_DELAYS_MS, d.ackDelayMs),
     endQuietMs: oneOf(o.endQuietMs, TALK.endQuietOptionsMs, d.endQuietMs),
-    guess: o.guess === true,
+    // oeb56: the default is on now, so only a stored true or false is his; anything else is the default.
+    guess: typeof o.guess === 'boolean' ? o.guess : d.guess,
     end: oneOf(o.end, ['button', 'silence'] as const, d.end),
     lang: oneOf(o.lang, ['auto', 'en', 'hi', 'mr'] as const, d.lang),
   }
@@ -546,6 +577,55 @@ export function sayPieces(text: string, max: number = TALK.sayMaxChars): string[
   }
   if (rest) out.push(rest)
   return out
+}
+
+/**
+ * A clause ends at , ; or : followed by a space (a closing quote or bracket may come between), or at a dash with a space after it. Only with
+ * the space after it: "1,200", "3.5", "10:30", a link or an email have none inside, so no piece is ever cut inside one; and a comma at the
+ * very end of what came so far waits for the next words (it may be "1," of "1,200"). A dash between two numbers is none (splitsRange).
+ */
+const CLAUSE_END = /[,;:]["')\]]?(?=\s)|\s?[—–](?=\s)|\s-(?=\s)/g
+/** The words of a piece: what stands between spaces and has a letter or a digit in it. */
+const wordCount = (s: string): number => s.split(/\s+/).filter(w => /[\p{L}\p{N}]/u.test(w)).length
+/**
+ * oeb56 review: a cut between `head` and `tail` would split a range of numbers ("10 – 20", "10 - 20", "10:30 – 11:30", "10% – 20%"; "10–20"
+ * has no space and is never cut): a number and a dash just before it with no letter after it (its second number, or nothing yet), or a
+ * number just before it with a dash or nothing yet after it (its dash may come). After a number a dash is still a clause end when a word
+ * follows it ("It was 10 – then it stopped").
+ */
+function splitsRange(head: string, tail: string): boolean {
+  if (/\d[^\s—–-]*\s*[—–-]\s*$/.test(head)) return !/^\s*\p{L}/u.test(tail)
+  return /\d[^\s—–,;:-]*$/.test(head) && /^\s*(?:[—–-]|$)/.test(tail)
+}
+
+/**
+ * oeb56: the first piece of an answer, before its first sentence is whole: what came so far up to its first clause boundary with at least
+ * TALK.firstPieceWords words (`waited`: after TALK.firstPieceWaitMs of streaming, up to its last word boundary with at least
+ * TALK.firstPieceWaitWords). Null to wait: no such boundary yet, or a whole sentence comes first (that goes as a sentence, as every later
+ * piece does). The rest stays for the sentences after it. Never cut inside a word: a number, a decimal, an email or a link has no space in it.
+ * oeb56 review: nor inside a range of numbers ("10 – 20", "10 - 20"): its dash is no clause end, and a waited cut goes before its first number.
+ */
+export function firstPiece(buffer: string, waited = false): { piece: string; rest: string } | null {
+  const take = (end: number) => {
+    const head = buffer.slice(0, end)
+    // A whole sentence before the boundary: the sentence rule has it (a short "On it." is said as soon as it is whole, as before).
+    if (takeSentences(head).sentences.length > 0) return null
+    const piece = spokenText(head)
+    return piece ? { piece, rest: buffer.slice(end) } : null
+  }
+  CLAUSE_END.lastIndex = 0
+  for (let m = CLAUSE_END.exec(buffer); m; m = CLAUSE_END.exec(buffer)) {
+    const end = m.index + m[0].length
+    if (splitsRange(buffer.slice(0, end), buffer.slice(end))) continue
+    if (wordCount(buffer.slice(0, end)) >= TALK.firstPieceWords) return take(end)
+  }
+  if (!waited) return null
+  // Streaming for a while with no boundary yet: up to its last space (the word after it may not be whole yet); never inside a range of
+  // numbers, so back to the space before its first number.
+  let space = buffer.search(/\s\S*$/)
+  while (space > 0 && splitsRange(buffer.slice(0, space), buffer.slice(space))) space = buffer.slice(0, space).search(/\s\S*$/)
+  if (space < 0 || wordCount(buffer.slice(0, space)) < TALK.firstPieceWaitWords) return null
+  return take(space)
 }
 
 /** An answer as sentences to be said: the hub's forSpeech (agent/agentic/voice.ts) without its length cut (the brain cuts by sentences). */
@@ -943,6 +1023,9 @@ interface Turn {
   received: string
   /** Answer text came. */
   answered: boolean
+  /** oeb56: when its first answer text came (the first piece's wait counts from it), and whether a piece of its answer was given to the voice. */
+  firstAt: number | null
+  firstOut: boolean
   /** Its answer's sentences that were said in full. */
   said: string[]
   /** odcd9 (from oeb56's review): how many of `said` (the first ones) are its lead-in, said before its first tool call (see Say.leadIn). */
@@ -1112,7 +1195,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   const turnOf = (id: string | null): Turn | undefined => (id === null ? undefined : turns.find(t => t.id === id))
   const hasSays = (t: Turn) => queue.some(s => s.turn === t.id) || pending.some(s => s.turn === t.id)
   function newTurn(id: string, kind: Turn['kind'], text: string, heard = ''): Turn {
-    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, said: [], leadSaid: 0, line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
+    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, firstAt: null, firstOut: false, said: [], leadSaid: 0, line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
     turns.push(t)
     while (turns.length > TALK.turnsMax) {
       const i = turns.findIndex(x => !x.generating && !hasSays(x))
@@ -1751,7 +1834,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       settle()
     }
   }
-  function onSttFail(req: number) {
+  /** `status`: the page's (409: Whisper refused a guess at once, busy); TALK.sttTimeoutMs with no sign of life gives a transcription up (408). */
+  function onSttFail(req: number, status: number) {
     const r = reqs.get(req)
     if (!r) return
     reqs.delete(req)
@@ -1759,7 +1843,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       if (guess?.req === req) guess = null
       return
     }
-    if (r.part.guess) {
+    // oeb56: only Whisper's busy refusal of the guess (409, at once) is worth a second try with the guess on by default; any other failure of
+    // it (Whisper failed, no answer for 20 s, the page lost the frames) is the turn's, as it would be with the guess off. (Every failure was
+    // tried again: a guess given up after 20 s was asked once more, and his "didn't catch that" came after 40 s.)
+    if (r.part.guess && status === 409) {
       // The guess became the final and then failed (Whisper was busy): the same frames are transcribed in full, once.
       r.part.guess = false
       r.part.req = ++reqNo
@@ -1783,7 +1870,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     for (const [req, r] of reqs) {
       if (now - r.alive < TALK.sttTimeoutMs && now - r.at < TALK.sttMaxMs) continue
       act({ t: 'stt-abort', req })
-      onSttFail(req)
+      onSttFail(req, 408)
     }
   }
 
@@ -1840,13 +1927,29 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   }
 
   // --- Quick's frames -----------------------------------------------------------------------------------------------------
-  function release(t: Turn, done: boolean) {
+  /**
+   * What of a turn's answer can be said now. oeb56: its first piece goes at its first clause boundary (firstPiece), or after
+   * TALK.firstPieceWaitMs of streaming at its last word (`waited`, from checkFirstPiece), not at the end of its first sentence; then, and
+   * for everything after it, whole sentences as before. `done`: nothing more is coming, so the rest goes too (whole: nothing is cut then).
+   */
+  function release(t: Turn, done: boolean, waited = false) {
+    const early = !t.firstOut && !done ? firstPiece(t.buffer, waited) : null
+    if (early) {
+      t.buffer = early.rest
+      sayAnswer(t, early.piece)
+    }
     const { sentences, rest } = takeSentences(t.buffer, done)
     t.buffer = rest
-    for (const s of sentences) {
-      t.spoke = true
-      say(s, 'answer', t)
-    }
+    for (const s of sentences) sayAnswer(t, s)
+  }
+  function sayAnswer(t: Turn, text: string) {
+    t.spoke = true
+    t.firstOut = true
+    say(text, 'answer', t)
+  }
+  /** oeb56: a first piece still not said after TALK.firstPieceWaitMs of its answer streaming goes at its last word boundary (5 words or more). */
+  function checkFirstPiece() {
+    for (const t of turns) if (t.generating && !t.cancelled && !t.firstOut && t.firstAt !== null && now - t.firstAt >= TALK.firstPieceWaitMs) release(t, false, true)
   }
   function upsertCard(c: TalkCard, from: string) {
     if (!isObject(c) || typeof c.id !== 'string' || !Number.isFinite(c.version)) return
@@ -1894,6 +1997,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         if (!t && f.id.startsWith('o:') && tellable.delete(f.id.slice(2))) t = newTurn(f.id, 'telling', '')
         if (!t || !t.generating || t.cancelled || !f.text) return
         t.answered = true
+        // oeb56: the first piece's wait counts from here (checkFirstPiece, after every event, this one too).
+        t.firstAt ??= now
         t.received += f.text
         t.buffer += f.text
         return release(t, false)
@@ -2203,7 +2308,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
           onStt(ev.req, typeof ev.text === 'string' ? ev.text : '', typeof ev.dropped === 'string' && ev.dropped.trim() !== '' ? ev.dropped : null)
           break
         case 'stt-fail':
-          onSttFail(ev.req)
+          onSttFail(ev.req, ev.status)
           break
         case 'stt-busy':
           onSttBusy()
@@ -2231,6 +2336,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       }
       if (!ended) {
         expireReqs()
+        checkFirstPiece()
         flushPending()
         checkFillers()
         checkAutoEnd()

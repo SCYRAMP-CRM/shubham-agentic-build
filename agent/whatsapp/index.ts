@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
-import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaDraft, type WaLive, type WaMessage, type WaSendRequest, type WaRoute, type WaSetup, type WaStatus, type WaTunnelSeen } from '../../shared/whatsapp.ts'
+import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaContactDetails, type WaDraft, type WaLive, type WaMediaFile, type WaMessage, type WaNewChat, type WaSendRequest, type WaRoute, type WaSetup, type WaStatus, type WaTunnelSeen } from '../../shared/whatsapp.ts'
 import type { ProofRequest } from '../agentic/index.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -63,11 +63,15 @@ export interface WhatsApp {
   mount: ApiMount
   tools: WaTools
   status(): WaStatus
+  /** Order oWA S3: the file of a message of a chat (bytes), or a 404 / 413 in plain words (and a code: wa-media-gone, wa-media-too-big). The page's route for it is the backend's (server.ts). */
+  media(chatId: string, messageId: string): Promise<{ bytes: Buffer; mimetype: string; filename: string | null }>
   /** The app is stopping: Chrome closes properly (the login is kept). */
   close(): Promise<void>
 }
 
 const CHAT_ID = /^[\w.:-]{1,80}@(c\.us|g\.us|lid|s\.whatsapp\.net)$/
+/** A message's id (whatsapp-web.js: true_<chat>_<hex>, with the writer's id added in a group). */
+const MESSAGE_ID = /^[\w.:@-]{1,200}$/
 /** His own sends: at most this many a minute (a stuck button, not a limit on him). */
 const MINE_PER_MINUTE = 10
 const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
@@ -465,6 +469,37 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
         await connected()
         return host.call<WaMessage[]>('messages', { chatId, count, ...(query.get('before') ? { before: query.get('before') } : {}) })
       }
+      // Order oWA S4: the people behind the chats (the contact panel, read receipts, archive, pin, a number typed for a new chat).
+      case 'GET /contact': {
+        const chatId = query.get('chat') ?? ''
+        if (!CHAT_ID.test(chatId)) throw apiError(400, 'Expected ?chat=<chat id>')
+        await connected()
+        return host.call<WaContactDetails>('contact', { chatId })
+      }
+      case 'GET /profile-pic': {
+        const chatId = query.get('chat') ?? ''
+        if (!CHAT_ID.test(chatId)) throw apiError(400, 'Expected ?chat=<chat id>')
+        await connected()
+        return host.call<{ url: string | null }>('profilePic', { chatId })
+      }
+      case 'POST /seen':
+      case 'POST /archive':
+      case 'POST /pin': {
+        const op = rest === '/seen' ? 'seen' : rest === '/archive' ? 'archive' : 'pin'
+        const b = isObject(body) ? body : {}
+        const chatId = typeof b.chatId === 'string' ? b.chatId : ''
+        if (!CHAT_ID.test(chatId)) throw apiError(400, 'Expected {chatId}')
+        if (op !== 'seen' && typeof b.on !== 'boolean') throw apiError(400, 'Expected {chatId, on: true | false}')
+        await connected()
+        await host.call(op, op === 'seen' ? { chatId } : { chatId, on: b.on })
+        return { ok: true }
+      }
+      case 'POST /new-chat': {
+        const number = isObject(body) && typeof body.number === 'string' ? body.number : ''
+        if (!number || number.length > 40) throw apiError(400, 'Expected {number}')
+        await connected()
+        return host.call<WaNewChat>('newChat', { number })
+      }
       case 'POST /send':
         return send(body, req)
       case 'PATCH /settings': {
@@ -546,6 +581,13 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     mount,
     tools,
     status,
+    async media(chatId, messageId) {
+      if (!CHAT_ID.test(chatId)) throw apiError(400, 'Expected ?chat=<chat id>')
+      if (!MESSAGE_ID.test(messageId)) throw apiError(400, 'Expected ?msg=<message id>')
+      await connected()
+      const f = await host.call<WaMediaFile>('media', { chatId, messageId })
+      return { bytes: Buffer.from(f.data, 'base64'), mimetype: f.mimetype, filename: f.filename }
+    },
     async close() {
       clearIdle()
       if (tunnelTimer) clearInterval(tunnelTimer)

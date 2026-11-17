@@ -2,6 +2,7 @@ import { pageFeature } from './access.ts'
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
 import type { AuthPerson, ChatAccess, ChatCan, ChatOwner } from './auth.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
+import { QUICK_ROUTE } from './quick-page.ts'
 
 // F-118: the three tabs of the chat lists (My chats, Shared chats, All chats) and the filter by owner. The agent already sends each connection only the chats it
 // may see (shared/auth.ts scopeFloors); this narrows THAT to the tab the person picked, so it never widens anything. Pure, tested.
@@ -104,7 +105,8 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
 // Orders o2aac / o6056: Paperclip and Schedules are the owner's too ("like the other pages"); empty for now, what they grow into works on this PC.
 // Order obb81: the Agents page (every agent's brief, notes, memory files and replies) is the owner's for now. Placed before '/phone-app': other pages'
 // wiring tests pin the tail of this list ('/phone-app', OLD_ROUTE ... and OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE at the end).
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', AGENT_DIRECTORY_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+// Order o088b (F-267): the Quick page (live talk on its own page, the locked "talk" feature) is the owner's; placed before '/phone-app' too.
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', AGENT_DIRECTORY_ROUTE, QUICK_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

@@ -9,6 +9,7 @@ import {
   type ChatOwner,
 } from '../../shared/auth.ts'
 import { isPersonAssistant, type Floor, type FloorAgent } from '../../shared/agentic.ts'
+import { OLD_STAFF_TYPING, type StaffTyping } from '../../shared/staff-typing.ts'
 import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
 
@@ -150,6 +151,10 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // o0c50 / o66aa: where each floor's decisions go ("Decisions go to…"). The owner's only (and a change takes his CRM session on the Server's page).
   ['GET', /^\/question-routing$/, OWNER],
   ['PUT', /^\/question-routing\/([^/]+)$/, OWNER],
+  // Orders of95c / o9ccb / ocf0e: which chats a non-owner may type into. The owner's only (and a change also takes his signed-in CRM session on
+  // the Server's own page, in the route itself: never a chat's key, a member PC's word, or a name in the body).
+  ['GET', /^\/staff-typing$/, OWNER],
+  ['PUT', /^\/staff-typing$/, OWNER],
   // F-221 (ob98a): live talk's cards and direct line: the owner's page (and Send also takes his signed-in CRM session, in the route itself).
   ['GET', /^\/talk\/cards$/, OWNER],
   ['POST', /^\/talk\/cards\/([^/]+)\/send$/, OWNER],
@@ -245,7 +250,10 @@ export interface Access {
   rights(c: Caller, agent: FloorAgent): { access: ChatAccess; can: ChatCan } | null
   /** Throws 403 not-yours unless the caller has this much on that chat. `route` and `sid` are for the log. */
   needChat(c: Caller, agent: FloorAgent, need: Need, route: string): void
-  /** o7e6d: may this caller type into this chat (the terminal's keys, a message, a draft)? Non-owners: their own person-assistant only. */
+  /**
+   * May this caller type into this chat (the terminal's keys, a message, a draft, a file)? The owner of the app: every chat. Anyone else: their
+   * own Assistant, and by his choice (staff-typing.ts, of95c / o9ccb / ocf0e) a chat they own and one shared to them as "Can type".
+   */
   mayType(c: Caller, agent: FloorAgent): boolean
   floorSeen(c: Caller, f: Floor): boolean
   /** Throws 403 not-yours unless the caller sees / manages / may delete the floor. */
@@ -259,7 +267,15 @@ export interface Access {
   deny(c: Caller, route: string, chatId?: string | null): void
 }
 
-export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route: string, chatId: string | null) => void): Access {
+/** Orders of95c / o9ccb / ocf0e: what decides a non-owner's typing (agent/agentic/staff-typing.ts). Left out (tests, older callers): the 15 Nov rule. */
+export interface AccessTyping {
+  /** The owner's choice now (on a member PC: the Server's, from its current state frame; the 15 Nov rule while it has none). */
+  typing?: () => StaffTyping
+  /** Whether a chat's home is the Server (for the 'not-on-server' scope). Left out, or unsure: true, so that scope stays closed. */
+  serverChat?: (agent: FloorAgent) => boolean
+}
+
+export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route: string, chatId: string | null) => void, o: AccessTyping = {}): Access {
   const admins = () => auth?.admins() ?? [SBSKRRT_ID]
   const isAdmin = (c: Caller) => (auth ? auth.isAdmin(c) : true)
   const person = (c: Caller): Pick<AuthPerson, 'id'> | null => c.person
@@ -277,12 +293,33 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
     onDeny?.(c, route, chatId ?? null)
   }
 
-  /** o7e6d (Lead's B2): a non-owner types only into their OWN person-assistant; every other chat they see is view only. The owner: as before. */
+  /**
+   * o7e6d (Lead's B2): a non-owner types only into their OWN person-assistant; every other chat they see is view only. The owner: as before.
+   * Orders of95c / o9ccb / ocf0e (Shubham, 16 Nov: "yes", then "A"): this deliberately REVERSES B2's 15 Nov staff rule (refinement2 line 53),
+   * by default and as a choice that keeps the old rule (staff-typing.ts): a non-owner may also type into a chat they OWN and one shared to
+   * them as "Can type", on every PC. Never a "Can view" share (refused above), never another person's Assistant (theirs alone, whatever it is
+   * shared as), never a PC-control slot (its own branch in rights(); not opened by owning or sharing), and with the 'not-on-server' scope never
+   * a chat whose home is the Server (it runs as the Server's Windows user with full tools). The staff fence (runFenced) is a separate gate.
+   */
   function mayType(c: Caller, agent: FloorAgent): boolean {
     const r = rights(c, agent)
     if (r === null || r.can === 'view') return false
     if (isAdmin(c)) return true
-    return !!c.person && isPersonAssistant(agent) && agent.owner?.id === c.person.id
+    if (!c.person) return false
+    // A person's Assistant: its own person types into it, nobody else, under every choice (B2, unchanged: a "Can type" share does not open it).
+    if (isPersonAssistant(agent)) return agent.owner?.id === c.person.id
+    // PC control: never opened to a non-admin, by either choice.
+    if (agent.pcControlSlot) return false
+    const t = o.typing?.() ?? OLD_STAFF_TYPING
+    // The 15 Nov rule, kept as his choice: nothing beyond their own Assistant.
+    if (t.rule !== 'owned-and-type-shares') return false
+    if (t.scope === 'not-on-server' && (o.serverChat?.(agent) ?? true)) return false
+    // THE OWNER, on its own and not as a side effect of the widening (Shubham, 17 Nov, o808f: "the owner should be able to type"; a chat's owner types in their own chat): a person types in
+    // a chat they own, whatever KIND of agent it is, because it is theirs. B2 let them type only into a person's Assistant, so the owner of a floor's Lead (an Orchestrator), or of any other
+    // agent, could not type in what they had made. `access: 'mine'` is chatRights' own word for that: the chat's owner on record is this person.
+    if (r.access === 'mine' && agent.owner?.id === c.person.id) return true
+    // What the choice adds beyond that: a chat shared to them as "Can type".
+    return r.access === 'shared' && r.can === 'type'
   }
 
   function needChat(c: Caller, agent: FloorAgent, need: Need, route: string) {

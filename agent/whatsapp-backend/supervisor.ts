@@ -1,8 +1,10 @@
 import { fork, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { WA_BACKEND_PORTS } from '../../shared/whatsapp.ts'
 import type { Logger } from '../log.ts'
 import { workerEnv } from '../whatsapp/host.ts'
+import { issueSendTicket, type SendFields } from './send-ticket.ts'
 
 // Order of5a0 (16 Nov 2026, Lead's GO with four conditions): the hub starts WhatsApp's backend (run.ts) and keeps it running, so the WhatsApp page
 // works on this Server without anyone starting it by hand.
@@ -53,6 +55,8 @@ export interface SupervisorOptions {
   quitMs?: number
   /** The waits before each start again (the last one repeats). */
   delaysMs?: readonly number[]
+  /** Order obf15: how long the backend has to confirm it holds a send key (ON) or has let it go (OFF) (default 5 s). */
+  sendAckMs?: number
   now?: () => number
 }
 
@@ -62,6 +66,16 @@ export interface BackendSupervisor {
   /** Asks it to stop, then ends its exact PID past quitMs. Resolves once it has ended. */
   stop(): Promise<void>
   view(): BackendView
+  /**
+   * Order obf15 (oWA S2, Lead: "make OFF as real as ON"). ON: a NEW random key (a rotation: tickets of an older one are worthless), handed to the backend over its private
+   * channel, now if it is running and the moment it says it is ready otherwise (and again after a restart); resolves whether the backend confirmed it holds it.
+   * OFF: the key is forgotten here first (no ticket can be made from that moment) and the backend is told to let it go; a backend that does not confirm it did is ended by
+   * its exact PID, so the capability cannot outlive the switch (it starts again without the key). The key is never in view(), a file, the environment or a log.
+   */
+  sending(on: boolean): Promise<boolean>
+  sendingOn(): boolean
+  /** A ticket for this send by this person (send-ticket.ts), or null when there is no key: sending is off. */
+  ticket(f: SendFields, by: string): string | null
 }
 
 const DEFAULT_SCRIPT = fileURLToPath(new URL('./run.ts', import.meta.url))
@@ -86,6 +100,37 @@ export function createBackendSupervisor(o: SupervisorOptions): BackendSupervisor
   let restartTimer: ReturnType<typeof setTimeout> | null = null
   let readyTimer: ReturnType<typeof setTimeout> | null = null
   let stopping: Promise<void> | null = null
+  const sendAckMs = o.sendAckMs ?? 5_000
+  /** The send key: in memory only. Null is sending OFF. */
+  let sendKey: string | null = null
+  /** Who waits for the backend's word about its key (it says what it holds: on = it holds one). */
+  const keyWaiters = new Set<{ on: boolean; resolve(v: boolean): void }>()
+
+  /** Tells this backend its key (or null) over its channel and waits for it to say what it holds. */
+  function tellKey(c: ChildProcess, key: string | null): Promise<boolean> {
+    return new Promise<boolean>(resolve => {
+      const w = {
+        on: key !== null,
+        resolve: (v: boolean) => {
+          clearTimeout(timer)
+          resolve(v)
+        },
+      }
+      const timer = setTimeout(() => {
+        keyWaiters.delete(w)
+        resolve(false)
+      }, sendAckMs)
+      keyWaiters.add(w)
+      try {
+        if (!c.connected) throw new Error('the channel is closed')
+        c.send({ t: 'send-key', key })
+      } catch {
+        keyWaiters.delete(w)
+        clearTimeout(timer)
+        resolve(false)
+      }
+    })
+  }
 
   const set = (next: BackendState, w: string | null) => {
     if (next !== state) since = now()
@@ -171,13 +216,22 @@ export function createBackendSupervisor(o: SupervisorOptions): BackendSupervisor
     lines(c.stderr, true)
     c.on('message', (m: unknown) => {
       if (child !== c || m === null || typeof m !== 'object') return
-      const w = m as { t?: unknown; port?: unknown; why?: unknown }
+      const w = m as { t?: unknown; port?: unknown; why?: unknown; on?: unknown }
       if (w.t === 'ready' && Number.isInteger(w.port)) {
         if (readyTimer) clearTimeout(readyTimer)
         readyTimer = null
         set('running', null)
         port = w.port as number
         log.info(`WhatsApp backend: running on 127.0.0.1:${port} (pid ${c.pid})`)
+        // Sending is ON: this backend (a first start, or after a crash) gets the key now. (OFF: it never had one, and starts without.)
+        if (sendKey !== null) void tellKey(c, sendKey).then(ok => ok || log.warn('WhatsApp backend: it did not confirm that it holds the send key'))
+      } else if (w.t === 'send-key' && typeof w.on === 'boolean') {
+        for (const x of [...keyWaiters]) {
+          if (x.on === w.on) {
+            keyWaiters.delete(x)
+            x.resolve(true)
+          }
+        }
       } else if (w.t === 'failed' && typeof w.why === 'string') last = w.why.slice(0, 300)
     })
     c.on('error', e => {
@@ -205,8 +259,30 @@ export function createBackendSupervisor(o: SupervisorOptions): BackendSupervisor
       set('starting', null)
       launch()
     },
+    async sending(on) {
+      if (on) {
+        sendKey = randomBytes(32).toString('hex')
+        const c = child
+        // Not running yet: it is handed over when it says it is ready.
+        if (!c || state !== 'running') return false
+        return tellKey(c, sendKey)
+      }
+      sendKey = null
+      const c = child
+      if (!c) return true
+      if (await tellKey(c, null)) return true
+      // It did not say it let go. Its exact PID is ended (never by name or port): it starts again, and without a key.
+      if (child === c && c.exitCode === null && c.signalCode === null) {
+        log.warn(`WhatsApp backend: it did not confirm that it let the send key go; ending its process (pid ${c.pid}) so sending is really off`)
+        c.kill()
+      }
+      return false
+    },
+    sendingOn: () => sendKey !== null,
+    ticket: (f, by) => (sendKey === null ? null : issueSendTicket(sendKey, f, by, now())),
     stop() {
       stopping ??= (async () => {
+        sendKey = null
         clearTimers()
         const c = child
         if (c && c.exitCode === null && c.signalCode === null) {

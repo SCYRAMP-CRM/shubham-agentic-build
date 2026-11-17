@@ -71,8 +71,13 @@ export type FastClientFrame =
    * F-221 (odcd9, Lead's gate): `talk` = this connection is live talk (src/talk/session.ts, the only sender), the one client that handles the short
    * line Quick says before a tool when he talks (shared/talk.ts markLeadIn). Only its asks via voice get that line (fast.ts); the hub ignores it
    * on the phone's socket.
+   * F-267 (order o088b): `page: 'quick'` = this connection is the Quick page's live talk (sent by src/talk/session.ts sendStart, the only
+   * builder of a start, in every start of a session the page hosts, a reconnect's too). The hub then makes every hand-off made
+   * during its asks a card for his tap, even with "Quick sends without asking" on (agent/agentic/index.ts hand_off). Only the exact value
+   * 'quick' counts; anything else (another string, another type) is dropped and the start is as it was. It is the client's word, so it can
+   * only make things stricter, never looser: a UX guard, not a security boundary.
    */
-  | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean; talk?: boolean }
+  | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean; talk?: boolean; page?: 'quick' }
   /**
    * A question or an order. `via` says how it was given (voice answers are written for the ear). `thorough` asks for Sonnet for this turn. A new ask while one runs cuts the old one off (it ends with done {cancelled}).
    * F-221 (ob98a): `heard` = the part of the previous answer he actually heard before he cut in (at most MAX_HEARD characters): the Assistant goes on from there.
@@ -155,7 +160,7 @@ export function parseClientFrame(raw: string): FastParse {
       if (v.client !== 'web' && v.client !== 'phone') return bad("start needs client 'web' or 'phone'.")
       if (!isId(v.id)) return bad('start needs an id (a tab or a device), 1 to 64 plain characters.')
       if (v.model !== undefined && !(FAST_MODELS as readonly unknown[]).includes(v.model)) return bad('model is haiku or sonnet.')
-      return { ok: true, frame: { t: 'start', client: v.client, id: v.id, ...(v.model ? { model: v.model as FastModel } : {}), ...(v.resume === true ? { resume: true } : {}), ...(v.talk === true ? { talk: true } : {}) } }
+      return { ok: true, frame: { t: 'start', client: v.client, id: v.id, ...(v.model ? { model: v.model as FastModel } : {}), ...(v.resume === true ? { resume: true } : {}), ...(v.talk === true ? { talk: true } : {}), ...(v.page === 'quick' ? { page: 'quick' as const } : {}) } }
     }
     case 'ask': {
       if (!isId(v.id)) return bad('ask needs an id, 1 to 64 plain characters.')

@@ -370,6 +370,9 @@ export function createEngine(d: EngineDeps = {}): Engine {
     status,
     async warm() {
       await load()
+      // oeb56: a warm is a use: the model's idle time starts again (live talk asks every 4 minutes while it runs, so a long pause of his never
+      // lets the model go; before, a warm of a loaded model did nothing and it was let go 15 minutes after its last transcription).
+      if (child) touch()
     },
     transcribe(pcm, o = {}, job = {}) {
       if (o.partial && pending > 0) return Promise.resolve(null)

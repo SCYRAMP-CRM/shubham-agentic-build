@@ -61,6 +61,11 @@ export interface Origin {
   conn: string
   hold: boolean
   via: 'voice' | 'typed'
+  /**
+   * F-267 (order o088b): asked on the Quick page (its start said page 'quick'), so every hand-off of it is a card (index.ts hand_off), whatever
+   * "Quick sends without asking" says. Left out for every other connection.
+   */
+  page?: 'quick'
 }
 
 export interface FastSession {
@@ -101,6 +106,8 @@ interface Conn {
   hold: boolean
   /** F-221 (odcd9, Lead's gate): its last start said it is live talk (`talk: true`); see the ask's `spoken`. */
   talk: boolean
+  /** F-267 (order o088b): its last start said it is the Quick page (`page: 'quick'`); see Origin.page. */
+  page: 'quick' | null
   /** F-221: the hub's own turns (o:<orderId>) told on this connection and not over yet: the only o: ids its cancel may name. */
   told: Set<string>
 }
@@ -237,6 +244,10 @@ export function createFastSession(deps: FastDeps): FastSession {
         c.clientId = f.id
         // F-221 (odcd9, Lead's gate): each start says it again (a reconnect's too); a start without it turns it off.
         c.talk = f.talk === true
+        // F-267 (order o088b): the Quick page says so in each start; a start without it turns it off. The client's word, so it only ever makes
+        // hand-offs STRICTER (a card instead of sent at once): a UX guard, not a security boundary. The web's socket only: the phone has no card
+        // screen, so a card there would wait for a tap nobody can give.
+        c.page = c.kind === 'web' && f.page === 'quick' ? 'quick' : null
         if (f.model) model = f.model
         // F-221 (review of T2): a reconnect holds as this client did before the blip, and owns that hold from now (fix round 3); it never lowers
         // hold (fix round 2). A plain start begins with this connection's hold off and leaves the client's sticky hold as it is (fix round 3).
@@ -369,7 +380,7 @@ export function createFastSession(deps: FastDeps): FastSession {
     socket(kind) {
       if (!deps.host) return null
       return ws => {
-        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, told: new Set() }
+        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, page: null, told: new Set() }
         conns.add(c)
         send(c, stateFor(c))
         ws.onText(raw => onFrame(c, raw))
@@ -390,7 +401,7 @@ export function createFastSession(deps: FastDeps): FastSession {
       // F-221 (ob98a): fail closed. Only an ask that is with the process now: not one a cancel cut off, not one still waiting for the snapshot or
       // the process (the turn before it may still be running, and its late tool call would be credited here), never the hub's own o: turn.
       if (!owner || !owner.clientId || !active || active.conn !== owner || active.cancelled || !active.sent) return null
-      return { kind: owner.kind, clientId: owner.clientId, askId: active.id, conn: owner.id, hold: owner.hold, via: active.via }
+      return { kind: owner.kind, clientId: owner.clientId, askId: active.id, conn: owner.id, hold: owner.hold, via: active.via, ...(owner.page ? { page: owner.page } : {}) }
     },
     handedOff(orderId, origin, line) {
       const c = owner && owner.clientId === origin.clientId ? owner : null

@@ -30,6 +30,9 @@ export const WA_BACKEND_PORTS = { from: 65000, to: 65099 } as const
  */
 export type WaBackendCode = 'wa-backend-starting' | 'wa-backend-stopped' | 'wa-backend-off' | 'wa-backend-unreachable' | 'wa-backend-no-token'
 
+/** Order o714a: the chat list is still being read (the first read after a link is slow): a 409 the page answers by waiting and asking again, not by failing. */
+export const WA_CHATS_LOADING = 'wa-chats-loading'
+
 /** How long WhatsApp stays open after its last use, unless it is set to stay on. */
 export const WA_IDLE_MS = 10 * 60_000
 
@@ -43,6 +46,21 @@ export const WA_TEXT_MAX = 4000
 
 /** The most messages one read gives (the page pages back for more). */
 export const WA_READ_MAX = 100
+
+/** Order oWA S3: the most of one file the page is shown; a bigger one is opened on the phone. */
+export const WA_MEDIA_MAX_BYTES = 16 * 1024 * 1024
+/** The `code` of the answers to a file that cannot be shown: too big (413), or no longer on WhatsApp (404). */
+export const WA_MEDIA_TOO_BIG = 'wa-media-too-big'
+export const WA_MEDIA_GONE = 'wa-media-gone'
+
+/** Order oWA S3: a message's file as the WhatsApp process hands it over (its bytes as base64). */
+export interface WaMediaFile {
+  mimetype: string
+  filename: string | null
+  /** The bytes, decoded. */
+  size: number
+  data: string
+}
 
 /** The one-time setup of the WhatsApp program on the hub (its packages, in the state folder). */
 export type WaSetup = 'missing' | 'installing' | 'ready' | 'failed'
@@ -92,6 +110,13 @@ export interface WaStatus {
   tunnel?: WaTunnelSeen | null
   /** Order of5a0 (A2): which login the overlay Assistant's WhatsApp tools use (added by the agent's proxy, on the Server). */
   assistantTools?: WaAssistantTools
+  /** Order obf15 (oWA S2): whether sending from the page is switched on (added by the agent's proxy; absent where the agent has no switch). OFF unless a person turned it on. */
+  sends?: WaSends
+}
+
+/** Order obf15 (oWA S2): the page's send switch as the agent holds it. Only a signed-in administrator can change it (PATCH /sending). */
+export interface WaSends {
+  on: boolean
 }
 
 /**
@@ -100,12 +125,22 @@ export interface WaStatus {
  */
 export type WaAssistantLogin = 'in-app' | 'backend'
 
+/**
+ * Order of5a0 (A2), Lead's rule on the record (17 Nov 2026): whose hand made a CHOICE of the Assistant's login. The choice itself is not human-only (it is reversible and fails safe), so the
+ * Assistant's screen control can press it on his instruction; the record must then say so instead of calling it his tap. 'owner': a person's own tap or key (a trusted event); 'assistant': pressed by
+ * the Assistant's screen control (a script's event). The page says which, from the event; the agent records exactly that and refuses a choice that does not say.
+ */
+export type WaAssistantHand = 'owner' | 'assistant'
+
 export interface WaAssistantTools {
   use: WaAssistantLogin
   /** Since when (ISO); null: as it started. */
   since: string | null
-  /** 'auto': moved when the page's WhatsApp was linked and answered; 'owner': his choice; null: as it started. */
-  by: 'auto' | 'owner' | null
+  /**
+   * 'auto': moved when the page's WhatsApp was linked and answered; 'owner': his own tap; 'assistant': pressed by the Assistant's screen control (on his instruction, but not his own tap);
+   * null: as it started. A choice by either hand stands: nothing moves it on its own.
+   */
+  by: 'auto' | WaAssistantHand | null
 }
 
 /** Order o55b6: 'z800' through the Z800's SSH SOCKS tunnel (around the office firewall), 'direct' straight out (the old way). */
@@ -118,6 +153,14 @@ export interface WaTunnelSeen {
   /** Through which PC (from the tunnel's note), when up. */
   via: string | null
   at: string
+}
+
+/** Order oWA S6: a private note about a chat, in the person's own words, with when it was written (kept on the Server only). */
+export interface WaNote {
+  id: string
+  text: string
+  /** ms since the epoch */
+  createdAt: number
 }
 
 export interface WaChat {
@@ -134,7 +177,45 @@ export interface WaChat {
   muted: boolean
   archived: boolean
   pinned: boolean
+  /**
+   * Order oWA S4: the phone number of a person's chat, digits only, so the CRM can be matched by it. Where the id is a number's (…@c.us) it is that; where WhatsApp hides the number
+   * behind a privacy id (…@lid) it is what WhatsApp Web knows of it, filled in as it is learned (a later read of the list has more of them); absent when it is not known, and for a group.
+   */
+  number?: string
 }
+
+/** Order oWA S4: a member of a group, as the contact panel lists them. */
+export interface WaGroupParticipant {
+  id: string
+  /** Digits; '' when WhatsApp hides it. */
+  number: string
+  name: string
+  isAdmin: boolean
+  isSuperAdmin: boolean
+}
+
+/** Order oWA S4: what the contact panel shows for a chat: a person's, or a group's. */
+export interface WaContactDetails {
+  id: string
+  isGroup: boolean
+  name: string
+  /** Their own WhatsApp name, when it differs from the one saved. */
+  pushname?: string
+  /** Digits; absent for a group and when WhatsApp hides it. */
+  number?: string
+  isBusiness: boolean
+  isMyContact: boolean
+  about?: string
+  /** A picture's address on WhatsApp's own servers, when their privacy settings allow it. */
+  profilePic: string | null
+  groupDesc?: string
+  owner?: string
+  participantsCount?: number
+  participants?: WaGroupParticipant[]
+}
+
+/** Order oWA S4: a number looked up to start a chat: its chat id, or that it is not on WhatsApp. */
+export type WaNewChat = { ok: true; id: string; number: string } | { ok: false; reason: 'not-on-whatsapp'; number: string }
 
 export type WaMessageType = 'chat' | 'image' | 'video' | 'audio' | 'ptt' | 'document' | 'sticker' | 'location' | 'vcard' | 'multi_vcard' | 'revoked' | 'other'
 

@@ -10,6 +10,11 @@ import { findMenu } from './screen.ts'
 const BOX = /[│┃╭╮╰╯┌┐└┘├┤┬┴┼]/g
 const RULES = /[─━═]{3,}/g
 const ESC_FOOTER_RE = /\besc to cancel\b/i
+/**
+ * A menu option that LEAVES claude: "No, exit", "Exit Claude Code", "Quit". On a prompt that has one, Esc is that option (claude's confirm select starts on its
+ * "no" and Esc takes it), so a generic "Cancel" there would be an exit under another name. A second signal only, on prompts whose menu was read; see promptOf.
+ */
+const EXIT_LABEL_RE = /^(?:no,?\s+)?(?:exit|quit)\b/i
 /** How many lines above the options are kept as what the prompt is about. */
 const CONTEXT_LINES = 28
 
@@ -21,12 +26,18 @@ const CONTEXT_LINES = 28
 export function promptOf(screen: string): { menu: ChatMenu | null; context: string; id: string; cancellable: boolean } {
   const lines = screen.split(/\r?\n/)
   // A footer that says "Esc to cancel" among the last lines drawn: Esc closes this prompt (on a permission prompt that means No).
-  const cancellable = lines
+  const escFooter = lines
     .filter(l => l.trim() !== '')
     .slice(-4)
     .some(l => ESC_FOOTER_RE.test(l))
   const found = findMenu(lines)
   const menu = found?.menu ?? null
+  // SAFETY FIX (17 Nov 2026): the generic "Cancel (Esc)" is offered ONLY for a prompt whose menu was READ. A prompt we cannot read is a prompt whose keys we do not
+  // know, and on claude 2.1.326's "Adding a new directory" prompt (an unnumbered select that starts on "No, exit") Esc IS "No, exit": it ends the chat's claude. That
+  // prompt's menu was not read, so the card offered "Cancel (Esc)" and nothing else, and the only button on the card ended the chat. An unread prompt now offers no
+  // button at all ("answer it in the chat itself"); it needs no list of words to maintain, so a reworded exit option cannot slip through. On a prompt that IS read,
+  // an option that leaves claude ("No, exit", "Quit") is a second signal: Esc is that option, so no Cancel there either.
+  const cancellable = escFooter && menu !== null && !menu.options.some(o => EXIT_LABEL_RE.test(o.label))
   const tidy = (rows: string[]) =>
     rows
       .map(l => l.replace(BOX, ' ').replace(RULES, ' ').replace(/\s+$/, '').replace(/^\s{0,2}/, ''))

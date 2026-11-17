@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import type { WaAssistantTools, WaChat, WaDraft, WaMessage, WaStatus } from '../../shared/whatsapp.ts'
+import type { WaAssistantHand, WaAssistantTools, WaChat, WaDraft, WaMessage, WaStatus } from '../../shared/whatsapp.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
@@ -18,8 +18,12 @@ import type { BackendView } from './supervisor.ts'
 // - Once moved, the tools use the page's WhatsApp only. If it cannot answer, the call fails and says so; it never quietly answers from the
 //   other login (Lead: a silent fallback is what makes him distrust the whole feature).
 // - wa_status always says which login answered, and whether the other is linked.
-// - He can choose either (the page's WhatsApp settings). His choice of the in-app one is kept, and it never moves on its own again; the page's
-//   one can be chosen only once it is linked.
+// - He can choose either (the page's WhatsApp settings). His choice of the in-app one is kept, and it never moves on its own again. A choice can
+//   point only at a login that is linked: the page's one once it is linked and answering, the in-app one once it is linked (never at one that
+//   could not answer, which would leave the Assistant's tools failing with nothing to fall back on).
+// - The record says whose hand chose (Lead, 17 Nov 2026): the choice is not human-only, so the Assistant's screen control can press it on his
+//   instruction. 'owner' is a person's own tap; 'assistant' is the Assistant pressing the page. The page names the hand from the event (trusted
+//   or not); a choice that does not name one is refused, so nothing is ever written down as his tap that nobody said was.
 
 export interface AssistantToolsOptions {
   /** F-079's own WhatsApp in the agent (null where there is none). */
@@ -39,8 +43,8 @@ export interface AssistantTools extends WaTools {
   /** wa_status's text: which login answered, its state, and the other one's. */
   describe(): Promise<string>
   state(): WaAssistantTools
-  /** His choice ('in-app' | 'backend'). */
-  choose(use: unknown): Promise<WaAssistantTools>
+  /** A choice ('in-app' | 'backend') and whose hand made it ('owner' | 'assistant'): both are required, and the choice is recorded as that hand's. */
+  choose(use: unknown, by: unknown): Promise<WaAssistantTools>
 }
 
 const START: WaAssistantTools = { use: 'in-app', since: null, by: null }
@@ -57,7 +61,7 @@ export function createAssistantTools(o: AssistantToolsOptions): AssistantTools {
   function read(): WaAssistantTools {
     try {
       const v = JSON.parse(readFileSync(file, 'utf8')) as Partial<WaAssistantTools>
-      if ((v.use === 'in-app' || v.use === 'backend') && (v.by === 'auto' || v.by === 'owner') && typeof v.since === 'string') return { use: v.use, since: v.since, by: v.by }
+      if ((v.use === 'in-app' || v.use === 'backend') && (v.by === 'auto' || v.by === 'owner' || v.by === 'assistant') && typeof v.since === 'string') return { use: v.use, since: v.since, by: v.by }
       o.log.warn(`the Assistant's WhatsApp choice (${file}) is not one this app writes: it stays on the older in-app WhatsApp`)
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'ENOENT') o.log.warn(`the Assistant's WhatsApp choice could not be read (${message(e)}): it stays on the older in-app WhatsApp`)
@@ -104,9 +108,9 @@ export function createAssistantTools(o: AssistantToolsOptions): AssistantTools {
     }
   }
 
-  /** Not his choice of the in-app one, and the page's WhatsApp linked AND answering: move to it, and write that down. */
+  /** Not a choice by a hand (his, or the Assistant's on his instruction) of the in-app one, and the page's WhatsApp linked AND answering: move to it, and write that down. */
   async function maybeMove(): Promise<void> {
-    if (state.use === 'backend' || state.by === 'owner') return
+    if (state.use === 'backend' || state.by === 'owner' || state.by === 'assistant') return
     const p = await pageStatus()
     if (!p.ok || !p.status.linked) return
     save({ use: 'backend', since: new Date(now()).toISOString(), by: 'auto' })
@@ -148,7 +152,7 @@ export function createAssistantTools(o: AssistantToolsOptions): AssistantTools {
     async describe() {
       await maybeMove()
       const lines: string[] = []
-      const how = state.by === 'auto' ? ', since it was linked and answered' : state.by === 'owner' ? ', his choice' : ''
+      const how = state.by === 'auto' ? ', since it was linked and answered' : state.by === 'owner' ? ', his choice' : state.by === 'assistant' ? ', set by an agent pressing the page, not by his own tap' : ''
       if (state.use === 'backend') {
         const p = await pageStatus()
         if (p.ok) lastPage = p.status
@@ -159,21 +163,28 @@ export function createAssistantTools(o: AssistantToolsOptions): AssistantTools {
         lines.push(`Answering: ${IN_APP}${how}.`)
         lines.push(statusText(inApp().status()))
         const p = await pageStatus()
-        const later = state.by === 'owner' ? 'he chose the in-app one' : 'your tools move to it on their own once it is linked and answers'
+        const later = state.by === 'owner' ? 'he chose the in-app one' : state.by === 'assistant' ? 'an agent set the in-app one by pressing the page, not by his own tap; it stays until a choice is made again' : 'your tools move to it on their own once it is linked and answers'
         lines.push(p.ok ? `Not used: ${PAGE}, which is ${p.status.linked ? 'linked' : 'not linked yet'} (${later}).` : `Not used: ${PAGE}, which is not answering (${p.why}).`)
       }
       return lines.join('\n')
     },
     state: () => ({ ...state }),
-    async choose(use) {
-      if (use !== 'in-app' && use !== 'backend') throw apiError(400, 'Expected {use: "in-app" | "backend"}')
+    async choose(use, by) {
+      if (use !== 'in-app' && use !== 'backend') throw apiError(400, 'Expected {use: "in-app" | "backend", by: "owner" | "assistant"}')
+      // The hand is the page's word from the event; with none, nothing is written down as anyone's.
+      if (by !== 'owner' && by !== 'assistant') throw apiError(400, 'Expected {use: "in-app" | "backend", by: "owner" | "assistant"}: say whose hand pressed it, and it is recorded as that')
+      // A choice points only at a login that is linked (the page's: and answering): otherwise the Assistant's tools would fail with nothing to fall back on.
       if (use === 'backend') {
         const p = await pageStatus()
         if (!p.ok) throw apiError(409, `${PAGE} is not answering (${p.why}), so the Assistant cannot be moved to it.`)
         if (!p.status.linked) throw apiError(409, `${PAGE} is not linked yet: link it first (its QR), then choose it for the Assistant.`)
+      } else {
+        if (!o.inApp) throw apiError(409, 'There is no older in-app WhatsApp on this PC, so the Assistant cannot be moved to it.')
+        if (!o.inApp.status().linked) throw apiError(409, `${IN_APP} is not linked, so the Assistant cannot be moved to it: it would have no WhatsApp to answer from. Choose it once it is linked.`)
       }
-      save({ use, since: new Date(now()).toISOString(), by: 'owner' })
-      o.log.info(`the Assistant's WhatsApp tools now use ${use === 'backend' ? PAGE : IN_APP} (his choice)`)
+      const hand: WaAssistantHand = by
+      save({ use, since: new Date(now()).toISOString(), by: hand })
+      o.log.info(`the Assistant's WhatsApp tools now use ${use === 'backend' ? PAGE : IN_APP} (${hand === 'owner' ? 'his own tap' : 'chosen by an agent pressing the page, not by his own tap'})`)
       return { ...state }
     },
   }

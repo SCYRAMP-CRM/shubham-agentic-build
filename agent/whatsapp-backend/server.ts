@@ -7,7 +7,10 @@ import { WA_PREFIX } from '../../shared/whatsapp.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { listProcesses } from '../proc-tree.ts'
+import { clean } from '../whatsapp/engine.ts'
 import { createWhatsApp, type WhatsApp, type WhatsAppOptions } from '../whatsapp/index.ts'
+import { cleanType } from '../whatsapp/media.ts'
+import { createTicketVerifier, SEND_TICKET_HEADER } from './send-ticket.ts'
 
 // Order o8d7e (F-223): WhatsApp's backend as its own server, on this Server only.
 // - Listens on 127.0.0.1 and nowhere else; on a port of 50000 or higher. The agent's API (21221) is untouched.
@@ -16,7 +19,9 @@ import { createWhatsApp, type WhatsApp, type WhatsAppOptions } from '../whatsapp
 // - One backend per state folder (`backend.lock`): two would drive one WhatsApp login from two Chromes.
 // - Every request needs the backend's token (x-sad-token, from <dir>\token, made on first start, compared in constant time),
 //   a Host of 127.0.0.1 or localhost, and no Origin (a browser page is refused until the page is wired in).
-// - Sends are refused here: nothing can send, not even through the token (the send signer always refuses).
+// - Sends are refused here unless they carry a TICKET (send-ticket.ts): one the agent made after a signed-in person's own request, for exactly that chat and
+//   those words, good once for 30 s, made with a key that lives in memory only. No key (how it starts, and what sending OFF is) refuses everything, so the
+//   token alone, a file any local program can read, cannot send (order obf15, oWA S2).
 // - No public tunnel, no CRM or cloud sync, no deploy: nothing in this server reaches beyond this PC.
 
 export const BACKEND_MIN_PORT = 50000
@@ -37,6 +42,8 @@ export interface BackendOptions {
   /** Its state folder: the token, the port, the lock, the login and WhatsApp's packages (<dir>\whatsapp). */
   dir: string
   log: Logger
+  /** Order obf15: the key that tickets are checked with (64 hex), or none. The hub hands it over later with setSendKey (its private channel), never in a file or the environment. */
+  sendKey?: string | null
   /** Tests: the WhatsApp part's options (script, ready, install, chrome...). */
   whatsapp?: Partial<WhatsAppOptions>
   /** Tests: what runs as a PID now (name and start), to tell a live backend from a PID reused by another program. */
@@ -48,6 +55,10 @@ export interface Backend {
   token: string
   server: Server
   wa: WhatsApp
+  /** Order obf15: sending ON hands it a key (every ticket made with an older one is worthless); sending OFF takes it away, and nothing can be sent until the next key. */
+  setSendKey(key: string | null): void
+  /** Whether it holds a key now (never the key itself). */
+  sendKeyHeld(): boolean
   close(): Promise<void>
 }
 
@@ -163,9 +174,9 @@ const same = (a: string, b: string) => {
   return x.length === y.length && timingSafeEqual(x, y)
 }
 
-function fail(res: ServerResponse, status: number, message: string) {
+function fail(res: ServerResponse, status: number, message: string, code?: string) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-  res.end(JSON.stringify({ error: message }))
+  res.end(JSON.stringify({ error: message, ...(code ? { code } : {}) }))
 }
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
@@ -214,14 +225,14 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
       log: o.log.child('whatsapp'),
       // Order o55b6: its Chrome may go out through the Z800 (tunnel.json, kept by Agent 6's tunnel; checked in agent/whatsapp/tunnel.ts).
       tunnel: { file: path.join(o.dir, 'tunnel.json') },
-      // Sends are refused on this server, whatever is asked of it.
-      human: () => {
-        throw Object.assign(new Error('sending is not open on this backend'), { status: 403 })
-      },
+      // A send is this backend's only against the agent's ticket for exactly it (send-ticket.ts); with no key, whatever is asked of it is refused.
+      human: (_kind, fields, _sig, r) => tickets.verify(r?.headers?.[SEND_TICKET_HEADER], { chatId: String(fields[0] ?? ''), textSha: String(fields[1] ?? ''), draft: String(fields[2] ?? '') }),
       ...o.whatsapp,
     })
     const live = wa
     let hosts = new Set<string>()
+    const tickets = createTicketVerifier()
+    tickets.setKey(o.sendKey ?? null)
 
     const server = createServer(async (req, res) => {
       try {
@@ -234,13 +245,21 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
         const rest = url.pathname.slice(WA_PREFIX.length) || '/'
         const method = (req.method ?? 'GET').toUpperCase()
         const body = method === 'GET' || method === 'HEAD' ? undefined : await readBody(req)
+        // Order oWA S3: a message's file, as bytes (not JSON). Only the agent's proxy asks (behind the token); what a browser is told about its kind is the proxy's (agent/whatsapp/media.ts).
+        if (method === 'GET' && rest === '/media') {
+          const f = await live.media(url.searchParams.get('chat') ?? '', url.searchParams.get('msg') ?? '')
+          res.writeHead(200, { 'content-type': cleanType(f.mimetype) ?? 'application/octet-stream', 'content-length': f.bytes.length, 'x-wa-media-name': encodeURIComponent(f.filename ?? ''), 'cache-control': 'no-store' })
+          return void res.end(f.bytes)
+        }
         const answer = rest.startsWith('/assistant/') ? await assistant(live, method, rest, url.searchParams, body) : await live.mount.http({ method, rest, query: url.searchParams, body, headers: req.headers })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(JSON.stringify(answer ?? { ok: true }))
       } catch (e) {
         const status = typeof (e as { status?: unknown }).status === 'number' ? (e as { status: number }).status : 500
-        if (status >= 500) o.log.error(`WhatsApp backend: ${(e as Error).name}`)
-        fail(res, status, status >= 500 ? 'the backend could not answer' : (e as Error).message)
+        // Order o714a: the log keeps WHY (it said only "Error"), cleaned of numbers, ids and images like every line this backend writes.
+        if (status >= 500) o.log.error(`WhatsApp backend: ${(e as Error).name}: ${clean((e as Error).message ?? '')}`)
+        const code = typeof (e as { code?: unknown }).code === 'string' && status < 500 ? (e as { code: string }).code : undefined
+        fail(res, status, status >= 500 ? 'the backend could not answer' : (e as Error).message, code)
       }
     })
 
@@ -255,6 +274,8 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
       token,
       server,
       wa: live,
+      setSendKey: k => tickets.setKey(k),
+      sendKeyHeld: () => tickets.hasKey(),
       close() {
         closed ??= (async () => {
           try {

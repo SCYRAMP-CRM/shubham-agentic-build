@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-CevTBH8a.js";function t(){e(`/goals`)}export{t as default};

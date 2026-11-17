@@ -60,7 +60,15 @@ const stop = () => {
 process.on('SIGINT', stop)
 process.on('SIGTERM', stop)
 process.on('message', m => {
-  if (m !== null && typeof m === 'object' && (m as { t?: unknown }).t === 'quit') stop()
+  if (m === null || typeof m !== 'object') return
+  const t = (m as { t?: unknown }).t
+  if (t === 'quit') stop()
+  else if (t === 'send-key') {
+    // Order obf15 (oWA S2): the hub hands over the key that send tickets are checked with (sending ON: a new one each time), or takes it away (OFF: null). Only over
+    // this private channel; never logged, never in a file or the environment. It says what it holds now, so the hub knows OFF really took.
+    backend.setSendKey((m as { key?: unknown }).key as string | null)
+    tell({ t: 'send-key', on: backend.sendKeyHeld() })
+  }
 })
 // The hub ended (or let go of it): close WhatsApp properly and end, so nothing it started outlives it.
 process.on('disconnect', stop)

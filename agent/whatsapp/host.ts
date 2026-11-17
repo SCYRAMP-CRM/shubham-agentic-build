@@ -128,7 +128,7 @@ export function createHost(o: HostOptions): Host {
       pending.delete(m.id)
       const r = m as WorkerReply
       if (r.ok) p.resolve(r.result)
-      else p.reject(Object.assign(new Error(r.error), r.status ? { status: r.status } : {}))
+      else p.reject(Object.assign(new Error(r.error), r.status ? { status: r.status } : {}, r.code ? { code: r.code } : {}))
       return
     }
     const e = m as WorkerEvent

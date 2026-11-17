@@ -88,6 +88,7 @@ import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMes
 import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
 import { BUSY_WORDS, createLatchFiles, createLineQueue, createLockRecord, createSpokenLatch, HELD_WORDS, holdsChat, LINE_POLL_MS, latchVerdict, lockHook, noLockWords, REFUSED_WORDS } from './talk-latch.ts'
 import { createResidualHolds, type Seen } from './talk-residual.ts'
+import { createTalkStage } from './talk-stage.ts'
 import { LATCH_NAME } from './latch-hook.ts'
 import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
@@ -180,12 +181,15 @@ import {
   candidatesOf, decidesOn, effectiveRoute, OWNER_ROUTE, parseApprovalsScope, routeNames, splitQuestions, type ApprovalsScope, type QuestionRoute,
   type QuestionRoutingAnswer, type WaitingQuestion,
 } from '../../shared/question-routing.ts'
+import { createStaffTyping } from './staff-typing.ts'
+import { broadcastTargets } from './broadcast-targets.ts'
+import { OLD_STAFF_TYPING, staffTypingOf, type StaffTyping } from '../../shared/staff-typing.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals } from './crm-goals.ts'
 import { createCrmReads } from './crm-reads.ts'
 import { createCrmWrite } from './crm-write.ts'
-import { createCrmProxy } from './crmproxy.ts'
+import { createCrmProxy, type CrmProxy } from './crmproxy.ts'
 import { createAccountsEmail } from './accounts-email.ts'
 import { createAccountsEmailWrite } from './accounts-email-write.ts'
 import { createAccountsPlatformWrite } from './accounts-platform-write.ts'
@@ -535,6 +539,8 @@ export interface AgenticOptions {
 export interface Agentic {
   /** F-126: the CRM files (agent/crm-files/): the tree and its changes, the page's routes, this PC's mount. */
   crmFiles: CrmFilesModule
+  /** Order oWA S5: this app's CRM proxy, for the WhatsApp page's CRM bridge (agent/whatsapp-crm/), which calls it on a signed-in person's own session (requestAs). */
+  crmProxy: Pick<CrmProxy, 'requestAs'>
   /** F-211: every chat's conversation copied into the CRM drive (conversations.ts); tests look now with tick(). */
   conversations: Pick<Conversations, 'tick' | 'status'>
   mount: ApiMount
@@ -854,7 +860,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   // F-118: every events socket with its caller: what it is sent is what that person may see.
   const events = new Map<WsSocket, Caller>()
-  const access = createAccess(o.auth)
+  // Orders of95c / o9ccb / ocf0e: which chats a non-owner may type into (shared/staff-typing.ts), the owner's choice kept on the Server: by
+  // default (no saved choice) a chat they own and one shared to them as "Can type", on every PC; an unreadable saved choice is the 15 Nov rule
+  // (their own Assistant only), which is also kept as a choice.
+  const staffTyping = createStaffTyping(path.join(o.dir, 'staff-typing.json'))
+  if (staffTyping.unreadable()) log?.warn('staff typing: the saved choice (staff-typing.json) could not be read; non-owners type only into their own Assistant (the 15 Nov rule) until he chooses again')
+  /** The Server's own PC id: this PC on the hub (or alone), the hub on a member PC; null when it is not known. */
+  const serverPcId = () => (mode() === 'member' ? (team?.hub()?.id ?? null) : self().id)
+  /** A member PC types by the Server's choice from the Server's current state frame (fresh: replicaIsFresh); without one, the 15 Nov rule. */
+  const typingNow = (): StaffTyping => (mode() === 'member' ? (replicaIsFresh() ? fresh?.typing : null) ?? OLD_STAFF_TYPING : staffTyping.get())
+  const access = createAccess(o.auth, undefined, {
+    typing: () => typingNow(),
+    // The 'not-on-server' scope: a chat with no home yet, or an unknown Server, counts as the Server's (it stays closed).
+    serverChat: a => {
+      const server = serverPcId()
+      return !server || !a.homePc || a.homePc === server
+    },
+  })
   // Order o9465 (order o929e: an existing share is his explicit choice): a person with an agent or a floor of their own or shared with them keeps
   // the Agents routes whatever Settings › Access says; this mount still shows them only those.
   o.featureAccess?.useShares(c => !!c.person && !access.isAdmin(c) && allFloors().some(f => access.floorSeen(c, f)))
@@ -1146,7 +1168,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * of its agents (staff / admin / other, judged with the Server's sign-in; M3), sent in that same frame over the PC link only. Cleared at once
    * when that stream closes or errs, the subscription is dropped, the link changes or this PC stops being a member, and by a frame it can't use.
    */
-  let fresh: { stream: Duplex; token: object; hubId: string; gen: number; classes: Map<string, StaffClass> | null } | null = null
+  let fresh: {
+    stream: Duplex
+    token: object
+    hubId: string
+    gen: number
+    classes: Map<string, StaffClass> | null
+    /** Orders of95c / o9ccb / ocf0e: the Server's choice of who may type where, from that same frame (null from an older Server, or a bad one). */
+    typing: StaffTyping | null
+  } | null = null
   /** The current subscription's stream, over the link this PC is joined by now (M2): only its frames change anything here. */
   function currentStream(link: LinkPeer, stream: Duplex): boolean {
     if (mode() !== 'member' || !sub || sub.stream !== stream || sub.token !== link.token) return false
@@ -1760,7 +1790,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (isStaffAssistant(agent)) throw executionHttpError('execution-forbidden', 'open')
         assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
         const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
-        prepareClaudeConfig(cwd, claudeJson)
+        prepareClaudeConfig(cwd, claudeJson, poolOptions.addDirs)
         const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief() : '', orderReplies())
           + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
         const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
@@ -2487,7 +2517,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
     try {
-      const done = prepareClaudeConfig(cwd, claudeJson)
+      // The chat's folder and every folder the pool starts it with (--add-dir: the uploads folder): claude asks about each, so each is recorded (of24b).
+      const done = prepareClaudeConfig(cwd, claudeJson, poolOptions.addDirs)
       if (done.length) log?.info(`answered in ${claudeJson} so the chat opens on its prompt: ${done.join(', ')}`)
     } catch (e) {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
@@ -2837,7 +2868,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const list = floors.list()
       const staffClasses = hubStaffClasses(list)
       classesPushed = classesFingerprint(staffClasses)
-      const state = { t: 'state', floors: list, staffClasses, pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
+      // Orders of95c / o9ccb / ocf0e: staffTyping, the choice in force here, so the members type by the Server's choice (PC link only).
+      const state = { t: 'state', floors: list, staffClasses, staffTyping: staffTyping.get(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -3033,7 +3065,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // M1/M3: taken from the current stream, so the copy is fresh for this generation, with the Server's classes from this same frame (none from
       // an older Server, or a malformed list: then whatever they would decide is unknown, fenced for each check only).
       const classes = parseStaffClasses(raw.staffClasses)
-      fresh = { stream, token: link.token, hubId: link.id, gen: sub!.gen, classes }
+      // Orders of95c / o9ccb / ocf0e: the Server's typing choice from this same frame; none (an older Server, a bad value): the 15 Nov rule here.
+      fresh = { stream, token: link.token, hubId: link.id, gen: sub!.gen, classes, typing: staffTypingOf(raw.staffTyping) }
       saveReplica()
       emitFloors()
       emitWhere()
@@ -4149,6 +4182,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-221 (ob98a, T4 phase 2): the residual holds (talk-residual.ts, kept in talk-residual.json): a chat a spoken line held when that line closed for
   // any reason but its reply being seen or his Let go, or that was told to carry on while held, stays held until a turn end is seen there.
   const residual = createResidualHolds({ now: Date.now, file: path.join(o.dir, 'talk-residual.json'), ...(log ? { log } : {}) })
+  // F-221 (order oeb56): live talk's turn records, one log line each, numbers only (talk-stage.ts): POST /talk/stage, his page's only.
+  const talkStage = createTalkStage({ now: Date.now, isOwner: c => access.isAdmin(c), deny: (c, where) => o.auth?.deny(c, 403, 'admin-only', where), ...(log ? { log } : {}) })
   /**
    * T4 review: what a chat here shows a residual hold beyond its state (talk-residual.ts Seen). `live`: its own screen shows it working (its spinner,
    * or a prompt of its turn): a turn of this very run. `readBack`: the turn its record reads as running (or asking) began before this run started
@@ -5241,6 +5276,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // oc58f: one owner choice applies to Quick on every device, including
         // older clients that still send their former default hold=true. Off is
         // the old tap-to-send card. Existing cards are NEVER submitted here.
+        // F-267 (order o088b): and the Quick page's every hand-off is a card, whatever that choice says (its start said page 'quick': fast.ts).
+        // The page's own word, so it only ever makes this stricter; every other connection follows the owner's choice as before.
+        if (origin.page === 'quick') return json(holdHandoff(text, origin, names))
         if (!quickForwarding.get().sendsWithoutAsking) return json(holdHandoff(text, origin, names))
         // This passes a REQUEST only. Neither the words nor a client hold frame
         // grant a human tap, approval, Send-as-me, publish or native permission.
@@ -5685,13 +5723,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const t = Date.now()
         if (t - (broadcastLast.get(floor.id) ?? 0) < BROADCAST_COOLDOWN_MS) throw apiError(429, 'This floor just had a broadcast; wait a few seconds.')
         broadcastLast.set(floor.id, t)
-        const all = Object.entries(whereAll())
-          .filter(([s]) => s !== sid && floors.bySession(s)?.floor.id === floor.id)
-          .filter(([s]) => {
-            const at = floors.bySession(s)
-            const r = at ? access.rights(me, at.agent) : null
-            return !at || (r !== null && r.can !== 'view')
-          })
+        // of95c (Agent 3's F1): only chats its owner may type into now, by the one typing rule and his choice (broadcast-targets.ts).
+        const all = broadcastTargets(Object.entries(whereAll()), sid, floor.id, s => floors.bySession(s), a => access.mayType(me, a))
           .map(([s, w]) => ({ sessionId: s, id: w.id, asking: atPrompt(s), drafting: hasDraft(s) }))
         // M1: a chat at a prompt is skipped, not pressed Enter on. 10 Nov 2026 (Shubham): a chat with unsent text in its box is NOT skipped
         // any more; the message goes in after the text the old direct way.
@@ -5940,7 +5973,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** F-118: replaces who a chat is shared with. People are named by CRM id; their names are the CRM's, from the sign-in directory. */
-  function shareChat(floorId: string, agentId: string, body: unknown) {
+  function shareChat(floorId: string, agentId: string, body: unknown, caller: Caller) {
     if (!isObject(body) || !Array.isArray(body.users)) throw apiError(400, "Expected {users: [{id, can: 'view' | 'type'}]}")
     if (body.users.length > 64) throw apiError(400, 'At most 64 people')
     const known = new Map((o.auth?.directory() ?? []).map(u => [u.id, u]))
@@ -5951,6 +5984,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const who = known.get(u.id.toLowerCase())
       if (!who && o.auth) throw apiError(404, `Nobody with id ${u.id.slice(0, 40)} in the CRM's member list`)
       list.push({ id: u.id.toLowerCase(), username: who?.username ?? '', name: who?.name ?? '', can: u.can })
+    }
+    // of95c, the share clamp (Agent 3's smallest version; Shubham's "yes", Lead o7e97): a "Can type" share lets that person type with the chat
+    // OWNER's powers, so only the owner of the app makes one or raises one to it. Judged against the list as it is NOW, and the list as it will
+    // be saved (the last word for each person, the chat's owner left out), since setShare replaces it whole: resubmitting cannot slip a raise in.
+    // Anyone else who may share this chat (its non-admin owner) keeps the rest: view shares, lowering, removing, the type shares already there.
+    if (!access.isAdmin(caller)) {
+      const agent = agentOf(floorOf(floorId), agentId)
+      const ownerId = agent.owner?.id.toLowerCase()
+      const now = new Map((agent.sharedWith ?? []).map(s => [s.id.toLowerCase(), s.can]))
+      const after = new Map(list.filter(x => x.id !== ownerId).map(x => [x.id, x.can]))
+      if ([...after].some(([id, can]) => can === 'type' && now.get(id) !== 'type')) {
+        throw authError(403, 'Only the owner of this app lets someone type in a chat. You can share it to view.', 'admin-only')
+      }
     }
     const floor = floors.setShare(floorId, agentId, list)
     log?.info(`chat ${(agentOf(floor, agentId).sessionId ?? '-').slice(0, 8)} is shared with ${list.map(x => `${x.username || x.id.slice(0, 8)} (${x.can})`).join(', ') || 'nobody'}`)
@@ -6777,7 +6823,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
     const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
     if (!p.native) throw Object.assign(apiError(409, 'That PC needs an app update before native approval can be verified.'), { code: 'approval-peer-update-required' })
-    if (!p.cancellable) throw apiError(409, 'That prompt has no "Esc to cancel"; answer it in the chat itself.')
+    if (!p.cancellable) throw apiError(409, 'Esc is not offered for that prompt (its keys are not known here, or Esc is its exit); answer it in the chat itself.')
     if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
     const latest = floors.bySession(req.sessionId)
     const current = whereAll()[req.sessionId]
@@ -7309,6 +7355,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, ([device, agent], r) => controlMutate(device, agent, 'engine', r)],
     // F-083: the watchdog: whether it runs, the heartbeat's last and next beat, and the chats it holds down now.
     ['GET', /^\/watchdog$/, () => watchdogView()],
+    // Orders of95c / o9ccb / ocf0e: which chats a non-owner may type into; the owner's only (access.ts POLICY). A member PC's page reads the
+    // Server's (passed on), and is told to change it on the Server's page.
+    ['GET', /^\/staff-typing$/, () => staffTyping.answer()],
+    ['PUT', /^\/staff-typing$/, (_, r) => {
+      if (mode() === 'member') throw Object.assign(apiError(409, "Who may type in chats is changed on the Server's page."), { code: 'hub-sign-in-required', hubOrigin: null })
+      // Who chose is the caller, never the body: a person signed in through CRM on this page, an administrator (requireCrmHuman refuses a chat's
+      // key, the open app and a member PC's word for its page); the body is the two words and nothing else (staff-typing.ts).
+      const by = requireCrmHuman(o.auth, r, true)
+      const next = staffTyping.set(r.body)
+      log?.info(`staff typing: ${describeHuman(by)} chose: non-owners type into ${next.settings.rule === 'own-assistant-only' ? 'their own Assistant only (the 15 Nov rule)' : `chats they own and chats shared to them as Can type${next.settings.scope === 'not-on-server' ? ', not on the Server' : ', on every PC'}`}`)
+      // The members type by this choice: they have it in the next state frame.
+      pushState()
+      return next
+    }, 'local'],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
     // oc58f follow-up: the answer says when the saved choice could not be read (the card is in force until he chooses again).
     // o0c50: where each floor's questions are pushed to the owner (owner only, access.ts POLICY); rights are unchanged.
@@ -7553,7 +7613,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // F-118: who a chat is shared with: the whole list, each person 'view' or 'type'. The owner's or sbskrrt's (the rule says so).
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/share$/,
-      ([id, agentId], r) => shareChat(id, agentId, r.body),
+      ([id, agentId], r) => shareChat(id, agentId, r.body, callerOf(r)),
     ],
     ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body, access.ownerOf(callerOf(r)), r), 'local'],
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => {
@@ -8804,6 +8864,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall' || rest === '/mcp/tools',
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
     raw: (rest, url) => {
+      // F-221 (order oeb56): a turn record of live talk for the log. A raw route (its own small body, read in it), so the owner's-page check
+      // is in it too (talk-stage.ts), as for /media below: the route table and its POLICY (access.ts) are left as they are.
+      if (rest === '/talk/stage') return (req, res, caller) => talkStage(req, res, caller ?? OPEN)
       const saved = /^\/saved-views\/(pc|phone)$/.exec(rest)
       if (saved) return (req, res, caller) => {
         if (url.search) throw apiError(400, 'Saved views do not accept selectors')
@@ -8952,6 +9015,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   return {
     crmFiles,
+    crmProxy,
     conversations,
     mount,
     browserMount: browserMount(browser),

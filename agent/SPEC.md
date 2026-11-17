@@ -2449,7 +2449,7 @@ backend's token on the server side: the page never sees it.
   `<state>\whatsapp-backend\port` (removed when it closes). `WA_BACKEND_PORT` (one port) or `WA_BACKEND_PORTS` ("from-to") override it. Each try's
   listeners are removed when the try ends and the port is read back from the socket (the pc-ssh fixture's bug, 8dd84be).
 - **Its door.** The token (`<dir>\token`, made on first start, compared in constant time) on every request, a Host of 127.0.0.1 or localhost,
-  no Origin. Sends are refused (o8416: "not yet"); opening them waits for his word.
+  no Origin. Sends are refused unless a person has switched sending on AND the send carries a ticket the agent made for it (see "oWA" below; it is built and OFF, o8416's "not yet" until his word).
 - **One per folder.** `<dir>\backend.lock` names the process running it; another start for the same folder refuses (exit 4, "another WhatsApp
   backend is already running for this folder (pid N, since T)") while that process is node and started within a minute of the lock; a lock whose
   PID is gone, or now runs another program, is taken over. Two would drive one WhatsApp login from two Chromes.
@@ -2494,6 +2494,69 @@ backend's token on the server side: the page never sees it.
   `proxy.test.ts` (the routes, the token never in an answer, each 503 and its code), `supervisor.test.ts` (stand-in backends: ready, a crash and
   the start again, never ready, 5 failures and stopped, a stop that is not obeyed, a stop during the wait; and the real `run.ts`: its port band,
   the proxy through it, a clean stop, and a second one for the same folder refused), `src/whatsapp/status-truth.test.mjs`.
+
+## oWA (order o7e59, 17 Nov 2026): the page made exactly like Shubham's own whatsapp-frontend: sending and the CRM
+
+His words: "get whatsapp exactly like whatsapp frontend repositories exactly like that"; "Everything the same including ability to add leads directly into the crm". The new page lives
+in `src/whatsapp-new/` (the current one is kept, as a setting); this is the agent's side of two things it needs.
+
+- **Sending (S2, order obf15), built and OFF.** "Sends are refused" above is now: refused unless a PERSON switched sending on, and then only against a ticket. Four gates, each tested alone
+  and together against a stand-in WhatsApp (`whatsapp-backend/send-gate.test.ts`, `send-ticket.test.ts`, `sends.test.ts`):
+  1. The proxy (`proxy.ts`, `SendsOptions`): a send needs a signed-in administrator's own request (`humanProof('wa-send')` = `requireCrmHuman`, admin only: a chat's key is 403, no session
+     401), asked FIRST (a stranger learns nothing about the switch); then the switch ON; then a well-formed send; only then a TICKET is made and the backend called.
+  2. The backend (`server.ts`, `send-ticket.ts`): sends only against a ticket bound to exactly this chat, these words (sha256), this draft or none, and who tapped; good 30 s and once
+     (a nonce); HMAC-SHA256 with a 32-byte key held in memory only (the agent's and the backend's, handed over the supervisor's IPC: never a file, an environment variable or a log). No key
+     (how it starts, and what OFF is) refuses everything, so the token alone cannot send.
+  3. The key (`supervisor.ts`, `run.ts`): new each time sending goes ON (also ON while ON), handed to the backend when it is running or the moment it is ready, and again after a restart while
+     ON; TAKEN AWAY when it goes OFF, and a backend that does not confirm it let go is ended by its exact PID.
+  4. The switch (`send-switch.ts`, `sends.ts`): `<dir>\whatsapp-backend\sending.json`, OFF unless it says exactly `{"on":true}` (missing, unreadable, "true", 1: OFF). ON is written first and
+     counts only once written; OFF is in force first even when it cannot be written (he is told it may come back after a restart). PATCH `/whatsapp-backend/sending` is a signed-in
+     administrator's request only; the page's Settings card has the switch (a person's own trusted tap), and `status.sends.on` is the agent's word.
+- **The people behind the chats (S4; `whatsapp/engine.ts`, `index.ts`, `whatsapp-backend/proxy.ts`).** The CRM is matched by a phone number, and many chats hide it behind a privacy id (`…@lid`):
+  the chat list now carries `number` (digits) on a person's chat: from its id where that is a phone number's (`…@c.us`), and for a privacy id what WhatsApp Web places behind it
+  (`getContactLidAndPhone`, in batches of 25, a batch that fails asked again one id at a time, a success kept, a miss not asked again for 10 minutes). The list waits for them only 1.5 s: they
+  are put into it as they come and the next read has them. A privacy id's or a group's digits are never taken for a number (`numberFromId`). Routes (also through the proxy, which lists them):
+  GET `/contact?chat=` (the contact panel: name, their own WhatsApp name when it differs, number, about, business/saved flags, a picture only if it is an https address; a group's description,
+  owner and members, the first 64 named and numbered within 12 s), GET `/profile-pic?chat=`, POST `/seen`, `/archive`, `/pin` (`{chatId, on}`; a fourth pin is a 409 in plain words) and
+  `/new-chat` (`{number}` → the chat id, or `{ok:false, reason:'not-on-whatsapp'}`). The four POSTs change something on WhatsApp's side (a read receipt, archive, pin) or ask it about a number,
+  so the proxy asks for a person's own request first (no session 401, a chat's key 403, the backend never called); they send no message, so they need no ticket and no switch. Each change drops the
+  kept chat list. A program that lacks the call answers 501 "cannot …", never a crash. Tests: `whatsapp/people.test.ts` (15), `whatsapp-backend/people-routes.test.ts` (5, the backend's real
+  worker on the stand-in and the proxy), `src/whatsapp/api-people.test.mjs` (3); 28 mutants killed.
+- **A message's file (S3a; `whatsapp/media.ts`, `engine.ts` `media()`, the backend's `GET /whatsapp/media`, the proxy's raw `/whatsapp-backend/media`, the page's `src/whatsapp/media.ts` and
+  `src/whatsapp-data/use-media.ts`).** A photo, sticker, video, voice note or document in a chat is shown from its own file. A file comes from whoever wrote the message, so nothing about it may run in
+  this app's own address: the agent's proxy answers it with only a photo, a sound or a video sent to be SHOWN (`image/jpeg|png|gif|webp`, `audio/ogg|mpeg|mp4|aac|amr|webm`, `video/mp4|webm|3gpp`, as
+  exactly that kind), and EVERYTHING else (an HTML page, an SVG, a script, a PDF, an unknown kind, a kind with a header injected into it) as an anonymous download (`application/octet-stream`,
+  `attachment`); every file carries `nosniff`, a CSP that is a sandbox with nothing allowed, and a private cache; its name (the sender's too) is percent-encoded and cleaned of path parts,
+  control characters and quotes. The engine reads only a message of THIS chat that has a file; a file WhatsApp says is over 16 MB is a 413 (`wa-media-too-big`) and is NOT downloaded, one that turns
+  out to be is the same, one WhatsApp no longer has is a 404 (`wa-media-gone`); the page says "open it on your phone" / "ask them to send it again" and never retries those. The bytes go from the
+  worker as base64 over its channel, from the backend as bytes (behind the token), and from the proxy to the page only after those rules. The page fetches it as a blob with the person's own session,
+  shows it from an object URL and gives it back when done; a trouble that may pass is tried again three times (2, 4, 8 s) and then waits for a tap. Tests: `whatsapp/media.test.ts` (10),
+  `whatsapp-backend/media-routes.test.ts` (7, the backend's real worker on the stand-in and the proxy), `src/whatsapp-data/media.test.mjs` (8); 36 mutants killed. Sending a file or a voice note is
+  not built (it would go through the send gate: a ticket bound to the file's hash).
+- **The CRM (S5), `agent/whatsapp-crm/`, mounted at `/agent-api/whatsapp-crm/` (owner only; `shared/whatsapp-crm.ts`, the page's `src/whatsapp/crm-api.ts`).** The reference's `/crm/*`
+  API, made of the SAM CRM's own `/v1/org` routes: the contact with a number (matched on its last ten digits, from the org's contact list, read whole and kept 5 minutes), the
+  contacts, leads (kept 30 s), one lead with its call records, the services and the members; and the changes: add / change a contact, attach a number to a contact, add / change a
+  lead, add a call record, add an update record with its callback date, change a call record. The rules, each tested (`whatsapp-crm/crm.test.ts`, 35, against the repo's fake CRM through the real CRM proxy and once over HTTP through `startApi`; `src/whatsapp/crm-api.test.mjs`, 5; every one of 50 mutants of the bridge and 9 of the client was killed):
+  - It is the signed-in person's OWN CRM session (`auth.viewerCrm`, through `crmProxy.requestAs` with the CRM's CSRF pair), never a key of the app's or this PC's; every route needs a person
+    (`requireCrmHuman`: a chat's key is 403, no session 401, signed in here but not to the CRM 401 `crm-not-signed-in`). The CRM decides what they may do.
+  - A change is a person's request about one record, built from NAMED fields only (`map.ts`): anything else in a body never goes (the CRM takes `is_disabled` as "delete"). Each is checked
+    first and refused in plain words, unsent. The same change twice within 30 s (a double tap, a retry while the first is out) is sent once, per person, and the second gets the first
+    answer marked `repeated`.
+  - Nothing is deleted: there is no delete route (a DELETE is 405) and every request out is first judged by the crm_ tools' own rule (`crm-catalog.ts`: no delete, no money, no people's
+    access), in one place (`up()`), which a test pins.
+  - Answers to act on are answers, not errors: a second lead for the same customer or number on one service (the CRM's 409 hands back the first) and a number already on a contact (one
+    contact per number) come back `{ok:false, reason:'duplicate', duplicate}`; an update record is two changes in order (the record, then the callback date) and a date that does not go
+    through comes back `{ok:false, reason:'partial', call}` (the record is saved: do not write it again).
+  - A read that could not be answered is an error with its reason (`crm-session-ended`, `crm-unreachable`, `crm-no-answer`, `crm-refused`), never an empty list or "not found"; a list that
+    failed half way is never kept; a CRM that says the sign-in ended drops what was kept for that person. Contacts the CRM has taken out of use (disabled, merged) own no number. A lead
+    taken out of use is left out of the list, and a lead's payments, messages and checks are not carried.
+  - Nothing about a person, number, chat or record is logged: only who did what kind of thing and how it came out.
+- **Private notes about a chat (S6; `whatsapp-backend/notes.ts`, the proxy's `/note-index`, `/notes`, `/notes/<id>`).** The reference's NotesSection: a person's own timestamped notes, a list per
+  chat, kept ONLY on this Server in `<state>\whatsapp-backend\notes.json` (written atomically, owner-only where the system allows): never sent to the backend, WhatsApp, the CRM or a cloud.
+  Reading is the owner's (the mount); adding and taking away need a person's own request (no session 401, a chat's key 403). A note is at most 4000 characters, a chat holds 500, notes are kept for
+  5000 chats; words that are only blanks add nothing; a note that cannot be written down is an error, not pretended. A file that cannot be read is SET ASIDE (`notes.json.unreadable-<time>`), never
+  overwritten, and the notes start empty (the log says that, and nothing of a note). Taking a note away deletes the person's own words in this app, nothing in the CRM or WhatsApp.
+  Tests: `whatsapp-backend/notes.test.ts` (10), `src/whatsapp/api-notes.test.mjs` (2); 20 mutants killed.
 
 ## F-085: the PC's side of Chris's Update button
 

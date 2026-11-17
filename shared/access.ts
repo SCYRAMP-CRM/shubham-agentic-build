@@ -14,6 +14,7 @@
 
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
+import { QUICK_ROUTE } from './quick-page.ts'
 
 export type AccessMode = 'owner' | 'people' | 'everyone'
 
@@ -104,7 +105,8 @@ export const FEATURES: readonly Feature[] = [
   // The Assistant, voice and talk.
   { key: 'assistant', group: 'assistant', pages: ['/assistant-history'], label: 'Their own Assistant', blurb: 'The Assistant overlay, with each person’s own Assistant (it comes with F-162).' },
   { key: 'voice', group: 'assistant', label: 'Voice typing', blurb: 'Speaking into a chat’s message box (the PC’s speech engine).' },
-  { key: 'talk', group: 'assistant', label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to your own Assistant and its orders.' },
+  // F-267 (order o088b): the Quick page is live talk on a page of its own, so it is this feature's page: locked, the owner's only.
+  { key: 'talk', group: 'assistant', pages: [QUICK_ROUTE], label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to your own Assistant and its orders.' },
   // Settings.
   { key: 'settings', group: 'settings', label: 'Settings › Look and Chats', blurb: 'Their own light or dark, palette, page picker and chat choices (kept in their browser).', pages: ['/settings'] },
   { key: 'settings-admin', group: 'settings', label: 'Settings › Devices, Ports, Security', blurb: 'This PC’s devices, ports, sign-in level and updates.', pages: ['/devices', '/ports'], locked: 'They are this PC’s own settings.' },
@@ -178,7 +180,8 @@ export const ROUTES: readonly RouteRule[] = [
   r('PATCH', `${FLOOR}\\/memory\\/[^/]+`, ['agents'], true),
   r('DELETE', `${FLOOR}\\/memory\\/[^/]+`, ['agents'], true),
   r('POST', `${AGENT}\\/(tune|move|chat|run-on|terminate|restart|session|say|say-direct|draft\\/clear|share|attach)`, ['agents'], true),
-  r('GET', `${AGENT}\\/(messages|chat|draft|deliveries|deliveries\\/[^/]+|attachment\\/[^/]+)`, ['agents'], true),
+  // of95c (gate A): conversion-progress too (the chat's own owner's, agent/agentic/index.ts profileOwner), so a non-admin owner's page reads it.
+  r('GET', `${AGENT}\\/(messages|chat|draft|deliveries|deliveries\\/[^/]+|attachment\\/[^/]+|conversion-progress)`, ['agents'], true),
   r('GET', `${A}\\/(offline-chats|codex\\/status|opencode\\/status|codex\\/settings|sync-mode|defaults|engine-switch-capabilities|previews|runs)`, ['agents', 'pc-control'], true),
   // o7e6d (refinement2 line 56): approvals and Send as me are the owner's only: no feature and no share opens them (the policy is OWNER in agent/agentic/access.ts).
   // Orders o66aa / oa76b / o7e97: except a floor's waiting prompts for the people he chose to decide for it, who are always people the floor is

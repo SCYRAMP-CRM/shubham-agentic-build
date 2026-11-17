@@ -3,7 +3,7 @@ import type { EngineStatus } from './engine.ts'
 // F-079: what the hub (host.ts) and the WhatsApp process (worker.ts) say to each other over Node's IPC channel.
 // Kept apart from worker.ts, which starts itself when it is loaded.
 
-export type WorkerOp = 'start' | 'status' | 'chats' | 'messages' | 'send' | 'pairCode' | 'logout' | 'quit'
+export type WorkerOp = 'start' | 'status' | 'chats' | 'messages' | 'send' | 'pairCode' | 'logout' | 'quit' | 'contact' | 'profilePic' | 'seen' | 'archive' | 'pin' | 'newChat' | 'media'
 
 export interface WorkerRequest {
   id: number
@@ -11,7 +11,8 @@ export interface WorkerRequest {
   args?: Record<string, unknown>
 }
 
-export type WorkerReply = { id: number; ok: true; result: unknown } | { id: number; ok: false; error: string; status?: number }
+/** `code` (order o714a): a machine-readable reason some answers carry, such as wa-chats-loading (the chat list is still being read for the first time). */
+export type WorkerReply = { id: number; ok: true; result: unknown } | { id: number; ok: false; error: string; status?: number; code?: string }
 
 /** What the worker says by itself. */
 export type WorkerEvent =

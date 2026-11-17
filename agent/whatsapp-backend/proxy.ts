@@ -1,7 +1,11 @@
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { WA_BACKEND_PREFIX, WA_PREFIX, type WaBackendCode } from '../../shared/whatsapp.ts'
+import { WA_BACKEND_PREFIX, WA_MEDIA_MAX_BYTES, WA_MEDIA_TOO_BIG, WA_PREFIX, type WaBackendCode } from '../../shared/whatsapp.ts'
 import { apiError, type ApiMount, type MountRequest } from '../api.ts'
+import { mediaHeaders } from '../whatsapp/media.ts'
 import type { AssistantTools } from './assistant-tools.ts'
+import type { NotesStore } from './notes.ts'
+import { SEND_TICKET_HEADER, type SendFields } from './send-ticket.ts'
 import type { BackendView } from './supervisor.ts'
 
 // Order o8416 (F-223): the WhatsApp page talks to the agent, and the agent passes its requests to the WhatsApp backend on
@@ -29,10 +33,33 @@ const ROUTES: Route[] = [
   { method: 'GET', pattern: /^\/chats$/ },
   { method: 'GET', pattern: /^\/messages$/ },
   { method: 'POST', pattern: /^\/send$/ },
+  // Order oWA S4: the people behind the chats. The four that change something (or ask WhatsApp about a number) need a person's own request (CHANGES below).
+  { method: 'GET', pattern: /^\/contact$/ },
+  { method: 'GET', pattern: /^\/profile-pic$/ },
+  { method: 'POST', pattern: /^\/(seen|archive|pin|new-chat)$/ },
   { method: 'DELETE', pattern: /^\/drafts\/[^/]+$/ },
 ]
 
+/** Order oWA S4: what changes something on WhatsApp's side (a read receipt, archive, pin) or asks it about a number: a person's own request, like a send's first gate. */
+const CHANGES = /^\/(seen|archive|pin|new-chat)$/
+
 export const allowedRoute = (method: string, rest: string): boolean => ROUTES.some(r => r.method === method && r.pattern.test(rest))
+
+/**
+ * Order obf15 (oWA S2, Lead's design approval): the agent's gates for a send. A send reaches the backend only after: (1) human(): a person's own signed-in request
+ * (requireCrmHuman: a CRM session, never a chat's key; it throws 401/403 and is asked FIRST, so a stranger learns nothing about the switch); (2) the switch ON (his, a
+ * file, OFF by default); (3) a well-formed send; (4) a ticket made for exactly that chat and those words. Each refusal is before the backend is called.
+ */
+export interface SendsOptions {
+  /** Whether sending is switched on. */
+  on(): boolean
+  /** Who tapped: this request is a signed-in person's own, or it throws (401 no session, 403 a chat's key or not an administrator). */
+  human(req: MountRequest): string
+  /** A ticket for this send by this person, or null when the backend holds no key. */
+  ticket(f: SendFields, by: string): string | null
+  /** Switches sending ON or OFF (the file, then the backend's key), by this person; resolves whether the backend confirmed it holds what it should. */
+  set(on: boolean, by: string): Promise<boolean>
+}
 
 export interface ProxyOptions {
   /** The backend's state folder: its token file is <dir>\token. */
@@ -41,12 +68,18 @@ export interface ProxyOptions {
   backend?: () => BackendView | null
   /** Order of5a0 (A2): which login the Assistant's WhatsApp tools use (the hub's), shown with the status and chosen here. */
   assistantTools?: () => AssistantTools | null
+  /** Order obf15: the gates for sending. Without them (a hand-run backend, a test) a send is passed on as it was and the backend itself refuses it. */
+  sends?: SendsOptions
+  /** Order oWA S6: the person's own notes about chats (kept here on the Server, never sent to the backend, WhatsApp or the CRM). Without it those paths do not exist. */
+  notes?: NotesStore
   /** Tests: a backend on a known port, with no supervisor. */
   port?: number
   /** Tests: a fetch to use in place of the network. */
   fetchImpl?: typeof fetch
   /** Tests: how long one call may take. */
   timeoutMs?: number
+  /** Order oWA S3: how long a file may take to come (default 60 s). */
+  mediaTimeoutMs?: number
 }
 
 const down = (code: WaBackendCode, message: string) => Object.assign(apiError(503, message), { code })
@@ -76,20 +109,107 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
 
   return {
     prefix: WA_BACKEND_PREFIX,
+    /**
+     * Order oWA S3: a message's file, as bytes. The agent's own answer to the page, so what a browser is told about its kind is decided HERE (agent/whatsapp/media.ts): only a photo, a sound or a
+     * video is sent to be shown, anything else is a download, and every file carries nosniff and a sandbox. Reading is the owner's (this mount); a file is never forwarded unread.
+     */
+    raw(rest, url) {
+      if (rest !== '/media') return null
+      return async (req, res) => {
+        if (req.method !== 'GET') throw apiError(405, 'A file is read with GET')
+        const chat = url.searchParams.get('chat') ?? ''
+        const msg = url.searchParams.get('msg') ?? ''
+        if (!chat || chat.length > 100 || !msg || msg.length > 200) throw apiError(400, 'Expected ?chat=<chat id>&msg=<message id>')
+        const port = o.port ?? backendPort(o.backend?.() ?? null)
+        let up: Response
+        try {
+          up = await doFetch(`http://127.0.0.1:${port}${WA_PREFIX}/media?chat=${encodeURIComponent(chat)}&msg=${encodeURIComponent(msg)}`, {
+            method: 'GET',
+            cache: 'no-store',
+            headers: { 'x-sad-token': token() },
+            signal: AbortSignal.timeout(o.mediaTimeoutMs ?? 60_000),
+          })
+        } catch (e) {
+          const cause = (e as { cause?: { code?: unknown } }).cause?.code
+          const what = (e as Error).name === 'TimeoutError' ? 'no answer in time' : typeof cause === 'string' ? cause : 'the connection failed'
+          throw down('wa-backend-unreachable', `The WhatsApp backend did not answer (${what}).`)
+        }
+        if (!up.ok) {
+          const data = (await up.json().catch(() => null)) as { error?: unknown; code?: unknown } | null
+          throw Object.assign(apiError(up.status, typeof data?.error === 'string' ? data.error : `The WhatsApp backend answered ${up.status}`), typeof data?.code === 'string' ? { code: data.code } : {})
+        }
+        const declared = Number(up.headers.get('content-length') ?? 0)
+        if (declared > WA_MEDIA_MAX_BYTES) throw Object.assign(apiError(413, 'This file is too big to show here: open it on your phone.'), { code: WA_MEDIA_TOO_BIG })
+        const bytes = Buffer.from(await up.arrayBuffer())
+        if (bytes.length > WA_MEDIA_MAX_BYTES) throw Object.assign(apiError(413, 'This file is too big to show here: open it on your phone.'), { code: WA_MEDIA_TOO_BIG })
+        let name: string | null = null
+        try {
+          name = decodeURIComponent(up.headers.get('x-wa-media-name') ?? '') || null
+        } catch {
+          name = null
+        }
+        res.writeHead(200, { ...mediaHeaders(up.headers.get('content-type') ?? '', name), 'content-length': bytes.length })
+        res.end(bytes)
+      }
+    },
     async http(req: MountRequest): Promise<unknown> {
       const { method, rest, query, body } = req
       // Order of5a0 (A2): his choice of the Assistant's login is the agent's own, not the backend's.
       if (method === 'PATCH' && rest === '/assistant-tools') {
         const at = o.assistantTools?.() ?? null
         if (!at) throw apiError(404, 'The Assistant has only one WhatsApp here.')
-        return at.choose((body as { use?: unknown } | undefined)?.use)
+        const b = body as { use?: unknown; by?: unknown } | undefined
+        return at.choose(b?.use, b?.by)
+      }
+      // Order oWA S6: the notes are the agent's own (never forwarded). Reading is the owner's (this mount); writing is a person's own request.
+      const notes = o.notes
+      if (notes) {
+        if (method === 'GET' && rest === '/note-index') return notes.index()
+        if (rest === '/notes') {
+          const chat = query.get('chat') ?? ''
+          if (method === 'GET') return notes.list(chat)
+          if (method === 'POST') {
+            o.sends?.human(req)
+            const b = (body ?? {}) as { chatId?: unknown; text?: unknown }
+            if (typeof b.chatId !== 'string' || typeof b.text !== 'string') throw apiError(400, 'Expected {chatId, text}')
+            return notes.add(b.chatId, b.text)
+          }
+        }
+        const one = /^\/notes\/([\w-]{1,64})$/.exec(rest)
+        if (one && method === 'DELETE') {
+          o.sends?.human(req)
+          return notes.remove(query.get('chat') ?? '', one[1])
+        }
+      }
+      // Order obf15 (oWA S2): the switch, and the gates of a send. A person's own request comes FIRST in both.
+      const sends = o.sends
+      let ticket: string | null = null
+      if (sends && method === 'PATCH' && rest === '/sending') {
+        const by = sends.human(req)
+        const on = (body as { on?: unknown } | undefined)?.on
+        if (typeof on !== 'boolean') throw apiError(400, 'Expected {on: true | false}')
+        const confirmed = await sends.set(on, by)
+        return { on: sends.on(), confirmed }
       }
       if (!allowedRoute(method, rest)) throw apiError(404, `No such WhatsApp path: ${method} ${rest}`)
+      // Order oWA S4: a person's own request (a CRM session; a chat's key is refused) before anything reaches the backend. No ticket and no switch: it sends no message.
+      if (sends && method === 'POST' && CHANGES.test(rest)) sends.human(req)
+      if (sends && method === 'POST' && rest === '/send') {
+        const by = sends.human(req)
+        if (!sends.on()) throw apiError(403, 'Sending is switched off. A person switches it on in the WhatsApp settings.')
+        const b = (body ?? {}) as Record<string, unknown>
+        const chatId = typeof b.chatId === 'string' ? b.chatId : ''
+        const text = typeof b.text === 'string' ? b.text : ''
+        const draft = b.draft === undefined ? '' : typeof b.draft === 'string' ? b.draft : null
+        if (!chatId || chatId.length > 200 || !text.trim() || draft === null || draft.length > 64) throw apiError(400, 'Expected {chatId, text, draft?}')
+        ticket = sends.ticket({ chatId, textSha: createHash('sha256').update(text, 'utf8').digest('hex'), draft }, by)
+        if (ticket === null) throw apiError(503, 'Sending is not available right now: the WhatsApp backend holds no send key yet (it may be starting). Try again in a moment.')
+      }
       const port = o.port ?? backendPort(o.backend?.() ?? null)
       const qs = query.toString()
       const url = `http://127.0.0.1:${port}${WA_PREFIX}${rest}${qs ? `?${qs}` : ''}`
       const json = method !== 'GET' && method !== 'HEAD' && body !== undefined
-      const headers = { 'x-sad-token': token(), ...(json ? { 'content-type': 'application/json' } : {}) }
+      const headers = { 'x-sad-token': token(), ...(json ? { 'content-type': 'application/json' } : {}), ...(ticket ? { [SEND_TICKET_HEADER]: ticket } : {}) }
       let res: Response
       try {
         res = await doFetch(url, { method, cache: 'no-store', headers, body: json ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) })
@@ -99,9 +219,15 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         throw down('wa-backend-unreachable', `The WhatsApp backend did not answer (${what}).`)
       }
       const data = (await res.json().catch(() => null)) as unknown
-      if (!res.ok) throw apiError(res.status, typeof (data as { error?: unknown })?.error === 'string' ? (data as { error: string }).error : `The WhatsApp backend answered ${res.status}`)
-      const at = method === 'GET' && rest === '/status' ? (o.assistantTools?.() ?? null) : null
-      return at && data !== null && typeof data === 'object' ? { ...(data as Record<string, unknown>), assistantTools: at.state() } : data
+      if (!res.ok) {
+        const why = (data as { code?: unknown } | null)?.code
+        // Order o714a: the backend's own code (wa-chats-loading) goes on to the page, which waits and asks again instead of failing.
+        throw Object.assign(apiError(res.status, typeof (data as { error?: unknown })?.error === 'string' ? (data as { error: string }).error : `The WhatsApp backend answered ${res.status}`), typeof why === 'string' ? { code: why } : {})
+      }
+      const isStatus = method === 'GET' && rest === '/status'
+      const at = isStatus ? (o.assistantTools?.() ?? null) : null
+      const extra = { ...(at ? { assistantTools: at.state() } : {}), ...(isStatus && sends ? { sends: { on: sends.on() } } : {}) }
+      return data !== null && typeof data === 'object' && Object.keys(extra).length > 0 ? { ...(data as Record<string, unknown>), ...extra } : data
     },
   }
 }

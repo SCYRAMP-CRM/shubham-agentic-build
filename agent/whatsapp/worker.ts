@@ -41,7 +41,7 @@ async function makeEngine(): Promise<WaEngine> {
   const profileDir = path.join(auth, `session-${LOGIN_ID}`)
   if (env.SAD_WA_FAKE) {
     const fake = (await import(pathToFileURL(env.SAD_WA_FAKE).href)) as { createClient(o?: { puppeteer: { args: string[] } }): WaClient }
-    return new WaEngine({ createClient: () => fake.createClient({ puppeteer: { args: chromeArgs() } }), qrImage: async t => `data:image/png;base64,${Buffer.from(t).toString('base64')}`, profileDir, log: say, pollMs: 20, pollTries: 5, retryMs: 10 })
+    return new WaEngine({ createClient: () => fake.createClient({ puppeteer: { args: chromeArgs() } }), qrImage: async t => `data:image/png;base64,${Buffer.from(t).toString('base64')}`, profileDir, log: say, pollMs: 20, pollTries: 5, retryMs: 10, chatsWaitMs: 50 })
   }
   const lib = env.SAD_WA_LIB
   const chrome = env.SAD_WA_CHROME
@@ -123,6 +123,25 @@ async function main() {
         return engine.messages(s('chatId'), typeof a.count === 'number' ? a.count : 30, s('before') || undefined)
       case 'send':
         return engine.send(s('chatId'), s('text'))
+      // Order oWA S4: the people behind the chats.
+      case 'contact':
+        return engine.contact(s('chatId'))
+      case 'profilePic':
+        return { url: await engine.profilePic(s('chatId')) }
+      case 'seen':
+        await engine.seen(s('chatId'))
+        return { ok: true }
+      case 'archive':
+        await engine.archive(s('chatId'), a.on === true)
+        return { ok: true }
+      case 'pin':
+        await engine.pin(s('chatId'), a.on === true)
+        return { ok: true }
+      case 'newChat':
+        return engine.newChat(s('number'))
+      // Order oWA S3: a message's file (the bytes as base64, to the hub, which hands them on as bytes).
+      case 'media':
+        return engine.media(s('chatId'), s('messageId'))
       case 'pairCode':
         return { code: await engine.pairCode(s('phone')) }
       case 'logout':
@@ -144,8 +163,9 @@ async function main() {
       },
       (e: unknown) => {
         const status = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined
+        const code = typeof (e as { code?: unknown })?.code === 'string' && status ? (e as { code: string }).code : undefined
         // Our own errors are plain words; a library's could hold an id or a number.
-        send({ id: r.id, ok: false, error: status ? message(e) : clean(message(e)), ...(status ? { status } : {}) })
+        send({ id: r.id, ok: false, error: status ? message(e) : clean(message(e)), ...(status ? { status } : {}), ...(code ? { code } : {}) })
       },
     )
   leaveNow = () => void leave(0)

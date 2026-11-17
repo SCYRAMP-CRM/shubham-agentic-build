@@ -13,6 +13,13 @@ import { writeAtomic } from '../config.ts'
 //   - "Do you trust this folder?" for the floor's folder, which the person picked for the floor
 //     in the app: projects["C:/the/folder"].hasTrustDialogAccepted, as claude writes on "Yes".
 //     (In claude 2.1 that menu starts on "No, exit", so answering it with Enter would quit.)
+//   - the same question for every folder the chat is STARTED WITH (--add-dir: the app's uploads
+//     folder). Claude 2.1.326 asks it too, as "Adding a new directory: ... Is this a directory you
+//     created or one you trust?", a select that starts on "No, exit" and whose Esc ends the chat, and
+//     it is the same record that answers it. permissions.additionalDirectories does NOT: that is
+//     tool access, not trust (proved by effect, twice, 17 Nov 2026: Lead's restart of a chat, and a
+//     scratch claude started with it set that still drew the prompt). The app recorded the consent
+//     for the chat's own folder and, silently, not for the folders it passes (order of24b).
 // Shubham explicitly chose bypass permissions for all existing and new chats. Record that
 // native consent too, so a managed bypass launch opens without another startup question.
 // Other preferences are only filled when absent; credentials and unrelated settings stay.
@@ -25,8 +32,11 @@ export const projectKey = (cwd: string) => cwd.replace(/\\/g, '/')
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
-/** Marks setup done, records the requested bypass consent and trusts `cwd`; returns the changed preferences. */
-export function prepareClaudeConfig(cwd: string, file = claudeJsonPath()): string[] {
+/**
+ * Marks setup done, records the requested bypass consent and trusts `cwd` and every folder in `addDirs` (the ones the chat is started with --add-dir);
+ * returns the changed preferences. The file is written only when something changed, and an unreadable one is left alone (claude asks in the terminal).
+ */
+export function prepareClaudeConfig(cwd: string, file = claudeJsonPath(), addDirs: readonly string[] = []): string[] {
   let data: Record<string, unknown> = {}
   if (existsSync(file)) {
     let parsed: unknown
@@ -54,12 +64,15 @@ export function prepareClaudeConfig(cwd: string, file = claudeJsonPath()): strin
     changed.push('theme')
   }
   const projects = isObject(data.projects) ? data.projects : {}
-  const key = projectKey(cwd)
-  const project = isObject(projects[key]) ? projects[key] : {}
-  if (project.hasTrustDialogAccepted !== true) {
-    projects[key] = { ...project, hasTrustDialogAccepted: true }
-    data.projects = projects
-    changed.push(`trust for ${key}`)
+  for (const dir of [cwd, ...addDirs]) {
+    if (!dir) continue
+    const key = projectKey(dir)
+    const project = isObject(projects[key]) ? projects[key] : {}
+    if (project.hasTrustDialogAccepted !== true) {
+      projects[key] = { ...project, hasTrustDialogAccepted: true }
+      data.projects = projects
+      changed.push(`trust for ${key}`)
+    }
   }
   if (changed.length) writeAtomic(file, `${JSON.stringify(data, null, 2)}\n`)
   return changed
