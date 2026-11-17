@@ -60,21 +60,38 @@ export function requireCrmHuman(auth: Auth | undefined, request: HumanRequest | 
 export function describeHuman(c: Caller): string {
   return `${c.person!.username.replace(/[\r\n]/g, ' ')} (${c.person!.id.slice(0, 8)}) signed in through CRM`
 }
-/** One native prompt is acted on at most once, even when two clicks overlap before screen refresh. */
+/** Who acted on a prompt: a person's CRM id and the name to show. */
+export interface PromptActor {
+  id: string
+  name: string
+}
+
+/** Orders o66aa / o7e97: the plain refusal for whoever comes second to a prompt someone else already answered (409, code answered-by-another). */
+export const answeredByAnother = (who: PromptActor) =>
+  Object.assign(apiError(409, `${who.name} already answered this prompt.`), { code: 'answered-by-another', answeredBy: who.name })
+
+/**
+ * One native prompt is acted on at most once, even when two clicks overlap before screen refresh. Orders o66aa / o7e97 (several people
+ * decide for one floor, the first answer wins): the claim is atomic (the entry is set before anything is awaited), and with an `actor`
+ * it remembers who: anyone else who comes to that prompt afterwards, with any answer (the same one included), is told plainly who answered
+ * it (answeredByAnother), never a silent failure and never somebody else's success as their own. The same person's double tap is one answer.
+ */
 export function createPromptActions() {
   // Never evict accepted/uncertain intents and silently make their native keys replayable.
   // Prompt IDs also bind the coordinator incarnation, so restart invalidates old UI intents.
-  const actions = new Map<string, { fingerprint: string; promise: Promise<unknown> }>()
+  const actions = new Map<string, { fingerprint: string; promise: Promise<unknown>; actor?: PromptActor }>()
   return {
-    run<T>(key: string, fingerprint: string, work: (markNativeAttempt: () => void) => Promise<T>): Promise<T> {
+    run<T>(key: string, fingerprint: string, work: (markNativeAttempt: () => void) => Promise<T>, actor?: PromptActor): Promise<T> {
       const previous = actions.get(key)
       if (previous) {
+        if (actor && previous.actor && previous.actor.id !== actor.id) return Promise.reject(answeredByAnother(previous.actor))
         if (previous.fingerprint !== fingerprint) return Promise.reject(apiError(409, 'This prompt already has an answer in progress; refresh it.'))
         return previous.promise as Promise<T>
       }
       if (actions.size >= 10_000) return Promise.reject(apiError(429, 'Prompt action history is full; no action was sent. Refresh after an app restart.'))
       let attempted = false
-      const entry: { fingerprint: string; promise: Promise<unknown> } = {
+      const entry: { fingerprint: string; promise: Promise<unknown>; actor?: PromptActor } = {
+        ...(actor ? { actor } : {}),
         fingerprint,
         promise: Promise.resolve().then(() => work(() => { attempted = true })).catch(error => {
           // A provable pre-native refusal must not poison the prompt for a later valid login.
@@ -85,6 +102,10 @@ export function createPromptActions() {
       }
       actions.set(key, entry)
       return entry.promise as Promise<T>
+    },
+    /** Who holds this prompt's answer (in progress or done), when it was given with an actor; undefined when nobody does. */
+    actorOf(key: string): PromptActor | undefined {
+      return actions.get(key)?.actor
     },
   }
 }

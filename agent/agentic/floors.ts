@@ -238,6 +238,12 @@ export interface FloorStore {
   /** The floor and agent a chat belongs to: how a tool call knows who is calling. */
   bySession(sessionId: string): { floor: Floor; agent: FloorAgent } | null
   /**
+   * Backend only (the profile of 16 Nov: index.ts's bySession deep-copied EVERY floor to find one chat): this store's own rows, NOT copied, for a caller that
+   * only READS them (the PC Control namespace check, a search that then copies only what it found). Never change them, never hand them out. Optional: a store
+   * without it is read through list() as before.
+   */
+  rows?(): readonly Floor[]
+  /**
    * Order o7e6d S1 (Agent 3's H1): what this store's load found, read only, as copies: its file missing, a corrupt one set aside (the store
    * started empty), a shape it does not read (kept as it is, read as empty), the floors quarantined at load and every session of theirs.
    * Nothing here hydrates, repairs, validates, commits or writes anything; a store made from a seed reports nothing.
@@ -511,6 +517,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
     validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine, executionDefaults, pcControl: opts.pcControl }).patch(id, patch, as) },
     list: () => clone(floors),
+    rows: () => floors,
     get: id => {
       if (quarantined.has(id)) throw executionHttpError('execution-invalid', 'selection')
       const f = floors.find(x => x.id === id)

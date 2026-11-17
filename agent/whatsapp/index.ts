@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
-import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaDraft, type WaLive, type WaMessage, type WaSendRequest, type WaSetup, type WaStatus } from '../../shared/whatsapp.ts'
+import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaDraft, type WaLive, type WaMessage, type WaSendRequest, type WaRoute, type WaSetup, type WaStatus, type WaTunnelSeen } from '../../shared/whatsapp.ts'
 import type { ProofRequest } from '../agentic/index.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -13,6 +13,7 @@ import { message, type EngineStatus } from './engine.ts'
 import { createHost, type HostOptions } from './host.ts'
 import { LOGIN_ID, type WorkerEvent } from './protocol.ts'
 import { installLib, libReady, MANIFEST_DIR } from './setup.ts'
+import { checkTunnel, type TunnelCheck } from './tunnel.ts'
 
 // F-079: WhatsApp in the app, on the hub. Shubham's own WhatsApp, linked once as a device by his QR scan, then read
 // and written from the WhatsApp page and, within limits, by the overlay Assistant.
@@ -41,6 +42,11 @@ export interface WhatsAppOptions {
   /** Lock the login folder to this Windows user (icacls); default on Windows. */
   lock?: boolean
   host?: Partial<HostOptions>
+  /**
+   * Order o55b6: where this WhatsApp can go out another way, through the Z800's SSH SOCKS tunnel (Agent 6 keeps it and notes it in `file`;
+   * tunnel.ts checks it). Given only to the WhatsApp backend; without it there is no route setting and Chrome goes out directly.
+   */
+  tunnel?: { file: string; check?: (file: string) => Promise<TunnelCheck>; everyMs?: number }
 }
 
 /** What the Assistant's tools use (agentic/index.ts, through whatsapp/tools.ts). */
@@ -49,6 +55,8 @@ export interface WaTools {
   chats(): Promise<WaChat[]>
   read(chatId: string, count: number): Promise<WaMessage[]>
   draft(chatId: string, text: string, why: string): Promise<WaDraft>
+  /** Order of5a0 (A2): wa_status's own text, where it says more than this login's status (which login answered, and the other). */
+  describe?(): Promise<string>
 }
 
 export interface WhatsApp {
@@ -72,6 +80,8 @@ interface Settings {
   linked: boolean
   /** His WhatsApp name, to show while it is closed. */
   name: string | null
+  /** Order o55b6: the way out he chose; null: not chosen (through the Z800 where there is a tunnel to choose). */
+  route: WaRoute | null
 }
 
 export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
@@ -99,19 +109,38 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   function readSettings(): Settings {
     try {
       const raw = JSON.parse(readFileSync(settingsFile, 'utf8')) as Record<string, unknown>
-      return { alwaysOn: raw.alwaysOn === true, linked: raw.linked === true, name: typeof raw.name === 'string' ? raw.name : null }
+      return { alwaysOn: raw.alwaysOn === true, linked: raw.linked === true, name: typeof raw.name === 'string' ? raw.name : null, route: raw.route === 'direct' || raw.route === 'z800' ? raw.route : null }
     } catch {
-      return { alwaysOn: false, linked: false, name: null }
+      return { alwaysOn: false, linked: false, name: null, route: null }
     }
   }
   function saveSettings(patch: Partial<Settings>) {
     settings = { ...settings, ...patch }
     try {
       mkdirSync(o.dir, { recursive: true })
-      writeAtomic(settingsFile, `${JSON.stringify(settings, null, 2)}\n`)
+      // Order o55b6: the way out is written only once he has chosen one; until then the file keeps its old shape.
+      const { route: chosen, ...rest } = settings
+      writeAtomic(settingsFile, `${JSON.stringify(chosen ? { ...rest, route: chosen } : rest, null, 2)}\n`)
     } catch (e) {
       log.warn(`could not save the WhatsApp settings: ${message(e)}`)
     }
+  }
+
+  // Order o55b6: the way out. Where there is a tunnel to choose, his choice, else the Z800 (his "Yes ok do however please" to option 3); the old
+  // way, directly, stays a setting. Without one: directly, as before, and no setting.
+  const route = (): WaRoute | null => (o.tunnel ? (settings.route ?? 'z800') : null)
+  let tunnelSeen: WaTunnelSeen | null = null
+  let tunnelAt = 0
+  /** The proxy the running Chrome was started with (null: directly, or not running). */
+  let proxyInUse: string | null = null
+  const seeTunnel = (t: TunnelCheck) => {
+    tunnelAt = now()
+    tunnelSeen = t.ok ? { up: true, why: null, via: t.via, at: new Date(tunnelAt).toISOString() } : { up: false, why: t.why, via: null, at: new Date(tunnelAt).toISOString() }
+  }
+  const checkNow = async (): Promise<TunnelCheck> => {
+    const t = await (o.tunnel!.check ?? checkTunnel)(o.tunnel!.file).catch((e: unknown): TunnelCheck => ({ ok: false, why: `the tunnel could not be checked (${message(e)})` }))
+    seeTunnel(t)
+    return t
   }
 
   const linked = () => {
@@ -131,6 +160,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     on: onWorker,
     onExit: code => {
       clearIdle()
+      proxyInUse = null
       if (code !== 0) log.warn(`WhatsApp's process ended unexpectedly (code ${code ?? 'none'})`)
       engine = { ...engine, state: engine.state === 'failed' ? 'failed' : 'off', qr: null, pairingCode: null, loading: null, reason: code === 0 ? engine.reason : 'WhatsApp stopped unexpectedly. It opens again when it is used.' }
       changed()
@@ -167,6 +197,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       closesAt,
       drafts: drafts.list(),
       assistantSentLastHour: drafts.sentLastHour(),
+      ...(route() ? { route: route()!, tunnel: tunnelSeen } : {}),
     }
   }
 
@@ -233,8 +264,26 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     if (!isReady()) throw apiError(409, 'WhatsApp is not set up on this PC yet. Set it up on the WhatsApp page first.')
     if (!chrome) throw apiError(409, 'There is no Chrome on this PC: WhatsApp runs in Google Chrome. Install it, then try again.')
     lockAuth()
+    if (host.running() && engine.state !== 'off' && engine.state !== 'failed') return touch()
+    // Order o55b6: through the Z800, Chrome starts only with a tunnel checked just now (its note, its listener's PID, a SOCKS5 greeting). If it is
+    // not there, WhatsApp does not open, and says why: it never goes out directly in its place (Lead's condition 2).
+    let start: { proxy?: string } = {}
+    if (route() === 'z800') {
+      const t = await checkNow()
+      if (!t.ok) {
+        const why = `WhatsApp goes out through the Z800 here, and that way is not ready: ${t.why}. It does not go out directly instead; to go directly, choose "Directly" on the WhatsApp page.`
+        engine = { ...engine, state: 'failed', qr: null, pairingCode: null, loading: null, reason: why }
+        log.warn(`WhatsApp not opened: ${t.why}`)
+        changed()
+        throw apiError(503, why)
+      }
+      start = { proxy: t.proxy }
+    }
     await host.spawn()
-    if (engine.state === 'off' || engine.state === 'failed') await host.call('start')
+    if (engine.state === 'off' || engine.state === 'failed') {
+      await host.call('start', start)
+      proxyInUse = start.proxy ?? null
+    }
     touch()
   }
 
@@ -256,6 +305,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
 
   async function shut(reason: string | null) {
     clearIdle()
+    proxyInUse = null
     await host.quit()
     engine = { ...engine, state: 'off', qr: null, pairingCode: null, loading: null, reason }
     changed()
@@ -418,7 +468,8 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       case 'POST /send':
         return send(body, req)
       case 'PATCH /settings': {
-        if (!isObject(body) || typeof body.alwaysOn !== 'boolean') throw apiError(400, 'Expected {alwaysOn}')
+        if (isObject(body) && body.route !== undefined && body.alwaysOn === undefined) return setRoute(body.route)
+        if (!isObject(body) || typeof body.alwaysOn !== 'boolean') throw apiError(400, 'Expected {alwaysOn} or {route}')
         saveSettings({ alwaysOn: body.alwaysOn })
         if (body.alwaysOn && linked()) await open()
         else touch()
@@ -451,6 +502,41 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     },
   }
 
+  /** Order o55b6: his choice of the way out. A WhatsApp open the other way is closed, saying so; it opens the new way when next used. */
+  async function setRoute(raw: unknown): Promise<WaStatus> {
+    if (!o.tunnel) throw apiError(400, 'This WhatsApp has no other way out to choose.')
+    if (raw !== 'direct' && raw !== 'z800') throw apiError(400, 'Expected {route: "direct" | "z800"}')
+    if (raw === route()) return status()
+    saveSettings({ route: raw })
+    log.info(`WhatsApp now goes out ${raw === 'z800' ? 'through the Z800' : 'directly'}`)
+    if (host.running()) await shut(`Closed: it now goes out ${raw === 'z800' ? 'through the Z800' : 'directly'}, and opens that way when it is next used.`)
+    if (raw === 'z800') await checkNow()
+    else tunnelSeen = null
+    changed()
+    return status()
+  }
+
+  // Order o55b6: while Chrome runs through the tunnel, the tunnel is checked again every everyMs (30 s). Gone, moved (another port), or held by
+  // another PID: WhatsApp is closed and says why, never left to fall back. While it is closed, the status the page reads is refreshed at the
+  // same pace, so the page shows the tunnel as it is before he opens.
+  const tunnelTimer = o.tunnel
+    ? setInterval(() => {
+        if (route() !== 'z800') return
+        const running = host.running() && proxyInUse !== null
+        if (!running && now() - tunnelAt < (o.tunnel!.everyMs ?? 30_000)) return
+        void checkNow().then(t => {
+          if (!running || !host.running() || proxyInUse === null) return changed()
+          if (!t.ok || t.proxy !== proxyInUse) {
+            const why = t.ok ? `the tunnel moved (now ${t.proxy}, Chrome was started with ${proxyInUse})` : t.why
+            log.warn(`WhatsApp closed: the way through the Z800 changed: ${why}`)
+            void shut(`Closed: WhatsApp goes out through the Z800 here, and that way stopped: ${why}. It does not go out directly instead.`)
+          } else changed()
+        })
+      }, Math.min(o.tunnel.everyMs ?? 30_000, 30_000))
+    : null
+  tunnelTimer?.unref?.()
+  if (o.tunnel) void checkNow().then(() => changed())
+
   // A crash may have left the last run's Chrome holding the login: end exactly that. Then, if it stays on, open it.
   void host.sweep().then(() => {
     if (settings.alwaysOn && linked() && isReady()) open().catch(e => log.warn(`WhatsApp did not open at start: ${message(e)}`))
@@ -462,6 +548,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     status,
     async close() {
       clearIdle()
+      if (tunnelTimer) clearInterval(tunnelTimer)
       await host.quit()
     },
   }

@@ -10,8 +10,25 @@ export const WA_PREFIX = '/whatsapp'
  * WhatsApp backend on this Server (agent/whatsapp-backend/), adding the backend's token on the server side: the page never sees it.
  */
 export const WA_BACKEND_PREFIX = '/whatsapp-backend'
-/** The WhatsApp backend's port on 127.0.0.1: 50000 or higher, never the agent's own 21221. */
-export const WA_BACKEND_PORT = 50070
+/**
+ * The WhatsApp backend's ports on 127.0.0.1 (order of5a0, 16 Nov 2026; it was the single port 50070, inside the tests' range, until then):
+ * 65000 to 65099, where the floor puts new long-lived app services (agent/SPEC.md, "Ports for tests and for the app's own services"). Still his
+ * "50000 or higher" (o8d7e), and never the agent's own 21221.
+ *
+ * THIS BAND IS SHARED, ON PURPOSE, AND NO PORT IN IT IS EVER THE BACKEND'S OWN. Two things can hold any one of these ports at any moment:
+ * - Windows: this Server's ephemeral range is 49152-65535, which CONTAINS 65000-65099, so an outgoing connection (or one in TIME_WAIT) can sit on it;
+ * - Stable ports: its Change can move a PC's block anywhere up to 65535, into this band too.
+ * Being above the tests' range keeps only the tests away. What protects the backend is the FIRST FREE port of the hundred, taken at each start,
+ * and the port it got written down (its ready word to the hub, and a `port` file beside its token) and read fresh by whoever calls it. Pinning a
+ * literal port here, however tidy it looks in review, reintroduces exactly the failure this avoids.
+ */
+export const WA_BACKEND_PORTS = { from: 65000, to: 65099 } as const
+
+/**
+ * Why the agent's proxy could not reach the WhatsApp backend (the `code` of its 503), so the page says what is true: starting (or starting again
+ * after a failure), stopped (after too many failures, with the reason), off (not running on this PC), unreachable (it did not answer), or no token.
+ */
+export type WaBackendCode = 'wa-backend-starting' | 'wa-backend-stopped' | 'wa-backend-off' | 'wa-backend-unreachable' | 'wa-backend-no-token'
 
 /** How long WhatsApp stays open after its last use, unless it is set to stay on. */
 export const WA_IDLE_MS = 10 * 60_000
@@ -66,6 +83,41 @@ export interface WaStatus {
   drafts: WaDraft[]
   /** How many of the Assistant's drafts were sent in the last hour (at most WA_ASSISTANT_SENDS_PER_HOUR). */
   assistantSentLastHour: number
+  /**
+   * Order o55b6: where WhatsApp's Chrome goes out, where it can go another way (the WhatsApp backend): through the Z800's SSH tunnel (his choice, the
+   * default there) or directly (the old way, kept as a setting). Absent where there is no other way.
+   */
+  route?: WaRoute
+  /** Order o55b6: the tunnel as last checked (its note, its listener's PID, a SOCKS5 greeting), while the route is 'z800'; null: not checked yet. */
+  tunnel?: WaTunnelSeen | null
+  /** Order of5a0 (A2): which login the overlay Assistant's WhatsApp tools use (added by the agent's proxy, on the Server). */
+  assistantTools?: WaAssistantTools
+}
+
+/**
+ * Order of5a0 (A2): the WhatsApp login the overlay Assistant's four tools use. 'in-app': F-079's own (where it starts, and the old way);
+ * 'backend': the one linked on the WhatsApp page (F-223). It moves to 'backend' on its own only once that one is linked AND answering.
+ */
+export type WaAssistantLogin = 'in-app' | 'backend'
+
+export interface WaAssistantTools {
+  use: WaAssistantLogin
+  /** Since when (ISO); null: as it started. */
+  since: string | null
+  /** 'auto': moved when the page's WhatsApp was linked and answered; 'owner': his choice; null: as it started. */
+  by: 'auto' | 'owner' | null
+}
+
+/** Order o55b6: 'z800' through the Z800's SSH SOCKS tunnel (around the office firewall), 'direct' straight out (the old way). */
+export type WaRoute = 'direct' | 'z800'
+
+export interface WaTunnelSeen {
+  up: boolean
+  /** Why it is not used, in plain words (up: null). */
+  why: string | null
+  /** Through which PC (from the tunnel's note), when up. */
+  via: string | null
+  at: string
 }
 
 export interface WaChat {

@@ -1,4 +1,5 @@
 import { pageFeature } from './access.ts'
+import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
 import type { AuthPerson, ChatAccess, ChatCan, ChatOwner } from './auth.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 
@@ -101,7 +102,9 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
 // Order o5007: the old-app reader (OLD_ROUTE) is the owner's too: its socket and its setting answer everyone else 403.
 // Order o5dc6: the Phone app page (the APKs to download) is the owner's: its routes want the owner signed in.
 // Orders o2aac / o6056: Paperclip and Schedules are the owner's too ("like the other pages"); empty for now, what they grow into works on this PC.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+// Order obb81: the Agents page (every agent's brief, notes, memory files and replies) is the owner's for now. Placed before '/phone-app': other pages'
+// wiring tests pin the tail of this list ('/phone-app', OLD_ROUTE ... and OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE at the end).
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', AGENT_DIRECTORY_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

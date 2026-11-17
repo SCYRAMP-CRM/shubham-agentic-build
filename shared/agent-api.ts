@@ -498,6 +498,12 @@ export interface PortsState {
    * both answer the new PortsState.
    */
   stable?: StablePortsState
+  /**
+   * Lead's gate-effect detector (16 Nov 2026): the ports the OLD phone gate (christopher-remote's proxy on 127.0.0.1:4741) shares on Tailscale beyond
+   * Christopher's own 80, 443 and 4740, read from `tailscale serve` (at most a minute old). A DETECTOR, NOT A GUARD: it makes that failure visible, it
+   * does not stop it. Null when there is none; absent from an older agent.
+   */
+  oldGate?: { extra: number[]; text: string } | null
 }
 
 /** POST /ports/settings: any of the three; answers the new PortsState. 400 for a bad port, mode or tlsBy. A blocked port in `chosen` is 409 (the text says why). */

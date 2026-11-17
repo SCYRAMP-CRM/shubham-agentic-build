@@ -2,16 +2,21 @@
 // A floor header is also a button that folds the floor. A touch held a little over 300 ms (a slow or firm tap, common on a phone) used to start a drag and swallow the
 // click that followed, so the floor did not fold. Now a header held and let go WITHOUT moving is a tap: it folds. A chat row held without moving is still the long press
 // (Switch computer, F-064); anything that moved is a drop.
+// Order o66aa: a floor header held still for FLOOR_LONG_PRESS_MS or more is ITS long press (its menu, where "Decisions go to…" is), when one is wanted; shorter
+// is still the tap above, so a slow tap keeps folding the floor.
 
 export type Release =
   /** The press was cancelled (Escape, a cancelled touch): nothing happens, the item goes back. */
   | 'cancel'
   /** A floor header held in place: the tap it was meant to be (the click that follows is let through, and folds the floor). */
   | 'tap'
-  /** A chat row held in place: the long press. */
+  /** A chat row held in place, or a floor header held in place long enough (o66aa): the long press. */
   | 'long-press'
   /** Moved: it lands where the line was. */
   | 'drop'
+
+/** o66aa: how long a floor header is held still before letting go counts as its long press (a slow tap is shorter: F-120). */
+export const FLOOR_LONG_PRESS_MS = 600
 
 export interface ReleaseInput {
   /** The pointer went up (true) or the press was cancelled (false). */
@@ -22,14 +27,16 @@ export interface ReleaseInput {
   /** How far the pointer went from where it went down (px) and how far counts as staying put. */
   moved: number
   slop: number
-  /** A long press on a chat is wanted (F-064). */
+  /** A long press is wanted: on a chat (F-064), on a floor header (o66aa). */
   hasLongPress: boolean
+  /** o66aa: how long it was held before letting go (ms). Left out: 0, so a floor header is the tap. */
+  heldMs?: number
 }
 
 export function releaseOutcome(i: ReleaseInput): Release {
   if (!i.commit) return 'cancel'
   const still = i.mode === 'body' && i.moved <= i.slop
-  if (still && i.kind === 'floor') return 'tap'
+  if (still && i.kind === 'floor') return i.hasLongPress && (i.heldMs ?? 0) >= FLOOR_LONG_PRESS_MS ? 'long-press' : 'tap'
   if (still && i.kind === 'agent' && i.hasLongPress) return 'long-press'
   return 'drop'
 }

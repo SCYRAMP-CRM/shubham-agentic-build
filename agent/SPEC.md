@@ -129,6 +129,18 @@ shared/agent-api.ts       API types (already written: the contract with the UI)
   (also `prefix`, `broadcast`, `adapter`; the main one first), `primaryLan()`,
   `inLocalSubnet(ip)` and `isPrivate(ip)` (RFC 1918, plus IPv6 unique-local).
 
+## Ports for tests and for the app's own services (order of5a0, 16 Nov 2026; Lead's rule)
+
+The floor's rule, as Lead set it:
+
+> Test servers take 127.0.0.1, 50000-64999. New long-lived app services take 65000 and up. Stable ports is a known pre-existing exception — its default blocks are 51011-51999, inside the test band; it is off by default and never on in test mode. NO service may assume its band is exclusive, because Stable ports' Change can move a block anywhere up to 65535.
+
+- Why 65000 and up is still not anyone's own: this Server's Windows ephemeral range is 49152-65535 (`netsh int ipv4 show dynamicport tcp`), which
+  contains every port above 50000, so an outgoing connection (or one in TIME_WAIT) can hold any of them at any moment; and Stable ports' Change can
+  put a block there. A service in this band therefore takes the first free port of a range at each start and writes down the one it got (the
+  WhatsApp backend: 65000-65099, see "F-223"); pinning one literal port brings the collision back.
+- Reserving a port through Windows (`netsh int ipv4 add excludedportrange`, administrator) does not help: it refuses our own bind too (WSAEACCES).
+
 ## Identity (link/identity.ts)
 
 - Ed25519 keypair via `crypto.generateKeyPairSync('ed25519')`. It is never silently
@@ -1325,6 +1337,9 @@ CRM goals, hooks, Skills and MCP are the later phases (features.html › F-018).
   `POST /agentic/floors/reorder`, `PATCH/DELETE /agentic/floors/:id` (a `codeDir` must be an
   existing absolute folder), `POST /agentic/floors/:id/agents`, `POST
   .../agents/:aid/chat | terminate | session`, `GET .../agents/:aid/messages`, `GET
+  .../agents/:aid/brain` (order obb81, the Agents page; the owner's only, read where the conversation is: the notes it saved on its
+  floor, the memory files of its Claude project folder (its own and MEMORY.md with their text, the others by name), its last five
+  replies; secrets masked; `agent-brain.ts`), `GET
   .../transcripts`, `GET/POST /agentic/floors/:id/memory`, `PATCH/DELETE .../memory/:nid`; the
   WebSockets `/agentic/events` (`floors`, `live`, `memory` events) and `/agentic/terminal?session=`
   (text frames: `{t:'in',d}` / `{t:'size',cols,rows}` in, `{t:'out',d}` / `{t:'exit',code}` out).
@@ -2423,6 +2438,63 @@ Shubham's own WhatsApp, linked once to the hub as a device (WhatsApp › Linked 
 
 Tests: `whatsapp/engine.test.ts` (24: the mapping, linking with and without `ready`, retries, recycling, stop, late events, logout, LOGOUT, paging, pairing codes), `host.test.ts` (9: the real worker on `client.fake.ts`: open, link, read, send, quit; one worker however many ask; an early question; a dying worker's Chrome ended by its PID; the crash sweep; the environment), `drafts.test.ts` (7), `index.test.ts` (18: through the API mount with the real worker: setup, linking, the pairing code, the Assistant refused before linking, reads, drafts, signatures, the burst limit, idle close, a page keeping it open, stay open, unlink, a log that names nobody), `setup.test.ts` (3), and agentic `index.test.ts` (the tool list).
 
+## F-223: WhatsApp's backend on this Server (whatsapp-backend/; orders ofb3a, o8d7e, o8416; kept running by the hub since of5a0, 16 Nov 2026)
+
+The WhatsApp page's WhatsApp: its own process on the Server (`whatsapp-backend/run.ts`, the F-079 manager inside it with its state in
+`<state>\whatsapp-backend\whatsapp`), reached only through the agent's proxy (`/agent-api/whatsapp-backend/`, owner only), which adds the
+backend's token on the server side: the page never sees it.
+
+- **Where it listens.** 127.0.0.1 only, on the FIRST FREE port of 65000-65099 (`shared/whatsapp.ts` `WA_BACKEND_PORTS`; the band is shared on
+  purpose, see "Ports for tests and for the app's own services"). The port it got is said in its ready word to the hub and written to
+  `<state>\whatsapp-backend\port` (removed when it closes). `WA_BACKEND_PORT` (one port) or `WA_BACKEND_PORTS` ("from-to") override it. Each try's
+  listeners are removed when the try ends and the port is read back from the socket (the pc-ssh fixture's bug, 8dd84be).
+- **Its door.** The token (`<dir>\token`, made on first start, compared in constant time) on every request, a Host of 127.0.0.1 or localhost,
+  no Origin. Sends are refused (o8416: "not yet"); opening them waits for his word.
+- **One per folder.** `<dir>\backend.lock` names the process running it; another start for the same folder refuses (exit 4, "another WhatsApp
+  backend is already running for this folder (pid N, since T)") while that process is node and started within a minute of the lock; a lock whose
+  PID is gone, or now runs another program, is taken over. Two would drive one WhatsApp login from two Chromes.
+- **Kept running by the hub** (`whatsapp-backend/supervisor.ts`, made in `main.ts` on the hub with the Agents section, as F-079; never in test
+  mode, nor with `SAD_WA_BACKEND=off`): started with the agent, as a child that is NOT detached (it sits in the agent's kill-on-exit job, so it
+  can't outlive the agent; if the agent dies first, its channel closes and it closes WhatsApp properly itself).
+  - Only its own ready word (with its port) makes it `running`; it must come within 60 s.
+  - A failure (it ended, did not say ready in time, could not be started) is an error line in the hub's log with its reason (the backend's last
+    words, or its `failed` word) and is kept in the state. It is started again after 2, 5, 15, 30, 60 s; after 5 failures within 5 minutes it is
+    STOPPED, with why, and not started again until the app restarts. It never spins.
+  - Stopping: asked first (`{t:'quit'}`: WhatsApp closed properly, the login kept), then past 25 s its own process is ended (`child.kill()`:
+    that one PID). Never by name, port or tree. The worker and Chrome it started end with it as F-079's do (`running.json`, exact PIDs).
+  - Exit codes: 0 asked to stop, 3 no free port in the band, 4 another backend for this folder, 1 anything else.
+- **The proxy** (`whatsapp-backend/proxy.ts`) calls the port of the RUNNING backend (the supervisor's state), never the port file, which may be
+  stale (another program may hold that port by now, and the token would go to it). Not running: 503 with a code the page reads
+  (`WaBackendCode`) and words that say what is true: starting (or starting again after a failure, and which), stopped (and why), off (and why:
+  not the Server, switched off, test mode), no answer, no token. Only the page's routes are passed on.
+- **The page** (`src/whatsapp/status-truth.ts`, `store.ts`, `WhatsApp.tsx`): a status is shown only while the backend answers it. The main PC
+  answering without one (a 503 above, a refusal) drops the last status and shows the reason in its place; nothing ready-looking stays. Only the
+  page's own connection dropping (status 0) keeps the last status, marked "reconnecting to the main PC…".
+- **The way out (order o55b6, 17 Nov 2026; his yes to option 3, "Yes ok do however please").** The office FortiGate re-signs web.whatsapp.com
+  for this Server, so its Chrome can go out through the Z800 (whose own route was checked clean, read-only: the real DigiCert chain). Agent 6
+  OWNS the tunnel (the Server's key, `ssh -N -D` to the Z800, supervised, the first free port of 65100-65199) and notes it in
+  `<state>\whatsapp-backend\tunnel.json`: `{socks: "socks5://127.0.0.1:<port>", pid: <the ssh that listens there>, since, via}`, or
+  `{up: false, why}`. This app never touches the key.
+  - The setting (`settings.json` `route`, the page's "Goes out" choice, shown before linking too): `z800` (the default where there is a tunnel
+    to choose) or `direct` (the old way, kept). Written only once chosen. Changing it closes a WhatsApp open the other way, saying so.
+  - Through the Z800, Chrome starts only with a tunnel checked just then (`agent/whatsapp/tunnel.ts`): the note names a socks5 address on
+    127.0.0.1 (50000+) and its listener's PID; Windows' own netstat (System32, by full path) shows that PID owns EVERY listener a connection to
+    127.0.0.1:<port> can reach (127.0.0.1, 0.0.0.0, [::]); a SOCKS5 greeting answers. A port held by another PID is refused, whatever it
+    answers. Any failure: WhatsApp does not open, and says which; it never goes out directly instead.
+  - The address goes to the worker with its `start` (never an environment variable), and only into Chrome's `--proxy-server`. Nothing else in
+    the app (the agent's own requests, any other process it starts) is given it.
+  - While Chrome runs through it, the tunnel is checked again every 30 s: gone, moved, or held by another PID, WhatsApp is closed, saying why.
+    The page's line under the choice says the tunnel as last checked.
+  - Its limits: the Z800 must be on, and the tunnel rides the Z800's Wi-Fi. The loopback port is usable by anything on this Server, which is
+    why the checks above are done and nothing but WhatsApp's Chrome is given it.
+- **Two logins today.** The overlay Assistant's WhatsApp tools (`wa_status`, `wa_chats`, `wa_read`, `wa_prepare_send`) still use F-079's
+  in-agent WhatsApp (`<state>\whatsapp`); the page uses this backend (`<state>\whatsapp-backend\whatsapp`). A QR scanned on the page links the
+  backend only. Moving the tools onto the backend is its own change, armed only once the backend is linked and answering.
+- Tests: `whatsapp-backend/server.test.ts` (the token, Host, Origin, sends refused, the first free port of a band, the port file, the lock),
+  `proxy.test.ts` (the routes, the token never in an answer, each 503 and its code), `supervisor.test.ts` (stand-in backends: ready, a crash and
+  the start again, never ready, 5 failures and stopped, a stop that is not obeyed, a stop during the wait; and the real `run.ts`: its port band,
+  the proxy through it, a clean stop, and a second one for the same folder refused), `src/whatsapp/status-truth.test.mjs`.
+
 ## F-085: the PC's side of Chris's Update button
 
 (mobile/docs/HUB-PROTOCOL.md §12, §12.1 H1.) Files: `agent/agentic/app-update.ts` (+ test), routes and the event in `voice.ts`, the tool in
@@ -2803,6 +2875,18 @@ Every PC's own agent can share some or all of the ports its programs listen on, 
 - **What is never shared** (block.ts), by Share all and one by one: `app` (decided by process: the agent, everything below it, the guard above it, the chat host, RustDesk and any copy of the app by its command line; the port numbers 21215-21229 etc. only for a process that cannot be identified), `tailscale`, `low` (< 1024), `windows`, `reserved` (80, 443, 4740, 4741, 4742, 8443, 8444), `debugger` (a browser/driver/Docker by name, `--inspect`/`--remote-debugging-port`/jdwp/debugpy in the command line, well-known ports 2375/2376/9222/9223/9229/9515/4444/4723/2828/5005/5678/5858/5900-5909, or an answer to GET /json/version, /json/list, /_ping, /status that looks like a debugger or WebDriver), `other-entry` (Tailscale already serves the port for the phone gate, the Drive or by hand), `not-reachable`. Only the app's page port (SAD_UI_PORT, 5173) is allowed (`appPage`).
 - **Share all** = the dev-server programs (`ALL_PROGRAMS`: node, python, uvicorn, gunicorn, java, php ... matched without .exe and version, so Linux names match), ports 1024-49151, minus every block. A new port is shared only after two scans and a probe (a debugger that opens its port first cannot slip in); shared ports are probed again every 5 minutes.
 - **Only its own entries**: the agent changes only the `serve` entries it made (kept in `<state>/agent/ports/state.json`); an entry that points elsewhere (80, 443, 4740, the phone gate's, the Drive's) is never touched and shows read-only (`sharedBy: gate|other`). Never `serve reset`, never Funnel. After a restart its own entries are found again and repaired to the new gate port.
+- **The 49151 cap is load-bearing** (written down 16 Nov 2026, Lead).
+  - Share all never takes a port above 49151 (`SHARE_MAX`). Below it, on a Share-all PC, binding to 127.0.0.1 protects nothing: the gate proxies to loopback, so a dev program's listener is on the tailnet within about two scans.
+  - So test and scratch servers listen on 127.0.0.1 at 50000 or above (the floor's rule), and the Z800's desktop sits on 127.0.0.1:50080 behind its own https door.
+  - The cap is held by `index.test.ts` test 3 ("share all"): 50000, from the same python program as 8765, is left out by the cap alone. Raising the cap re-opens a second door to that desktop.
+- **The old phone gate, watched** (Lead's gate-effect detector, 16 Nov 2026).
+  - The old way's gate (christopher-remote's proxy.mjs on 127.0.0.1:4741, not this app's code) should serve only Christopher's own 80, 443 and 4740 (`CHRISTOPHER_PORTS`). If its `ports.json` is unreadable or lacks "programs", it falls back to sharing every dev port: a latent fail-open.
+  - Ports does not read that file (the cause). It reads the EFFECT, in what Tailscale actually serves: any entry pointing at the old gate on another port. `PortsState.oldGate = { extra, text }`.
+  - Settings › Ports shows it as an alert, the log gets one line on each change (and one when it is back to Christopher's own), and `alarms()` gives the heartbeat one line for the Assistant, told once per key.
+  - It is VISIBLE within about a minute: `tailscale serve` is read again every `SERVE_RECHECK_MS` (60 s), or at once when a listening port changes.
+  - It does NOT prevent anything, and never touches the old gate's entries. **This is a detector, not a guard.**
+  - Never accept an exposure "because Ports will catch it". It tells only after the port is already shared, only within about a minute, and only to someone looking at Settings › Ports or hearing the heartbeat.
+  - Making the old gate fail closed (`?? []` in proxy.mjs) waits for Shubham's word.
 - **Links never lie**: `PortShare.ipUrl` is http only where nobody does TLS in front of the gate; where Tailscale does the TLS (the phone gate's ports, other entries, `tlsBy: tailscale`) it is https with `ipUrlWarns`.
 - **The Server button**: the hub puts `ports` (`PortsHello`) in its hello and sends a `ports` message when it changes; a member keeps it (`PortsState.server`); an older hub sends none and the member shows only the saved tailnet name.
 - **Systems**: Windows' scanners are netstat and the process table. Linux's (F-116, `ports/scan-linux.ts`) read /proc and run nothing: listeners from `/proc/net/tcp` and `tcp6` (with each socket's uid and inode), the PID behind a socket through `/proc/<pid>/fd` of this account's own processes, and each process's name from its program file (`exe`; Node calls itself "MainThread" in comm). Any other system passes `net`/`procs` to `createPorts` or Ports says it has no scanner there yet. Tests (`ports/linux.test.ts`, on a pretend /proc): the real case makes `/proc/<pid>/fd` symlinks and so runs only where a test may make them (the Z800; the Windows runner skips it, EPERM). A second case runs the same fd walk and its `socket:[inode]` parsing everywhere through `linuxScanners`' optional `readlink` and `uid` (16 Nov, self-skip Stage 2, decision B); the product's one caller passes neither, and that case is not proof that real /proc links are read.
@@ -3023,6 +3107,33 @@ Resources (a phone's tab says "Deps"). READ ONLY: no install button; an install 
 - Tests: `shared/pc-deps.test.ts` (versions, the check), `pc-deps-read.test.ts` (the Server today; the Z800 with its broken npm and missing
   postgres; a system Node; Tailscale signed out; the DLL's version; the voices; the fix table covers every row), `pc-deps.test.ts` (kept a minute,
   fresh, a member, off, older build, liar, the route), `src/pc-control/deps-report.test.mjs`, `workspace-tabs.test.mjs`, `src/pages/phone-width.test.mjs`.
+
+## PC control's desktop tab, labelled "XFCE" (order o226e, 16 Nov 2026; the label is his word, order o6461; pc-desktop.ts, shared/pc-desktop.ts, src/pc-control/PcDesktopPanel.tsx)
+
+Shubham: "Now in the code next to screen hav3 xcfe please also the browser link i will see but i think there should be that also". The owner's tab right after Screen: a PC's own Linux desktop (XFCE through noVNC, order o851d on the Z800) inside the page, with "Open in a new tab" always beside it. Screen (RustDesk) is unchanged. These are Lead's and the Assistant's reading, not his words: its own tab, shown only where the desktop answers, and its own Settings › Access row `pc-desktop`, locked like Screen.
+
+- **The check** (`pc-desktop.ts`, read only):
+  - At most two bounded GETs of noVNC's page on that PC: https by its tailnet name on 6443 (tailscale serve there) first, then plain http by its tailnet address on 6080.
+  - Limits: 2.5 s each, redirects not followed, at most 64 KB read. The page must say "noVNC".
+  - The name and address are the ones that PC's own agent reports in its ports report (this PC's own, or a member's through `pcPorts.get`). So it never names another host: only `*.ts.net` names and 100.64/10 addresses.
+  - Kept a minute; `?fresh=1` looks again. No password, no write.
+- **Route** `GET /agent-api/pc-desktop/pcs/<id>[?fresh=1]`:
+  - Not a scoped mount, and no Access route opens it, so the owner only.
+  - Another PC's desktop comes only from the Server: a member answers 409 for any PC but itself. An id that is none of the Server's PCs is 404. Any other method or question is 400.
+- **The page** (`usePcDesktop`, `PcDesktopPanel`):
+  - It asks only for a viewer who may have the tab, and again every minute while the page is visible.
+  - Connect first, then the frame: sandbox `allow-scripts allow-same-origin allow-forms allow-pointer-lock`, permissions `clipboard-write; fullscreen`, no referrer. Both lists are constants in shared/pc-desktop.ts, pinned exactly by a test.
+  - No clipboard-read (Lead): it would let a page served by one PC read the clipboard of the PC you sit at. Paste goes through noVNC's own panel.
+  - Never the app's own origin (Lead's guard, `sameOriginAsPage`). allow-same-origin is safe only while the desktop is another origin, so a url on the page's own origin, or one that does not parse, is not framed, and the tab says why.
+  - An https page cannot frame a plain-http desktop. There the tab says so in one sentence and offers the link.
+  - The VNC password is typed into noVNC's own box each time: never stored, logged or put in a link. noVNC takes `?password=`, and the app never sets it.
+- **The Z800 today** (Agent 6, 16 Nov):
+  - https on its tailnet name, port 6443 (`tailscale serve --https=6443 http://127.0.0.1:50080`).
+  - websockify listens on 127.0.0.1:50080, above the Ports cap of 49151, so Share all never shares it a second time. The cap is held by `ports/index.test.ts` test 3.
+  - 6080 is gone there.
+- **Tests:**
+  - `pc-desktop.test.ts` (fake fetch): https first; the http fallback; not noVNC; only that PC's own name and address are asked; one look a minute and `?fresh=1`; the refusals, and a member answering only for itself.
+  - Also `src/pc-control/pc-desktop.test.mjs`, `workspace-tabs.test.mjs`, `workspace-layout.test.mjs`, `shared/access.test.ts` and `src/auth/access-wiring.test.mjs`.
 
 ## F-118: who is using the app (auth/, agentic/access.ts, shared/auth.ts)
 

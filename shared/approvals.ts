@@ -1,5 +1,6 @@
 import type { ChatMenu } from './chat.ts'
 import type { ChatState } from './agentic.ts'
+import type { ApprovalsScope, RoutedElsewhere } from './question-routing.ts'
 
 // F-076: answering a chat that waits at a prompt, and saying something as the person, from one place (the
 // overlay). Both are HUMAN-ONLY: the page's handlers need a real tap (isTrusted) and the controls carry
@@ -30,6 +31,8 @@ export interface ApprovalItem {
   answerable: boolean
   /** Its footer, drawn now, says "Esc to cancel": a Cancel (Esc) button can press Esc for him. On a permission prompt Esc means No. */
   cancellable?: boolean
+  /** o0c50 / o66aa: its floor's decisions go to these people ("Ravi Teja, Priya"; shared/question-routing.ts): shown to the owner looking at it. */
+  routedTo?: string
 }
 
 /** A card the assistant prepared: a target and the words proposed. Only the person's tap sends it. */
@@ -49,6 +52,12 @@ export interface PreparedCard {
 export interface ApprovalsAnswer {
   items: ApprovalItem[]
   prepared: PreparedCard[]
+  /** o0c50: the routed floors' questions still with someone else, counted (not listed) in this view. */
+  elsewhere?: RoutedElsewhere[]
+  /** o0c50: which prompts were listed (GET /approvals?scope=). */
+  scope?: ApprovalsScope
+  /** o66aa / o7e97: answers given (their keys typed) whose record could not be written, newest first: for the owner to see. */
+  unrecorded?: ApprovalLogEntry[]
 }
 
 /** POST /agentic/approvals/answer: the option `n` of the prompt `id` in that chat. */
@@ -133,4 +142,14 @@ export interface ApprovalLogEntry {
   detail: string
   /** Who asked: the app and the device it was opened on. */
   by: string
+  /**
+   * Orders o66aa / o7e97 (Lead: an approval must name the human who gave it, durably): on an answer or a cancel, the person's CRM id, whether
+   * they answered as the owner of the app or as one of the floor's decision-makers, the floor's id, the prompt's id and what they chose. Older
+   * rows have none of these.
+   */
+  personId?: string
+  role?: 'owner' | 'decision-maker'
+  floorId?: string
+  promptId?: string
+  choice?: string
 }

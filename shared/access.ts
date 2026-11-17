@@ -12,6 +12,7 @@
  * - A feature that runs as him (his CRM sign-in, his passwords, his WhatsApp, his browser, his PCs' screens and updates) is `locked`: it stays his.
  */
 
+import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 
 export type AccessMode = 'owner' | 'people' | 'everyone'
@@ -62,6 +63,9 @@ export const FEATURES: readonly Feature[] = [
   { key: 'features', group: 'pages', label: 'Features', blurb: 'What is asked for and what is built (to read; ticking stays yours).', pages: ['/features'] },
   { key: 'themes', group: 'pages', label: 'Themes', blurb: 'The six looks, light and dark.', pages: ['/themes'] },
   { key: 'agents', group: 'pages', label: 'Agentic Platform', blurb: 'Their floors and the agents shared with them, and making their own. What you shared stays open to them anyway.', pages: ['/agents', '/chats'] },
+  // Order obb81 (goal "Agents tab", step 1): every agent's definition, notes, memory files and last replies. Starts as Only me like every row; its
+  // look at an agent's memory and replies (the brain route) stays the owner's even when the page is opened to someone (it is in no rule below).
+  { key: 'agent-directory', group: 'pages', label: 'Agents', blurb: 'Every agent: what it does, edited here; its notes, memory files and last replies stay yours.', pages: [AGENT_DIRECTORY_ROUTE] },
   { key: 'old-reader', group: 'pages', label: 'Live talking', blurb: 'Questions about the old app, answered in seconds (both Live talking pages).', pages: [OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE] },
   { key: 'pc-control', group: 'pages', label: 'PC control', blurb: 'The PCs and their tabs (each tab below is chosen on its own).', pages: ['/pc-control'] },
   { key: 'browser', group: 'pages', label: 'Browser', blurb: 'A browser on the Server.', pages: ['/browser'], locked: 'It is your browser on the Server, with your sign-ins.' },
@@ -82,6 +86,8 @@ export const FEATURES: readonly Feature[] = [
   // PC control's tabs (order odbd8's list of tabs; the page itself is above).
   { key: 'pc-chats', group: 'pc-control', label: 'Chat 1 and Chat 2', blurb: 'Each PC’s two pinned chats (a chat restricted to someone stays so).', needs: 'pc-control' },
   { key: 'pc-screen', group: 'pc-control', label: 'Screen', blurb: 'Controlling a PC’s screen.', needs: 'pc-control', locked: 'It controls your PCs’ screens and keyboards.' },
+  // Order o226e: a PC's own Linux desktop (noVNC), its own row, locked like Screen.
+  { key: 'pc-desktop', group: 'pc-control', label: 'XFCE', blurb: 'A Linux PC’s own desktop (XFCE through noVNC), where it has one.', needs: 'pc-control', locked: 'It controls your PCs’ desktops and keyboards.' },
   { key: 'pc-updates', group: 'pc-control', label: 'Updates', blurb: 'Updating each PC.', needs: 'pc-control', locked: 'It updates and restarts your PCs.' },
   { key: 'pc-ports', group: 'pc-control', label: 'Ports', blurb: 'Each PC’s ports and Tailscale addresses, read only.', needs: 'pc-control' },
   // Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): chosen per PC.
@@ -140,7 +146,7 @@ export function pageFeature(pathname: string): Feature | null {
 }
 
 /** PC control's tabs and the feature each needs. */
-export const PC_TAB_FEATURE: Readonly<Record<string, string>> = { chat1: 'pc-chats', chat2: 'pc-chats', screen: 'pc-screen', updates: 'pc-updates', ports: 'pc-ports', ssh: 'pc-ssh', resources: 'pc-resources', deps: 'pc-deps' }
+export const PC_TAB_FEATURE: Readonly<Record<string, string>> = { chat1: 'pc-chats', chat2: 'pc-chats', screen: 'pc-screen', desktop: 'pc-desktop', updates: 'pc-updates', ports: 'pc-ports', ssh: 'pc-ssh', resources: 'pc-resources', deps: 'pc-deps' }
 
 // ---- the agent's routes (the path after /agent-api) and their features
 
@@ -175,6 +181,11 @@ export const ROUTES: readonly RouteRule[] = [
   r('GET', `${AGENT}\\/(messages|chat|draft|deliveries|deliveries\\/[^/]+|attachment\\/[^/]+)`, ['agents'], true),
   r('GET', `${A}\\/(offline-chats|codex\\/status|opencode\\/status|codex\\/settings|sync-mode|defaults|engine-switch-capabilities|previews|runs)`, ['agents', 'pc-control'], true),
   // o7e6d (refinement2 line 56): approvals and Send as me are the owner's only: no feature and no share opens them (the policy is OWNER in agent/agentic/access.ts).
+  // Orders o66aa / oa76b / o7e97: except a floor's waiting prompts for the people he chose to decide for it, who are always people the floor is
+  // shared with: so a share (no feature) lets the list and an answer or a cancel past this gate, and the routes decide (decides(): that chat's
+  // floor, now). Send as me stays closed to everyone but him.
+  r('GET', `${A}\\/approvals`, [], true),
+  r('POST', `${A}\\/approvals\\/(answer|cancel)`, [], true),
   r('WS', `${A}\\/(terminal|chat)`, ['agents', 'pc-chats'], true),
   r('WS', `${A}\\/events`, ['agents', 'pc-control'], true),
   // The Assistant's hands on this person's own pages (order o355e made the bridge per person: their pages join only their own scope).

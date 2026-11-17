@@ -27,14 +27,21 @@ interface QrCode {
   toDataURL(text: string, o?: unknown): Promise<string>
 }
 
+// Order o55b6: where Chrome goes out, told by the hub with each start (never in the environment, so nothing else in this process or any other
+// picks it up): null, directly; else the SOCKS5 address of the tunnel the hub has just checked (agent/whatsapp/tunnel.ts). Every launch and
+// relaunch of that start uses it. There is no fallback: with the tunnel gone, Chrome fails to load, and that failure is what is shown.
+let proxy: string | null = null
+const PROXY = /^socks5:\/\/127\.0\.0\.1:\d{5}$/
+const chromeArgs = () => (proxy ? [...CHROME_ARGS, `--proxy-server=${proxy}`] : [...CHROME_ARGS])
+
 async function makeEngine(): Promise<WaEngine> {
   const env = process.env
   const auth = env.SAD_WA_AUTH
   if (!auth) throw new Error('SAD_WA_AUTH is not set')
   const profileDir = path.join(auth, `session-${LOGIN_ID}`)
   if (env.SAD_WA_FAKE) {
-    const fake = (await import(pathToFileURL(env.SAD_WA_FAKE).href)) as { createClient(): WaClient }
-    return new WaEngine({ createClient: () => fake.createClient(), qrImage: async t => `data:image/png;base64,${Buffer.from(t).toString('base64')}`, profileDir, log: say, pollMs: 20, pollTries: 5, retryMs: 10 })
+    const fake = (await import(pathToFileURL(env.SAD_WA_FAKE).href)) as { createClient(o?: { puppeteer: { args: string[] } }): WaClient }
+    return new WaEngine({ createClient: () => fake.createClient({ puppeteer: { args: chromeArgs() } }), qrImage: async t => `data:image/png;base64,${Buffer.from(t).toString('base64')}`, profileDir, log: say, pollMs: 20, pollTries: 5, retryMs: 10 })
   }
   const lib = env.SAD_WA_LIB
   const chrome = env.SAD_WA_CHROME
@@ -47,7 +54,7 @@ async function makeEngine(): Promise<WaEngine> {
     createClient: () =>
       new wweb.Client({
         authStrategy: new wweb.LocalAuth({ clientId: LOGIN_ID, dataPath: auth }),
-        puppeteer: { headless: env.SAD_WA_SHOW !== '1', executablePath: chrome, args: CHROME_ARGS },
+        puppeteer: { headless: env.SAD_WA_SHOW !== '1', executablePath: chrome, args: chromeArgs() },
         // Never pinned, nothing cached on disk: always the build WhatsApp serves now (it unlinks old ones).
         webVersionCache: { type: 'none' },
         deviceName: DEVICE_NAME,
@@ -101,9 +108,13 @@ async function main() {
     const a = r.args ?? {}
     const s = (k: string) => (typeof a[k] === 'string' ? (a[k] as string) : '')
     switch (r.op) {
-      case 'start':
+      case 'start': {
+        const p = a.proxy === undefined || a.proxy === null ? null : typeof a.proxy === 'string' && PROXY.test(a.proxy) ? a.proxy : undefined
+        if (p === undefined) throw new Error('that is not a way out this worker takes')
+        proxy = p
         engine.start()
         return engine.status()
+      }
       case 'status':
         return engine.status()
       case 'chats':

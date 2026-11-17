@@ -4,6 +4,7 @@ import { createSshTerm } from './pc-ssh-term.ts'
 import { createSshStatus, PC_SSH_STREAM } from './pc-ssh.ts'
 import { readSsh, realSshDeps } from './pc-ssh-read.ts'
 import { createPcDeps, PC_DEPS_STREAM } from './pc-deps.ts'
+import { createPcDesktop } from './pc-desktop.ts'
 import { readDeps } from './pc-deps-read.ts'
 import { findClaude, loadNodePty } from './agentic/chats.ts'
 import { BRIDGE_REQUIREMENTS } from './codex-claude/requirements.ts'
@@ -70,6 +71,8 @@ import { createTts, type Tts } from './speech/tts.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { createWhatsAppBackendProxy } from './whatsapp-backend/proxy.ts'
+import { createBackendSupervisor, type BackendView } from './whatsapp-backend/supervisor.ts'
+import { createAssistantTools, type AssistantTools } from './whatsapp-backend/assistant-tools.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts, DEFAULT_GATE_PORT } from './ports/index.ts'
 import { scannersFor } from './ports/scan.ts'
@@ -319,6 +322,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       : null
   // F-079: Shubham's WhatsApp (made below, once the Agents section is: its sends are signed by his approval device).
   let whatsapp: WhatsApp | null = null
+  // Order of5a0 (A2): which login the Assistant's WhatsApp tools use (made below with the backend).
+  let waAssistant: AssistantTools | null = null
   // F-097's Common Drive was removed on Shubham's order (10 Nov 2026): nothing starts it, and its folder and settings stay on disk untouched.
   // F-126 (Linux): the CRM files in GNOME Files, through a WebDAV listener of this agent's own user that gvfs mounts. Windows keeps its WinFsp drive (left out here).
   let crmFilesService: CrmFilesService | null = null
@@ -358,6 +363,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     log: log.child('agentic'),
     chatHost,
     newerBuild: () => extras.newerBuild?.() ?? null,
+    // Lead's gate-effect detector: the old phone gate sharing more than Christopher's ports is TOLD (one heartbeat line), not only shown.
+    alarms: () => portsMod.alarms(),
     currentBuild: () => extras.currentBuild?.() ?? null,
     updateRun: () => extras.updateCoordinator?.current?.status() ?? null,
     onAutoUpdateChanged: () => extras.updateCoordinator?.current?.nudge(),
@@ -366,7 +373,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     // F-058: under the guard, the chats that were open when the app last stopped come back.
     // With the chat host, the list is also what brings the chats back when the host itself changes with an update.
     resumeChats: process.env.SAD_RESUME_CHATS === '1' || !!chatHost,
-    whatsapp: () => whatsapp?.tools ?? null,
+    whatsapp: () => waAssistant ?? whatsapp?.tools ?? null,
     token: () => {
       try {
         return userEnv?.get(TOKEN_VAR) || null
@@ -417,6 +424,16 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
   // F-079: on the hub only, and only with the Agents section. It runs only while it is used (agent/whatsapp/).
   if (role === 'hub' && agentic) whatsapp = createWhatsApp({ dir: path.join(paths.root, 'whatsapp'), log: log.child('whatsapp'), human: (kind, fields, sig, r) => agentic.humanProof(kind, fields, sig, r) })
+  // Order of5a0: the WhatsApp page's backend (F-223, whatsapp-backend/), started and kept running by the hub, with bounded restarts and every failure
+  // said (whatsapp-backend/supervisor.ts). On the hub only, as F-079; never in test mode, nor with SAD_WA_BACKEND=off (then the page says so).
+  const waBackendDir = process.env.WA_BACKEND_DIR || path.join(paths.root, 'whatsapp-backend')
+  const waBackendOff = process.env.SAD_WA_BACKEND === 'off' ? 'it is switched off on this Server (SAD_WA_BACKEND=off)' : testNoRustdesk ? 'it does not run in test mode' : null
+  const waBackend = role === 'hub' && agentic && !waBackendOff ? createBackendSupervisor({ dir: waBackendDir, log: log.child('wa-backend') }) : null
+  waBackend?.start()
+  const waBackendOffView: BackendView | null = role === 'hub' && agentic && waBackendOff ? { state: 'off', since: new Date().toISOString(), port: null, pid: null, why: waBackendOff, failures: [] } : null
+  // Order of5a0 (A2): F-079's login until the page's WhatsApp is linked and answering; then that one (whatsapp-backend/assistant-tools.ts). The
+  // page's WhatsApp has never been linked, so until he links it this changes nothing.
+  if (role === 'hub' && agentic && whatsapp) waAssistant = createAssistantTools({ inApp: whatsapp.tools, dir: waBackendDir, backend: () => waBackend?.view() ?? waBackendOffView, log: log.child('wa-assistant') })
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
   // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this
@@ -508,6 +525,21 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       return pc ? stableFallbackRows(pc.ports, pc.status, serverLink, name) : []
     },
     serverLinks: (rows: PcPortRow[]) => rows.map(r => (r.group === 'stable' ? { ...r, serverUrl: serverLink(r.port) } : r)),
+  })
+
+  // Order o226e: PC control's Desktop tab asks whether a PC's own noVNC desktop answers (pc-desktop.ts, read only), at the tailnet name and address
+  // that PC's own agent reports in its ports report (this PC's own, or a member's).
+  const pcDesktop = createPcDesktop({
+    selfId: identity.id,
+    role: () => role,
+    member: id => {
+      const m = devices.member(id)
+      return m ? { name: m.name } : null
+    },
+    whereIs: async id => {
+      const r = id === identity.id ? pcPortsReport() : await pcPorts!.get(id)
+      return { address: r.tailnetAddress, name: r.tailnetName }
+    },
   })
 
   // Orders o1fa0 + o2915: PC control's SSH tab opens a live SSH session from THIS PC's own ssh client and key (pc-ssh-term.ts). Human only, the
@@ -1216,8 +1248,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       const available = extras.newerBuild?.() ?? null
       return current === null && available === null ? null : { current, available }
     }
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, buildBadge, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), createCpuProfileMount({ dir: paths.agent, log: log.child('diag') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
-      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: process.env.WA_BACKEND_DIR ?? path.join(paths.root, 'whatsapp-backend') }), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, access: featureAccess, buildBadge, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, pcResources.mount, pcDeps.mount, pcDesktop.mount,createPhoneAppsMount({ auth, log: log.child('phone-apps') }), createCpuProfileMount({ dir: paths.agent, log: log.child('diag') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
+      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: waBackendDir, backend: () => waBackend?.view() ?? waBackendOffView, assistantTools: () => waAssistant }), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -1240,6 +1272,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     extras.updateCoordinator?.current?.close()
     // F-079: WhatsApp closes its Chrome properly alongside the rest (if the agent ends first, the worker still does).
     const waClosed = whatsapp?.close()
+    // Order of5a0: the WhatsApp backend too: asked to close WhatsApp properly, then its exact PID past 25 s.
+    const waBackendStopped = waBackend?.stop()
     // Claude subscription failover first: nothing may start restarting a chat while they are being closed.
     failover.stop()
     rowWatch?.stop()
@@ -1257,6 +1291,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     tunnels.closeAll()
     await hub?.stop()
     await waClosed
+    await waBackendStopped
   }
 
   let stopping: Promise<void> | null = null

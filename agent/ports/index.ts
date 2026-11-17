@@ -82,9 +82,17 @@ export interface Ports {
   hello(): PortsHello | null
   /** A member keeps what its hub says. Anything malformed is ignored. */
   setServer(raw: unknown): boolean
+  /** Lead's gate-effect detector: one line per thing that must be TOLD (the heartbeat tells the Assistant once per key). Empty when all is well. */
+  alarms(): { key: string; text: string }[]
   start(): void
   close(): Promise<void>
 }
+
+/** Christopher's own addresses on Tailscale, which the old phone gate (christopher-remote, 127.0.0.1:4741) is meant to serve and nothing else. */
+export const CHRISTOPHER_PORTS: readonly number[] = [80, 443, 4740]
+/** The one plain sentence for the old gate sharing more than Christopher's own ports (Settings › Ports, the log, the heartbeat). */
+export const oldGateText = (extra: readonly number[]): string =>
+  `The old phone gate (christopher-remote, 127.0.0.1:4741) is sharing port${extra.length === 1 ? '' : 's'} ${extra.join(', ')} on Tailscale beyond Christopher's own 80, 443 and 4740. Its ports.json may be unreadable or missing "programs", and then it shares every dev port again. This shows it; it does not stop it.`
 
 /** What the hub sends in its hello and in 'ports' messages. An absent field means an older hub. */
 export interface PortsHello {
@@ -251,12 +259,40 @@ export function createPorts(o: PortsOptions): Ports {
     const out: PortShare[] = []
     for (const e of entries) {
       // Christopher's own addresses are the "main" page, not shares.
-      if ([80, 443, 4740].includes(e.port)) continue
+      if (CHRISTOPHER_PORTS.includes(e.port)) continue
       const owner = ownerOf(e)
       const links = owner === 'ours' ? oursLinks(w, e.port, viaOf(e), certReady) : foreignLinks(w, e, owner === 'gate')
       out.push({ port: e.port, program: programOf(e.port), sharedBy: owner === 'ours' ? 'ports' : owner, ...links })
     }
     return out
+  }
+
+  // ---- Lead's gate-effect detector (16 Nov 2026)
+  // A DETECTOR, NOT A GUARD. The old phone gate (christopher-remote's proxy.mjs on 127.0.0.1:4741, not this app's code) should serve only
+  // Christopher's own 80, 443 and 4740. If its ports.json is ever unreadable or lacks "programs", it falls back to sharing every dev port: a
+  // latent fail-open in the old way's script. This does not look at that file (the cause); it looks at the EFFECT, in what Tailscale actually
+  // serves: any entry pointing at the old gate on another port. It makes that failure VISIBLE (Settings › Ports, a log line on each change, one
+  // heartbeat line to the Assistant) within about a minute: `tailscale serve` is read again every SERVE_RECHECK_MS, or at once when a listening
+  // port changes. It does NOT PREVENT it: only a fail-closed old gate would, and that edit waits for Shubham's word.
+  // THIS IS A DETECTOR, NOT A GUARD. Never accept an exposure "because Ports will catch it": it tells only AFTER the port is already shared, only
+  // within about a minute, and only to someone looking at Settings › Ports or hearing the heartbeat. It prevents nothing and never touches the
+  // old gate's entries (Lead, 17 Nov 2026).
+  function oldGateExtra(): number[] {
+    return [...new Set(entries.filter(e => ownerOf(e) === 'gate' && !CHRISTOPHER_PORTS.includes(e.port)).map(e => e.port))].sort((a, b) => a - b)
+  }
+  function oldGateView(): PortsState['oldGate'] {
+    const extra = oldGateExtra()
+    return extra.length ? { extra, text: oldGateText(extra) } : null
+  }
+  let oldGateSaid = ''
+  /** One log line when what the old gate shares beyond Christopher's ports changes (and one when it is back to only those). */
+  function noteOldGate() {
+    const extra = oldGateExtra()
+    const said = extra.join(',')
+    if (said === oldGateSaid) return
+    oldGateSaid = said
+    if (extra.length) log?.warn(`Ports: ${oldGateText(extra)}`)
+    else log?.info("Ports: the old phone gate shares only Christopher's own ports (80, 443, 4740) again.")
   }
 
   function mainView(): PortsHello['main'] {
@@ -305,6 +341,8 @@ export function createPorts(o: PortsOptions): Ports {
       server: serverView(),
       // F-116: Linux only (absent on Windows): what Tailscale still needs before Ports can share.
       ...(platform === 'linux' ? { tailscaleRights: rights } : {}),
+      // Lead's gate-effect detector: shown, not prevented.
+      oldGate: unavailable === null ? oldGateView() : null,
     }
   }
 
@@ -494,6 +532,7 @@ export function createPorts(o: PortsOptions): Ports {
     } finally {
       scannedAt = new Date(now()).toISOString()
       lastScan = now()
+      if (unavailable === null) noteOldGate()
       o.onChange?.()
     }
   }
@@ -586,6 +625,10 @@ export function createPorts(o: PortsOptions): Ports {
       serverHello = { hello: h, at: new Date(now()).toISOString() }
       o.onChange?.()
       return true
+    },
+    alarms() {
+      const v = unavailable === null ? oldGateView() : null
+      return v ? [{ key: `old-gate:${v.extra.join(',')}`, text: v.text }] : []
     },
     start() {
       if (disabled || closed) return

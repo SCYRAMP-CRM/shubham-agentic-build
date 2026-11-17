@@ -140,10 +140,16 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/old\/api-key\/test$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, chat('owner')],
   // o7e6d (refinement2 line 56): the owner's only, human proof on top (humanTarget in index.ts).
-  ['GET', /^\/approvals$/, OWNER],
-  ['POST', /^\/approvals\/answer$/, OWNER],
-  ['POST', /^\/approvals\/cancel$/, OWNER],
+  // Orders o66aa / oa76b / o7e97 (his "1A"): a floor's waiting prompts, and answering or cancelling one, also for the people he chose to decide
+  // for that floor. Signed in here; the routes themselves decide who (requireCrmHuman, then listApprovals / humanTarget with decides(), read
+  // at every step): the owner of the app, or a decision-maker for that chat's floor now, and nobody else (refused 403 admin-only, as before).
+  ['GET', /^\/approvals$/, SIGNED],
+  ['POST', /^\/approvals\/answer$/, SIGNED],
+  ['POST', /^\/approvals\/cancel$/, SIGNED],
   ['POST', /^\/send-as-me$/, OWNER],
+  // o0c50 / o66aa: where each floor's decisions go ("Decisions go to…"). The owner's only (and a change takes his CRM session on the Server's page).
+  ['GET', /^\/question-routing$/, OWNER],
+  ['PUT', /^\/question-routing\/([^/]+)$/, OWNER],
   // F-221 (ob98a): live talk's cards and direct line: the owner's page (and Send also takes his signed-in CRM session, in the route itself).
   ['GET', /^\/talk\/cards$/, OWNER],
   ['POST', /^\/talk\/cards\/([^/]+)\/send$/, OWNER],
@@ -174,6 +180,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/restart$/, chat('owner')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/session$/, chat('owner')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/messages$/, chat('view')],
+  // Order obb81: the Agents page's look at one agent (its notes, its project folder's memory files, its last replies): the owner's only for now.
+  ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/brain$/, OWNER],
   ['GET', /^\/floors\/([^/]+)\/transcripts$/, floor('view')],
   // F-162 slice A: a person's own Assistant floor; the feature 'assistant' opens it (shared/access.ts ROUTES), the owner rule otherwise.
   ['GET', /^\/own-assistant$/, OWNER],

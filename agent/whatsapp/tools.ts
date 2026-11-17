@@ -75,7 +75,8 @@ export function statusText(s: WaStatus): string {
 export async function waTool(wa: WaTools, name: WaToolName, args: Record<string, unknown>): Promise<string> {
   switch (name) {
     case 'wa_status':
-      return statusText(wa.status())
+      // Order of5a0 (A2): where there are two logins, which one answered and whether the other is linked.
+      return wa.describe ? await wa.describe() : statusText(wa.status())
     case 'wa_chats': {
       const q = str(args.query).trim().toLowerCase()
       const limit = Math.max(1, Math.min(30, Math.floor(num(args.limit, 15))))

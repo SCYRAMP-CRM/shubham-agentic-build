@@ -1,4 +1,4 @@
-import { requireCrmHuman, describeHuman, createPromptActions, APPROVAL_GRANT_MS, isNativeApprovalCommit, nativeApprovalSnapshot, type NativeApprovalProof, type NativeApprovalSnapshot, type NativeApprovalCommit } from './human-session.ts'
+import { requireCrmHuman, describeHuman, createPromptActions, answeredByAnother, type PromptActor, APPROVAL_GRANT_MS, isNativeApprovalCommit, nativeApprovalSnapshot, type NativeApprovalProof, type NativeApprovalSnapshot, type NativeApprovalCommit } from './human-session.ts'
 import { createPcControlStore, isPcControl, immutablePcControl, pcControlError, pcControlRevision, assertPcControlExpected, checkedPcControlNamespace, type PcControlKnownDevice } from './pc-control.ts'
 import type { PcControlAnswer, PcControlWorkspace, PcControlCapability, PcControlSlot } from '../../shared/pc-control.ts'
 import { executionIdentityOf, requireLegacyExecution, requireRunningEngine, engineUpdateRequired, type RuntimeEngine } from './runtime-engine.ts'
@@ -128,7 +128,7 @@ import type { WaTools } from '../whatsapp/index.ts'
 import { waTool } from '../whatsapp/tools.ts'
 import type { SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
-import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
+import type { AnswerRequest, ApprovalItem, ApprovalLogEntry, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from './floors.ts'
 import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
@@ -174,6 +174,12 @@ import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
 import { GOALS_CRM_PATH, routeRule } from '../../shared/access.ts'
 import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
+import { createQuestionRouting } from './question-routing.ts'
+import { floorRoutable, routableChat } from './decision-routing.ts'
+import {
+  candidatesOf, decidesOn, effectiveRoute, OWNER_ROUTE, parseApprovalsScope, routeNames, splitQuestions, type ApprovalsScope, type QuestionRoute,
+  type QuestionRoutingAnswer, type WaitingQuestion,
+} from '../../shared/question-routing.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals } from './crm-goals.ts'
@@ -192,6 +198,7 @@ import { createCodebaseImport } from './accounts-codebase-import.ts'
 import { createAccountsPlatforms } from './accounts-platforms.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
+import { readAgentBrain } from './agent-brain.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
 import { createBrowserHost } from '../browser/host.ts'
 import { browserMount } from '../browser/mount.ts'
@@ -468,6 +475,8 @@ export interface AgenticOptions {
   reapEveryMs?: number
   /** F-078: the newer build waiting for Update now, if there is one (main.ts reads it off the build). */
   newerBuild?: () => string | null
+  /** Lead's "visible means TOLD": alarms from other parts of the app that the heartbeat tells the Assistant (main.ts: Ports, the old phone gate). */
+  alarms?: () => { key: string; text: string }[]
   /** @deprecated Inert compatibility input. Human actions always use the real CRM cookie session, never an injected proof. */
   voiceProof?: (body: unknown, r?: { caller?: Caller; headers: IncomingMessage['headers'] }) => string
   /** @deprecated Inert compatibility input: approval-device enrollment/recovery is retired; no elevation is run. */
@@ -949,6 +958,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return pickFloors().commitExecution(request)
     },
     list: () => mode() === 'member' ? allFloors() : checkedPcControlNamespace([...pickFloors().list(), ...controlFloors.store.list()]),
+    // Backend only (the Server's stalls, 16 Nov): this PC's floors then PC Control's, the stores' OWN rows (live objects, NOT copied), the same rows list()
+    // copies. Read only: never change them, never hand them out. It is the one way the hub's bySession reads rows, looked up here at call time, so a test that
+    // makes "the floors unreadable" by replacing list and rows reaches that lookup too. A member answers nothing: its floors are the replica's (bySession
+    // checks mode() first and keeps the old loop there).
+    rows: () => mode() === 'member' ? [] : [...(pickFloors().rows?.() ?? []), ...(controlFloors.store.rows?.() ?? [])],
     get: id => storeFor(id).get(id) ?? (mode() === 'member' ? replica.floors.find(f => f.id === id && isPcControl(f)) ?? null : null),
     create: (name, as) => pickFloors().create(name, as),
     validatePatch: (id, p, as) => storeFor(id).validatePatch(id, p, as),
@@ -1222,7 +1236,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   function bySession(sid: string): { floor: Floor; agent: FloorAgent } | null {
     // A quarantined persisted profile must not become an unbound legacy-Claude session.
-    pickFloors().bySession(sid)
+    const own = pickFloors().bySession(sid)
+    // The Server's stalls (profile, 16 Nov): on the hub, allFloors() deep-copied EVERY floor for each lookup of ONE chat, and GET /runs did that twice per agent
+    // per request. The hub's answer is the same here without the copy: the same two stores in the same order (this PC's floors, then PC Control), the same
+    // collision check (checkedPcControlNamespace throws before any answer, as allFloors() did), the same null; only the floor found is copied. The rows are
+    // read ONLY through the facade's floors.rows(), looked up at each call (Agent 12's review: "floors unreadable" in a test must reach this lookup too). A member
+    // keeps the old way: its floors are the replica's (codeDir = this PC's folder), which no store holds; so does a store without rows().
+    if (mode() !== 'member' && pickFloors().rows && controlFloors.store.rows && floors.rows) {
+      const rows = floors.rows()
+      checkedPcControlNamespace([...rows])
+      if (own) return { floor: own.floor, agent: own.floor.agents.find(a => a.sessionId === sid) ?? own.agent }
+      // No floor of this PC's store has the chat (its own lookup said so), so the first hit in the rows is PC Control's, in its order.
+      for (const f of rows) {
+        if (!f.agents.some(a => a.sessionId === sid)) continue
+        const floor = structuredClone(f)
+        return { floor, agent: floor.agents.find(a => a.sessionId === sid)! }
+      }
+      return null
+    }
     for (const floor of allFloors()) {
       const agent = floor.agents.find(a => a.sessionId === sid)
       if (agent) return { floor, agent }
@@ -1472,7 +1503,26 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   /** Every place that looks for a chat's conversation goes through this: a Codex chat's is its rollout, any other chat's is Claude's JSONL. */
   const isOpenCode = (sid: string) => { const at = bySession(sid); return !!at && engineFor(at.agent) === 'opencode' }
-  const findTranscript = (sid: string, dir: string): string | null => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid) ?? findClaudeTranscript(sid, dir)
+  // The Server's stalls (profile, 16 Nov): finding a Claude JSONL lists every project folder and asks each for the file (existsSync, on this thread), for every
+  // chat, on every GET /runs: 8% of the thread. Where it was FOUND is remembered (a chat whose file is not there yet is never remembered: it appears later);
+  // a remembered place is used only while that file is still there (one existsSync instead of one per folder: a moved file is looked for again at once) and for
+  // CLAUDE_FILE_MS at most (a copy placed in another folder is found within that). The engine is still asked first, every time: an OpenCode or Codex chat, or
+  // one that switched to such, never reads this.
+  const CLAUDE_FILE_MS = 10_000
+  const claudeFiles = new Map<string, { file: string; at: number }>()
+  function claudeTranscript(sid: string, dir: string): string | null {
+    const key = `${dir}\0${sid}`
+    const hit = claudeFiles.get(key)
+    if (hit && Date.now() - hit.at < CLAUDE_FILE_MS && existsSync(hit.file)) return hit.file
+    claudeFiles.delete(key)
+    const found = findClaudeTranscript(sid, dir)
+    if (found) {
+      if (claudeFiles.size >= 5_000) claudeFiles.clear()
+      claudeFiles.set(key, { file: found, at: Date.now() })
+    }
+    return found
+  }
+  const findTranscript = (sid: string, dir: string): string | null => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid) ?? claudeTranscript(sid, dir)
 
   /** Where this PC keeps a session's JSONL, whether it has it yet or not. */
   function fileOf(sid: string): string {
@@ -4063,6 +4113,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
   const approvalLog = createApprovalLog(path.join(o.dir, 'approvals.jsonl'))
+  /**
+   * o66aa / o7e97 (Lead's ruling on Agent 3's record-ordering point): an answer's record is written AFTER its key, never before (a row claiming
+   * a decision that never happened is worse in an accountability record than a gap). A write that fails is never silent: the answer stands (its
+   * key was typed), and the record that could not be written is kept here with the person, the prompt and the choice, for the owner to see
+   * (his overlay's cards, GET /approvals/log, the heartbeat once) and in the hub's log, so it can be written up by hand. Since this run only.
+   */
+  const unrecorded: ApprovalLogEntry[] = []
+  let unrecordedCount = 0, unrecordedTold = 0
+  function recordAnswer(e: Omit<ApprovalLogEntry, 'at'>) {
+    try {
+      approvalLog.add(e)
+    } catch (err) {
+      unrecorded.unshift({ at: new Date().toISOString(), ...e })
+      unrecorded.splice(50)
+      unrecordedCount++
+      log?.error(`approvals: an answer's record could not be written (${message(err)}): ${e.by} answered prompt ${e.promptId ?? '?'} in ${e.agent} on ${e.floor}: ${e.choice ?? e.detail}`)
+    }
+  }
   // The phones (browsers) whose signature an approval or a send needs: registered once, here on the hub.
   // F-081: the switch the guard's night-watch reads (auto-update.json in this folder).
   const autoUpdate = createAutoUpdate(path.join(o.dir, 'auto-update.json'))
@@ -4298,6 +4366,40 @@ export function createAgentic(o: AgenticOptions): Agentic {
     activity: sid => chats.activity(sid),
     record: e => chatLog.append({ event: 'watch', sessionId: e.sessionId, agent: e.agent, floor: e.floor, cause: e.cause, what: e.what, did: e.did }),
   })
+
+  // Orders o0c50 / o66aa / oa76b / o7e97: where each floor's decisions go (shared/question-routing.ts). A floor whose decisions go to people
+  // is never pushed to him (the heartbeat below, Quick's snapshot and approvals_waiting, his overlay's cards and badge), at no time; he sees
+  // it when he looks (GET /approvals ?scope=all or floor:<id>) and keeps every right. Its chosen people answer its prompts (decides()).
+  const questionRouting = createQuestionRouting(path.join(o.dir, 'question-routing.json'))
+  if (questionRouting.unreadable()) log?.warn('question routing: the saved choices (question-routing.json) could not be read; every floor\'s questions go to the owner until he chooses again')
+  /** Every chat waiting at a question now. */
+  function waitingQuestions(): WaitingQuestion[] {
+    const where = whereAll()
+    return floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name }] : [])))
+  }
+  /** The route in force for a floor NOW: its chosen people who still have a share on it (read from the floor as it is); nobody left, the owner. */
+  const questionRouteOf = (floorId: string) => (floorRoutable(floors.list().find(f => f.id === floorId)) ? effectiveRoute(questionRouting.route(floorId), floors.list().find(f => f.id === floorId) ?? null) : OWNER_ROUTE)
+  // floorRoutable and routableChat: decision-routing.ts (pure, each exclusion pinned on its own: PC control, a person's Assistant, the Orchestrator
+  // and the phone's chats, Agent 3's F1).
+  /** The route of one waiting question: its floor's in force, unless its chat's prompts stay the owner's whatever the floor's route. */
+  const routeOfQuestion = (q: WaitingQuestion): QuestionRoute => {
+    const f = floors.list().find(x => x.id === q.floorId), a = f?.agents.find(x => x.id === q.agentId)
+    return f && a && routableChat(f, a) ? questionRouteOf(f.id) : OWNER_ROUTE
+  }
+  /** The owner's share of the waiting questions (his floors' only) and a count of the ones with someone else, for when he looks. */
+  const ownerQuestions = () => splitQuestions(waitingQuestions(), routeOfQuestion)
+  /**
+   * Orders o66aa / oa76b / o7e97 ("1A"): may this signed-in person, not the owner of the app, answer this chat's prompt as one of its floor's
+   * decision-makers? The chat's floor is the one the hub has it on NOW (floors.bySession: never anything a request or a prompt's text names);
+   * that floor's route in force now names them (a share taken away ends it at once, a floor with nobody left is the owner's); and never a
+   * PC-control floor or slot, a person's own Assistant or the Orchestrator. Asked when listing, before an answer, and again right before the
+   * key is written into the chat.
+   */
+  function decides(c: Caller, at: { floor: Floor; agent: FloorAgent } | null): boolean {
+    if (!at || !c.person || access.isAdmin(c) || !routableChat(at.floor, at.agent)) return false
+    return decidesOn(questionRouteOf(at.floor.id), c.person.id)
+  }
+
   const heartbeat = createHeartbeat({
     now: Date.now,
     file: path.join(o.dir, 'heartbeat.json'),
@@ -4332,13 +4434,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (shown.length) voice.beat(shown.map(i => i.text).join(' '), shown.filter(i => i.agent).map(i => ({ floor: i.floor ?? '', agent: i.agent ?? '', what: i.kind })))
     },
     newerBuild: () => o.newerBuild?.() ?? null,
+    alarms: () => o.alarms?.() ?? [],
     currentBuild: () => o.currentBuild?.() ?? null,
     overnight: since => describeEvents(chatLog.since(since)),
     waiting: async () => {
       const lines: string[] = []
-      const where = whereAll()
-      const asking = floors.list().flatMap(f => f.agents.filter(a => a.sessionId && where[a.sessionId]?.state === 'question').map(a => `${a.name} on ${f.name}`))
+      // o0c50 / oa76b: his own floors' questions only. A floor whose decisions go to people is never pushed to him here, at any time (his "2 No").
+      const asking = ownerQuestions().mine.map(q => `${q.agentName} on ${q.floorName}`)
       if (asking.length) lines.push(`${asking.length} chat${asking.length === 1 ? '' : 's'} waiting at a question (the Approvals tab): ${asking.join(', ')}.`)
+      // o66aa / o7e97: an answer whose record could not be written is told once, with who, which prompt and what they chose.
+      if (unrecordedCount > unrecordedTold) {
+        const fresh = unrecorded.slice(0, Math.min(unrecordedCount - unrecordedTold, unrecorded.length))
+        lines.push(`${fresh.length} answer${fresh.length === 1 ? ' was' : 's were'} given but NOT written to the approvals record (the file could not be written): ${fresh.map(e => `${e.by} answered prompt ${e.promptId ?? '?'} in ${e.agent} on ${e.floor}: ${e.choice ?? e.detail}`).join('; ')}.`)
+        unrecordedTold = unrecordedCount
+      }
       if (prepared.size) lines.push(`${prepared.size} card${prepared.size === 1 ? ' is' : 's are'} prepared for you in the Send tab.`)
       const replies = orders.list().filter(x => x.pending).length
       if (replies) lines.push(`${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.`)
@@ -4706,7 +4815,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function fastSnapshot(): Promise<string> {
     const where = whereAll()
     const agents = floors.list().flatMap(f => f.agents.map(a => ({ floor: f.name, name: a.name, role: a.role, state: a.sessionId ? (where[a.sessionId]?.state ?? 'not running') : 'never opened' })))
-    const approvals = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ floor: f.name, agent: a.name }] : [])))
+    // o0c50 / oa76b: his own floors' questions only; a floor whose decisions go to people is never pushed to him through Quick.
+    const approvals = ownerQuestions().mine.map(q => ({ floor: q.floorName, agent: q.agentName }))
     const open = await tasks.list({ status: 'open', limit: 4 }).catch(() => [])
     const count = (await tasks.counts().catch(() => ({ open: 0 }))).open
     const phones = voice.phone.status().devices.map(d => ({ name: d.name, online: d.online, armed: d.armed }))
@@ -5146,9 +5256,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json({ orders: ids.map(i => (cancelledOrders.has(i) ? { orderId: i, open: false, phase: 'cancelled' } : handoff.status(i))) })
       }
       case 'approvals_waiting': {
-        const where = whereAll()
-        const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ agent: a.name, floor: f.name }] : [])))
-        return json({ count: waiting.length, waiting, note: 'He answers these himself in Approvals; you cannot.' })
+        // o0c50 / oa76b: his own floors' questions; the ones whose floor's decisions go to other people, as counts only, never pushed to him.
+        const { mine, elsewhere } = ownerQuestions()
+        const waiting = mine.map(q => ({ agent: q.agentName, floor: q.floorName }))
+        const routed = elsewhere.map(e => ({ floor: e.floorName, to: e.to, count: e.count }))
+        return json({ count: waiting.length, waiting, ...(routed.length ? { routedElsewhere: routed } : {}), note: 'He answers these himself in Approvals; you cannot. routedElsewhere: floors whose decisions he gave to other people; they answer them. Never bring those up yourself; tell him only if he asks.' })
       }
       default: {
         // The reads and task_add: run as an agent that belongs to the Orchestrator's floor (its memory, its floor's roster), under the Assistant's own name.
@@ -6387,13 +6499,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F158: never inspect old device keys, settings, signatures or unsigned flags.
     return describeHuman(requireCrmHuman(o.auth, r, ['autoupdate', 'pair', 'wa-send'].includes(kind)))
   }
-  function humanTarget(r: ProofRequest | undefined, agent: FloorAgent, need: 'type' | 'owner' = 'type') {
+  function humanTarget(r: ProofRequest | undefined, agent: FloorAgent, need: 'type' | 'owner' = 'type', decisions = false) {
     const caller = requireCrmHuman(o.auth, r)
     if (r) r.caller = caller
     // o7e6d (refinement2 line 56): approvals and Send as me are the owner's. A non-admin (a staff Assistant or any other person) is refused here,
     // before any native write; every approval and cancel recheck after an await calls this again (the typeKeys callbacks).
-    if (!access.isAdmin(caller)) throw authError(403, 'This is for the owner of this app.', 'admin-only')
-    access.needChat(caller, agent, need, 'human approval/send')
+    // Orders o66aa / oa76b / o7e97 ("1A"): except a prompt (an answer or a cancel only: `decisions`; Send as me never passes it) of a chat whose
+    // floor's decisions go to this person NOW. decides() reads the chat's floor from the hub at this very call (floors.bySession) and the route
+    // in force now, so a share taken away, a floor given back to him or a chat moved off the floor refuses even an answer already on its way,
+    // at the last check before the key is written. Their right is the floor's, not a share of the chat (his "1A": unshared chats too).
+    if (!access.isAdmin(caller)) {
+      const at = decisions && agent.sessionId ? floors.bySession(agent.sessionId) : null
+      if (!at || at.agent.id !== agent.id || !decides(caller, at)) throw authError(403, decisions ? "This is for the owner of this app, or for the people he chose to decide for this chat's floor; that is not you now." : 'This is for the owner of this app.', 'admin-only')
+    } else access.needChat(caller, agent, need, 'human approval/send')
     const at = agent.sessionId ? whereAll()[agent.sessionId] : null
     if (mode() === 'member' && (at?.id ?? agent.homePc) !== self().id) throw Object.assign(apiError(409, 'Sign in on the Server page to act on a chat running on another PC.'), { code: 'hub-sign-in-required', hubOrigin: null })
     return caller
@@ -6519,18 +6637,74 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return true
   }
 
-  /** Every chat waiting at a prompt, on every floor and PC, with what its screen says. */
-  async function listApprovals(r?: ProofRequest): Promise<ApprovalsAnswer> {
+  /**
+   * Every chat waiting at a prompt, on every floor and PC, with what its screen says.
+   * The owner of the app (o0c50): `scope` chooses which floors' prompts are listed, never who may answer them: 'mine' (the default) leaves
+   * out the floors whose decisions go to people (nothing of theirs is pushed to him, ever: oa76b); 'all' is every floor, the old list;
+   * 'floor:<id>' one floor. What waits on those floors is counted in `elsewhere`, for when he looks. With no floor routed, 'mine' is the old list.
+   * A floor's decision-maker (o66aa / oa76b / o7e97, "1A"): the prompts of the floors they decide for now (decides()), in that floor's
+   * unshared chats too, and nothing else: no other scope, no prepared sends, no counts.
+   */
+  async function listApprovals(r?: ProofRequest, scope: ApprovalsScope = 'mine'): Promise<ApprovalsAnswer> {
     const caller = requireCrmHuman(o.auth, r)
+    const admin = access.isAdmin(caller)
+    if (!admin && scope !== 'mine') throw authError(403, 'Only the owner of this app looks at other floors.', 'admin-only')
+    // Someone who decides for no floor now: refused as before (o7e6d), not an empty list.
+    if (!admin && !floors.list().some(f => caller.person && floorRoutable(f) && decidesOn(questionRouteOf(f.id), caller.person.id))) throw authError(403, 'This is for the owner of this app.', 'admin-only')
     const where = whereAll()
-    const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (access.rights(caller, a)?.can && access.rights(caller, a)?.can !== 'view' && a.sessionId && where[a.sessionId]?.state === 'question' ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
+    const { mine, elsewhere } = ownerQuestions()
+    const own = new Set(mine.map(q => q.sessionId))
+    const listed = (f: Floor, a: FloorAgent, sid: string) => {
+      if (!admin) return decides(caller, { floor: f, agent: a })
+      const rights = access.rights(caller, a)
+      return !!rights?.can && rights.can !== 'view' && (scope === 'all' ? true : scope === 'mine' ? own.has(sid) : scope === `floor:${f.id}`)
+    }
+    const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' && listed(f, a, a.sessionId) ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
     const items = await Promise.all(
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
         const p = await promptOfChat({ sessionId: sid, id: w.id })
-        return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable }
+        // On his list, a floor whose decisions go to people says whose they are.
+        const route = admin && routableChat(f, a) ? questionRouteOf(f.id) : OWNER_ROUTE
+        return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable, ...(route.to === 'people' ? { routedTo: routeNames(route) } : {}) }
       }),
     )
-    return { items, prepared: [...prepared.values()].filter(card => { const a = allFloors().find(f => f.id === card.floorId)?.agents.find(a => a.id === card.agentId); const rights = a ? access.rights(caller, a) : null; return rights && rights.can !== 'view' }).sort((x, y) => y.at.localeCompare(x.at)) }
+    return {
+      items,
+      prepared: admin ? [...prepared.values()].filter(card => { const a = allFloors().find(f => f.id === card.floorId)?.agents.find(a => a.id === card.agentId); const rights = a ? access.rights(caller, a) : null; return rights && rights.can !== 'view' }).sort((x, y) => y.at.localeCompare(x.at)) : [],
+      ...(admin && elsewhere.length ? { elsewhere } : {}),
+      // o66aa / o7e97: answers given whose record could not be written, for him to see (his overlay's cards).
+      ...(admin && unrecorded.length ? { unrecorded: unrecorded.slice(0, 10) } : {}),
+      scope,
+    }
+  }
+
+  /** o0c50 / o66aa: GET /question-routing: every floor's decision-makers (saved and in force), who may be chosen, and what his badge leaves out. Owner only. */
+  function questionRoutingView(): QuestionRoutingAnswer {
+    const list = floors.list()
+    const answer: QuestionRoutingAnswer = {
+      floors: list.map(f => ({ floorId: f.id, floorName: f.name, route: questionRouting.route(f.id), effective: questionRouteOf(f.id), routable: floorRoutable(f), candidates: candidatesOf(f, SBSKRRT_OWNER.id) })),
+      routedFloorIds: list.filter(f => questionRouteOf(f.id).to === 'people').map(f => f.id),
+    }
+    return questionRouting.unreadable() ? { ...answer, unreadable: true } : answer
+  }
+
+  /**
+   * o0c50 / o66aa: PUT /question-routing/<floorId>: the owner's again, or one or more people this floor's chats are shared with. Owner only. The
+   * floor's menu ("Decisions go to…") changes it here. Only on the Server, by the person signed in through CRM on its own page (requireCrmHuman:
+   * never a chat's key, the machine's token, the open app or a member PC's word for its page; Lead / Agent 3: "admin" alone would be any chat
+   * he owns); who chose is that caller, never the body. A member PC's page is told to change it on the Server's page.
+   */
+  function setQuestionRoute(floorId: string, r: MountRequest): QuestionRoutingAnswer {
+    if (mode() === 'member') throw Object.assign(apiError(409, "Where a floor's decisions go is changed on the Server's page."), { code: 'hub-sign-in-required', hubOrigin: null })
+    const by = requireCrmHuman(o.auth, r, true)
+    const f = floors.list().find(x => x.id === floorId)
+    if (!f) throw apiError(404, 'No such floor')
+    // A floor whose decisions stay his whatever is chosen (PC control, a person's Assistant, the Orchestrator) takes no people; going back to him always works.
+    if (!floorRoutable(f) && !(isObject(r.body) && r.body.to === 'owner')) throw apiError(409, "This floor's decisions stay yours: it is PC control, or it holds an Assistant or the phone's chat.")
+    const people = candidatesOf(f, SBSKRRT_OWNER.id)
+    const saved = questionRouting.set(floorId, r.body, id => people.find(p => p.id === id)?.name ?? null)
+    log?.info(`question routing: ${describeHuman(by)} chose: ${f.name}'s decisions now go to ${saved.to === 'people' ? routeNames(saved) : 'the owner'}`)
+    return questionRoutingView()
   }
 
   /** His tap on option n of the prompt he was shown: typed into that chat exactly as pressing it there. Refused when the prompt has changed since. */
@@ -6542,7 +6716,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
-    humanTarget(r, at.agent)
+    // o66aa / o7e97: the owner of the app, or one of the people deciding for this chat's floor now (decides(), asked again at every step below).
+    const caller = humanTarget(r, at.agent, 'type', true)
+    const actor = promptActor(caller)
+    const key = JSON.stringify([req.sessionId, req.id])
+    // First answer wins: someone else already holds this prompt's answer (the screen may have moved on since): say who, plainly.
+    const holder = promptActions.actorOf(key)
+    if (holder && holder.id !== actor.id) throw answeredByAnother(holder)
     const runtime = w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
     const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
@@ -6554,20 +6734,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const latest = floors.bySession(req.sessionId)
     const current = whereAll()[req.sessionId]
     if (!latest || latest.agent.id !== at.agent.id || current?.id !== w.id || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed; refresh the prompt.')
-    humanTarget(r, latest.agent)
-    return promptActions.run(JSON.stringify([req.sessionId, req.id]), JSON.stringify(['answer', req.n]), async markNativeAttempt => {
+    humanTarget(r, latest.agent, 'type', true)
+    return promptActions.run(key, JSON.stringify(['answer', req.n]), async markNativeAttempt => {
       const now = await promptOfChat({ sessionId: req.sessionId, id: w.id })
       if (!now.native || now.id !== req.id || !answerable(now.menu) || !now.menu!.options.some(x => x.n === req.n)) throw apiError(409, 'That prompt changed before the answer could be committed; refresh it.')
       const target = floors.bySession(req.sessionId), live = whereAll()[req.sessionId]
       if (!target || target.agent.id !== at.agent.id || live?.id !== w.id || live.state !== 'question' || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed before the answer could be committed; refresh it.')
-      humanTarget(r, target.agent)
-      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, String(req.n), now.native.proof, current => humanTarget(r, current), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be answered right now`)
+      humanTarget(r, target.agent, 'type', true)
+      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, String(req.n), now.native.proof, current => humanTarget(r, current, 'type', true), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be answered right now`)
       const detail = `${p.menu!.question || 'A prompt'} → ${option.n}. ${option.label}${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
-      approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
-      log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}`)
+      // o66aa / o7e97: the record names the human who gave it (an action taken with the chat owner's powers must never pass for his own).
+      recordAnswer({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by, ...promptRecord(caller, at.floor.id, req.id, `${option.n}. ${option.label}`) })
+      log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}${access.isAdmin(caller) ? '' : `, by ${describeHuman(caller)} for the floor`}`)
       return { ok: true, answered: `${option.n}. ${option.label}`, agent: at.agent.name, floor: at.floor.name }
-    })
+    }, actor)
   }
+
+  /** o66aa / o7e97: who holds a prompt's answer (the once-only claim), from the caller requireCrmHuman proved. */
+  const promptActor = (c: Caller): PromptActor => ({ id: c.person!.id, name: c.person!.name || c.person!.username })
+  /** o66aa / o7e97: the durable part of an answer's record: which person, as what, on which floor, which prompt, and what they chose. */
+  const promptRecord = (c: Caller, floorId: string, promptId: string, choice: string) =>
+    ({ personId: c.person!.id, role: access.isAdmin(c) ? 'owner' as const : 'decision-maker' as const, floorId, promptId, choice })
 
   /**
    * His tap on Cancel (Esc) for the prompt he was shown: one Escape key into that chat, only while its screen still shows the same prompt
@@ -6580,7 +6767,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
-    humanTarget(r, at.agent)
+    // o66aa / o7e97: as an answer (this IS one: the prompt's own Esc, "No" on a permission prompt): the owner, or one of the floor's people now.
+    const caller = humanTarget(r, at.agent, 'type', true)
+    const actor = promptActor(caller)
+    const key = JSON.stringify([req.sessionId, req.id])
+    const holder = promptActions.actorOf(key)
+    if (holder && holder.id !== actor.id) throw answeredByAnother(holder)
     const runtime = w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
     const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
@@ -6590,19 +6782,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const latest = floors.bySession(req.sessionId)
     const current = whereAll()[req.sessionId]
     if (!latest || latest.agent.id !== at.agent.id || current?.id !== w.id || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed; refresh the prompt.')
-    humanTarget(r, latest.agent)
-    return promptActions.run(JSON.stringify([req.sessionId, req.id]), 'cancel', async markNativeAttempt => {
+    humanTarget(r, latest.agent, 'type', true)
+    return promptActions.run(key, 'cancel', async markNativeAttempt => {
       const now = await promptOfChat({ sessionId: req.sessionId, id: w.id })
       if (!now.native || now.id !== req.id || !now.cancellable) throw apiError(409, 'That prompt changed before Cancel could be committed; refresh it.')
       const target = floors.bySession(req.sessionId), live = whereAll()[req.sessionId]
       if (!target || target.agent.id !== at.agent.id || live?.id !== w.id || live.state !== 'question' || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed before Cancel could be committed; refresh it.')
-      humanTarget(r, target.agent)
-      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, ESC_KEY, now.native.proof, current => humanTarget(r, current), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be cancelled right now`)
+      humanTarget(r, target.agent, 'type', true)
+      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, ESC_KEY, now.native.proof, current => humanTarget(r, current, 'type', true), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be cancelled right now`)
       const detail = `${p.menu?.question || 'A prompt'} → Esc (cancel)${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
-      approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
-      log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}`)
+      recordAnswer({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by, ...promptRecord(caller, at.floor.id, req.id, 'Esc (cancel)') })
+      log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}${access.isAdmin(caller) ? '' : `, by ${describeHuman(caller)} for the floor`}`)
       return { ok: true, agent: at.agent.name, floor: at.floor.name }
-    })
+    }, actor)
   }
 
   /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
@@ -7119,6 +7311,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/watchdog$/, () => watchdogView()],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
     // oc58f follow-up: the answer says when the saved choice could not be read (the card is in force until he chooses again).
+    // o0c50: where each floor's questions are pushed to the owner (owner only, access.ts POLICY); rights are unchanged.
+    ['GET', /^\/question-routing$/, () => questionRoutingView()],
+    ['PUT', /^\/question-routing\/([^/]+)$/, ([floorId], r) => setQuestionRoute(floorId, r), 'local'],
     ['GET', /^\/fast\/forwarding$/, () => quickForwarding.answer()],
     ['PUT', /^\/fast\/forwarding$/, (_, r) => quickForwarding.set(r.body)],
     ['GET', /^\/fast\/names$/, () => ({ choice: fastNames })],
@@ -7291,7 +7486,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
-    ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals(r)), 'local'],
+    // o0c50: ?scope=mine (the default) | all | floor:<id> (shared/question-routing.ts); anything else is refused, never widened.
+    ['GET', /^\/approvals$/, (_, r) => {
+      humanOnly(r)
+      const scope = parseApprovalsScope(r.query.get('scope'))
+      if (!scope) throw apiError(400, 'scope is mine, all or floor:<id>')
+      return listApprovals(r, scope)
+    }, 'local'],
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r)), 'local'],
@@ -7316,7 +7517,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/approvals\/devices\/recover\/finish$/, () => retiredApprovalDevices()],
     ['POST', /^\/approvals\/devices\/remove$/, () => retiredApprovalDevices()],
     ['POST', /^\/approvals\/devices\/unsigned$/, () => retiredApprovalDevices()],
-    ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],
+    // o66aa / o7e97: with the answers given whose record could not be written (who, which prompt, what they chose), since this run.
+    ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecorded.length ? { unrecorded } : {}) })],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
@@ -7447,6 +7649,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
+    // Order obb81 (the Agents page, /agent-directory): one agent's floor notes, its Claude project folder's memory files and its last few replies,
+    // read-only, secrets masked (agent-brain.ts). The owner's only: OWNER in access.ts POLICY and in no shared/access.ts ROUTES rule. 'local':
+    // read where its conversation is kept.
+    [
+      'GET',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/brain$/,
+      ([id, agentId]) => {
+        const floor = floorOf(id)
+        return readAgentBrain(agentOf(floor, agentId), memory.all(floor.id), projectsDir)
+      },
+      'local',
+    ],
     [
       'GET',
       /^\/floors\/([^/]+)\/transcripts$/,
@@ -7569,8 +7783,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const live = chats.states()
         const runs: Record<string, ChatRun> = {}
         let inherited: { model: string; mtimeMs: number } | null = null
-        const seen = access.visible(callerOf(r), allFloors())
-        for (const f of allFloors()) {
+        // One copy of the floors per request (it was two here, and two more per agent through bySession: the profile of 16 Nov). access.visible only reads it.
+        const all = allFloors()
+        const seen = access.visible(callerOf(r), all)
+        for (const f of all) {
           for (const a of f.agents) {
             if (seen && (!a.sessionId || !seen.has(a.sessionId))) continue
             const file = a.sessionId ? findTranscript(a.sessionId, projectsDir) : null

@@ -140,11 +140,16 @@ export interface HeartbeatDeps {
    * When it is given, it starts the stopped chats and this beat no longer does.
    */
   watch?(): Promise<Finding[]>
+  /**
+   * Lead's rule "visible means TOLD" (16 Nov 2026): things the app watches that Shubham must hear about, not only find on a page (today: the old
+   * phone gate sharing more than Christopher's ports, from Ports). Each is told once per key, like every finding (until it changes or an hour).
+   */
+  alarms?(): { key: string; text: string }[]
   file?: string
   log?: { info(m: string): void; warn(m: string): void }
 }
 
-export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent'
+export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent' | 'alarm'
 
 export interface Finding {
   kind: FindingKind
@@ -320,6 +325,13 @@ export function createHeartbeat(deps: HeartbeatDeps): Heartbeat {
     if (build) findings.push({ kind: 'build', key: `build:${build}`, did: false, text: `A newer build (${build}) is waiting; only Shubham presses Update now.` })
     const replies = deps.undeliveredReplies()
     if (replies > 0) findings.push({ kind: 'replies', key: `replies:${replies}`, did: false, text: `${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.` })
+    // Lead's "visible means TOLD": an alarm another part of the app raised (Ports: the old phone gate sharing more than Christopher's ports).
+    // A failing source is said in the log and tells nothing, never a false "all is well" in its place.
+    try {
+      for (const a of deps.alarms?.() ?? []) findings.push({ kind: 'alarm', key: `alarm:${a.key}`, did: false, text: a.text })
+    } catch (e) {
+      deps.log?.warn(`heartbeat: the alarms could not be read: ${e instanceof Error ? e.message : String(e)}`)
+    }
 
     // Told once each (until it changes or an hour passes); nothing at all when nothing is new.
     const fresh = findings.filter(f => !(f.key in saved.told) || now - saved.told[f.key] >= REPEAT_MS)
