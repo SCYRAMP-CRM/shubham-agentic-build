@@ -47,6 +47,8 @@ At most 30 asks a minute per client (then an `error` 429 frame).
 
 ## Hub → client
 
+Quick V2 extends this protocol only for an owner web connection whose **current** start says `page:'quick', talk:true, ahead:true`. Each reconnect must repeat all three. Only that opted-in connection receives `previews:true` on its state frames, and only when this hub implements disposable preparation. V1, the bar and Chris keep their original frames and processing. `prepare {id,text,thorough?}` and `prepare-cancel` are computation/cancellation only: they never acquire an ask origin, enter normal Quick history, speak or create a card. The eventual ordinary `ask` may name `preparationId`; only a ready exact text/model/context/connection match is consumed, never awaited. See [QUICK-V2.md](./QUICK-V2.md) for bounds, the isolation guarantee and V1 parity. These client claims enable a UX path, not new authority or a human confirmation.
+
 | Frame | Meaning |
 |---|---|
 | `{t:'state', state, reason?, model?, holds?}` | `off, starting, ready, unavailable, paused, taken-over, stopped`. `paused` = memory is low: asks go straight to the Orchestrator. `reason` is one plain sentence. Sent on connect and on every change. F-221: `holds: true` on every state frame of a hub that can hold hand-offs as cards; a page offers live talk only then ("Update the app first" otherwise). |

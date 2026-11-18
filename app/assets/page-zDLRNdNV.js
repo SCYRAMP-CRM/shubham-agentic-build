@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-Bm4v8tVm.js";function t(){e(`/goals`)}export{t as default};

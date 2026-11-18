@@ -77,12 +77,15 @@ export type FastClientFrame =
    * 'quick' counts; anything else (another string, another type) is dropped and the start is as it was. It is the client's word, so it can
    * only make things stricter, never looser: a UX guard, not a security boundary.
    */
-  | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean; talk?: boolean; page?: 'quick' }
+  | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean; talk?: boolean; page?: 'quick'; ahead?: true }
+  /** V2 preparation is isolated computation. It is never an ask, an order, or authority for a tool. */
+  | { t: 'prepare'; id: string; text: string; thorough?: true }
+  | { t: 'prepare-cancel' }
   /**
    * A question or an order. `via` says how it was given (voice answers are written for the ear). `thorough` asks for Sonnet for this turn. A new ask while one runs cuts the old one off (it ends with done {cancelled}).
    * F-221 (ob98a): `heard` = the part of the previous answer he actually heard before he cut in (at most MAX_HEARD characters): the Assistant goes on from there.
    */
-  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean; source?: AnswerSource; heard?: string }
+  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean; source?: AnswerSource; heard?: string; preparationId?: string }
   /** Barge-in: stop turn `id` now (what is already spoken stays said). F-221: also `o:<orderId>`, the hub's turn that tells a hand-off's answer, when it was told on this connection. */
   | { t: 'cancel'; id: string }
   /** The client is done: the Assistant is released (the hub keeps the process warm for a while). F-221: this connection's cards are dropped too. */
@@ -108,7 +111,7 @@ export type FastServerFrame =
    * The Assistant itself: `reason` is one plain sentence for anything but 'ready' / 'starting'. `paused` = memory is low; asks go to the Orchestrator directly.
    * F-221 (ob98a): `holds: true` = this hub can hold hand-offs as cards (the `hold` latch, `card` frames); a page offers live talk only then.
    */
-  | { t: 'state'; state: FastState; reason?: string; model?: FastModel; holds?: boolean }
+  | { t: 'state'; state: FastState; reason?: string; model?: FastModel; holds?: boolean; previews?: true }
   /** A piece of the answer text as it streams (speak it as it arrives). `id` is the ask's, or `o:<orderId>` for a turn the hub started. */
   | { t: 'delta'; id: string; text: string }
   /** A boundary where speech may start (the end of a text block): speak what is queued. */
@@ -160,8 +163,16 @@ export function parseClientFrame(raw: string): FastParse {
       if (v.client !== 'web' && v.client !== 'phone') return bad("start needs client 'web' or 'phone'.")
       if (!isId(v.id)) return bad('start needs an id (a tab or a device), 1 to 64 plain characters.')
       if (v.model !== undefined && !(FAST_MODELS as readonly unknown[]).includes(v.model)) return bad('model is haiku or sonnet.')
-      return { ok: true, frame: { t: 'start', client: v.client, id: v.id, ...(v.model ? { model: v.model as FastModel } : {}), ...(v.resume === true ? { resume: true } : {}), ...(v.talk === true ? { talk: true } : {}), ...(v.page === 'quick' ? { page: 'quick' as const } : {}) } }
+      return { ok: true, frame: { t: 'start', client: v.client, id: v.id, ...(v.model ? { model: v.model as FastModel } : {}), ...(v.resume === true ? { resume: true } : {}), ...(v.talk === true ? { talk: true } : {}), ...(v.page === 'quick' ? { page: 'quick' as const } : {}), ...(v.ahead === true ? { ahead: true as const } : {}) } }
     }
+    case 'prepare': {
+      if (!isId(v.id) || typeof v.text !== 'string') return bad('prepare needs an id and text.')
+      const text = v.text.replace(/\s+/g, ' ').trim()
+      if (!text || text.length > MAX_TEXT) return bad('Preparation text is empty or too long.')
+      return { ok: true, frame: { t: 'prepare', id: v.id, text, ...(v.thorough === true ? { thorough: true as const } : {}) } }
+    }
+    case 'prepare-cancel':
+      return { ok: true, frame: { t: 'prepare-cancel' } }
     case 'ask': {
       if (!isId(v.id)) return bad('ask needs an id, 1 to 64 plain characters.')
       if (v.via !== 'voice' && v.via !== 'typed') return bad("ask needs via 'voice' or 'typed'.")
@@ -171,6 +182,7 @@ export function parseClientFrame(raw: string): FastParse {
       if (text.length > MAX_TEXT) return bad(`That is longer than ${MAX_TEXT} characters.`, 413)
       // Order o7f34: which answerer (the efficient route's compare button and its setting); left out, the server decides.
       if (v.source !== undefined && v.source !== 'subscription' && v.source !== 'api') return bad("source is 'subscription' or 'api'.")
+      if (v.preparationId !== undefined && !isId(v.preparationId)) return bad('Invalid preparation id.')
       // F-221 (ob98a): what he heard of the answer he cut off. Empty is the same as left out.
       let heard = ''
       if (v.heard !== undefined) {
@@ -178,7 +190,7 @@ export function parseClientFrame(raw: string): FastParse {
         heard = oneLine(v.heard)
         if (heard.length > MAX_HEARD) return bad(`heard is longer than ${MAX_HEARD} characters.`, 413)
       }
-      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}), ...(v.source ? { source: v.source } : {}), ...(heard ? { heard } : {}) } }
+      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}), ...(v.source ? { source: v.source } : {}), ...(heard ? { heard } : {}), ...(v.preparationId ? { preparationId: v.preparationId } : {}) } }
     }
     case 'cancel':
       // F-221: an o: id is the hub's turn telling a hand-off's answer (the session lets a connection cancel only one told to it).

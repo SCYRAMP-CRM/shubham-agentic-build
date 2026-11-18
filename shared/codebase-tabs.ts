@@ -149,4 +149,6 @@ export interface TabsAnswer {
   subsets: TabsSubset[]
   /** Whether the key file is on this PC (values can be read and saved). */
   keyOk: boolean
+  /** Order o6f00: the name the app gives the PC whose agent answered (Server, Shubham ...), so a page that says "the key file is not on this PC" can say WHICH one. A name only, never a path or an address. Absent from an older agent. */
+  pc?: string
 }

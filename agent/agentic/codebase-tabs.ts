@@ -16,6 +16,8 @@ export interface CodebaseTabsOptions {
   dir: string
   open?: typeof openAccountsDb
   log?: { warn(message: string): void; info?(message: string): void }
+  /** Order o6f00: this PC's name as the app shows it (Server, Shubham ...), read at each request. Only a name is ever given to the page. */
+  pcName?: () => string
 }
 
 const PERSON = /^[A-Za-z0-9._:@-]{1,80}$/
@@ -50,6 +52,18 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
     } finally {
       await sql?.end({ timeout: 2 }).catch(() => {})
     }
+  }
+
+  /** This PC's name for the page (a short plain name: no path, no address); null when none is given or it is not a usable name. */
+  function pcLabel(): string | null {
+    let name: unknown
+    try {
+      name = o.pcName?.()
+    } catch {
+      return null
+    }
+    const t = typeof name === 'string' ? name.trim() : ''
+    return t && t.length <= 80 && !/[\\/:]/.test(t) ? t : null
   }
 
   /** The key, or a plain refusal (values cannot be saved or read without it). */
@@ -126,6 +140,7 @@ async function codebaseOr404(tx: Tx, cb: string) {
           const sid = str(v.subset_id)
           varsBy.set(sid, [...(varsBy.get(sid) ?? []), { id: str(v.id), name, secret, value }])
         }
+        const pc = pcLabel()
         return {
           codebaseId: cb,
           sections,
@@ -138,6 +153,7 @@ async function codebaseOr404(tx: Tx, cb: string) {
           }),
           subsets: subs.map(s => ({ id: str(s.id), name: str(s.name), vars: varsBy.get(str(s.id)) ?? [] })),
           keyOk: key.ok,
+          ...(pc === null ? {} : { pc }),
         }
       })
     },
@@ -360,7 +376,7 @@ async function codebaseOr404(tx: Tx, cb: string) {
       })
     },
 
-    /** The one way a secret value leaves the Server: when he asks for it (reveal). Nothing is logged. */
+    /** The one way a secret value leaves the Server: when he asks for it (reveal). One line is logged (who, which row, when), never the value. */
     async reveal(person: string, varId: string): Promise<{ value: string }> {
       const id = uuid(varId)
       if (!id) throw apiError(400, 'That variable id is not valid.')

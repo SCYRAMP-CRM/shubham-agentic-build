@@ -191,6 +191,8 @@ export type TalkLang = 'auto' | 'en' | 'hi' | 'mr'
 export type TalkEndQuiet = (typeof TALK.endQuietOptionsMs)[number]
 
 export interface TalkOptions {
+  /** V2: transcribe bounded pieces while speaking; partial text may only prepare a disposable answer. */
+  ahead?: true
   /** quick: Quick answers (cards for real work). direct: straight to the Assistant chat, as orders (his setting). */
   mode: TalkMode
   /** auto: on the PC or earbuds his voice cuts in, on the phone speaker it talks over; talk-over: its own echo is told from his words; tap: only Stop. */
@@ -260,6 +262,7 @@ export function talkOptions(raw: unknown): TalkOptions {
     ackDelayMs: within(o.ackDelayMs, 0, TALK.ackDelayMaxMs) ? Math.round(o.ackDelayMs) : TALK_DEFAULTS.ackDelayMs,
     endQuietMs: oneOf(o.endQuietMs, TALK.endQuietOptionsMs, TALK_DEFAULTS.endQuietMs),
     guess: o.guess === true,
+    ...(o.ahead === true ? { ahead: true as const } : {}),
     autoEndMs: within(o.autoEndMs, TALK.autoEndMinMs, TALK.autoEndMaxMs) ? Math.round(o.autoEndMs) : null,
     lang: oneOf(o.lang, ['auto', 'en', 'hi', 'mr'] as const, TALK_DEFAULTS.lang),
     idPrefix: typeof o.idPrefix === 'string' && ID_PREFIX.test(o.idPrefix) ? o.idPrefix : TALK_DEFAULTS.idPrefix,
@@ -380,8 +383,9 @@ export function parseTalkSettings(raw: unknown): TalkSettings {
 /**
  * The brain's options for one session: his settings, and what the page decides (the mode it may use, where the sound comes out, the session's id
  * prefix, the names). F-267 step 2 (o7be4): `quickPage`, only a session the Quick page hosts (src/talk/session.ts, its page 'quick').
+ * V2 alone also opts into bounded, disposable preparation during his speech.
  */
-export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device: TalkDevice; idPrefix: string; names: Names; quickPage?: boolean }): TalkOptions {
+export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device: TalkDevice; idPrefix: string; names: Names; quickPage?: boolean; ahead?: true }): TalkOptions {
   return talkOptions({
     mode: page.mode,
     cutIn: s.cutIn,
@@ -395,6 +399,7 @@ export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device
     idPrefix: page.idPrefix,
     names: page.names,
     ...(page.quickPage === true ? { quickPage: true } : {}),
+    ...(page.ahead === true ? { ahead: true as const } : {}),
   })
 }
 
@@ -494,6 +499,8 @@ export type TalkEndReason = 'end' | 'silence' | 'taken-over' | 'paused' | 'unava
  *   hush word: let the sentence playing (a filler) reach the end of its word, then stop and drop it and what was queued before this action.
  */
 export type TalkAction =
+  | { t: 'prepare'; text: string }
+  | { t: 'prepare-cancel' }
   /**
    * Transcribe frames fromFrame <= n < toFrame, then push `stt` (its text) or `stt-fail`. `guess`: the early guess (Whisper may answer
    * 409 busy at once). One with no sign of life for 20 s (o0de2: the page pushes `stt-busy` while the PC works on it), or out 2 minutes, is
@@ -504,7 +511,7 @@ export type TalkAction =
   | { t: 'stt'; req: number; fromFrame: number; toFrame: number; guess: boolean; check?: true; room?: true }
   | { t: 'stt-abort'; req: number }
   /** To Quick: {t:'ask', id, text, via:'voice', heard?}. `heard`: what he heard of the answer he cut off. */
-  | { t: 'ask'; id: string; text: string; heard?: string }
+  | { t: 'ask'; id: string; text: string; heard?: string; speechEndedAt?: number }
   | { t: 'cancel'; id: string }
   /**
    * Review of T3b: he cut off a turn whose answer was all written already, so no `cancel` goes to the hub; only the page's turn record notes
@@ -988,7 +995,7 @@ export interface Segmenter {
 }
 
 /** His turns, out of the frames (the classic's poe, line for line): the onset, voice runs, the quiet that ends a turn, the 25 s cut. */
-export function createSegmenter(floor: Pick<NoiseFloor, 'value' | 'count'>, endQuietFrames: number = TALK.endQuietFrames): Segmenter {
+export function createSegmenter(floor: Pick<NoiseFloor, 'value' | 'count'>, endQuietFrames: number = TALK.endQuietFrames, maxFrames: number | (() => number) = TALK.maxSegmentFrames): Segmenter {
   let open = false
   let ring: HeardFrame[] = []
   let win: boolean[] = []
@@ -1098,7 +1105,7 @@ export function createSegmenter(floor: Pick<NoiseFloor, 'value' | 'count'>, endQ
       frames.push(f)
       account(f, fl, frames.length - 1)
       if (quiet >= endQuietFrames) return close()
-      if (frames.length >= TALK.maxSegmentFrames) return cut()
+      if (frames.length >= (typeof maxFrames === 'function' ? maxFrames() : maxFrames)) return cut()
       return null
     },
     guessRange() {
@@ -1286,6 +1293,10 @@ const OUT: readonly TalkOrderPhase[] = ['queued', 'typed', 'working', 'waiting-y
 export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   const o = talkOptions(given)
   const quick = o.mode === 'quick'
+  const page = o.quickPage === true && quick
+  // Only the Quick page may prepare early. An overlay or a direct line never
+  // acquires V2's rules just because a caller supplied the option.
+  const ahead = page && o.ahead === true
   /** How his voice over it is taken: Auto is "barge" on the PC and earbuds, talk-over on the phone speaker. */
   const style: 'barge' | 'talk-over' | 'tap' = o.cutIn === 'tap' ? 'tap' : o.cutIn === 'talk-over' || o.device === 'phone-speaker' ? 'talk-over' : 'barge'
   /** On the phone speaker spoken fillers are an echo risk: tone only, unless only a tap can cut in. */
@@ -1310,7 +1321,9 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   let echoTail = 0
   let doubts: number[] = []
   let wasPlaying = false
-  const seg = createSegmenter(floor, endQuietFrames)
+  // Silent/room pieces retain their existing bound and one-at-a-time path:
+  // V2 is not permission to send room speech to a draft process more often.
+  const seg = createSegmenter(floor, endQuietFrames, () => ahead && !silent && !utt?.room && !utt?.quiet ? 300 : TALK.maxSegmentFrames)
 
   // his words
   let reqNo = 0
@@ -1331,6 +1344,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
 
   // what it says
   let askNo = 0
+  let decidingEndAt: number | null = null
   let sayNo = 0
   const turns: Turn[] = []
   let queue: Say[] = []
@@ -1342,7 +1356,6 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
 
   // F-267 step 2 (orders o088b, o7be4): the Quick page's Silent. Only with TalkOptions.quickPage (Quick mode): the overlay never sets it, so for
   // it all of this stays idle (silent false, nothing kept, nothing checked).
-  const page = o.quickPage === true && quick
   /** Silent: it hears and shows what it hears, says nothing (no answer, filler, line or tone), and asks Quick nothing but a wake. */
   let silent = false
   /** When Silent began, or his last "Quick" (a command or a wake) or tap since: Silent's own end counts from it (TALK.silentEndMs). */
@@ -1465,7 +1478,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // The classic's echo window starts again with each question.
     spoken = ''
     info = ''
-    if (quick) act({ t: 'ask', id, text: clean, ...(h ? { heard: h } : {}) })
+    if (quick) act({ t: 'ask', id, text: clean, ...(h ? { heard: h } : {}), ...(ahead && decidingEndAt !== null ? { speechEndedAt: decidingEndAt } : {}) })
     else act({ t: 'direct-ask', id, text: clean })
     dirty = true
   }
@@ -1589,6 +1602,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    * "Quick, continue" says it); fillers, progress lines and its own lines go. Hearing goes on, and the cards stay.
    */
   function enterSilent() {
+    if (ahead) act({ t: 'prepare-cancel' })
     const answers = [...queue, ...pending].filter(s => s.kind === 'answer' && !s.own && (s.turn ?? s.of) !== null)
     if (queue.length > 0 || held) act({ t: 'hush', at: 'now', hold: false })
     queue = []
@@ -2008,6 +2022,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   }
   /** Quiet now, and nothing of what was out is said after it: its turns are cancelled, and so are the tellings not begun yet. */
   function stopAll() {
+    if (ahead) act({ t: 'prepare-cancel' })
     dropAudio(true)
     lost = null
     // F-267 step 2 (o7be4): nothing kept for him is said after a stop either (the Stop button while Silent too: Silent stays).
@@ -2072,8 +2087,19 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    * nothing else from him that is "didn't catch that"; with words, they are asked and he is told part of it was missed. Never silent.
    */
   function decide(u: Utterance, text: string, lostPiece: boolean) {
+    // V2 cuts earlier to overlap recognition. If any piece is lost, these are
+    // still incomplete words, not an authorised final command. V1 stays as it was.
+    if (ahead && lostPiece) {
+      act({ t: 'prepare-cancel' })
+      answerEndAt = null
+      // A lost room piece is not an invitation to speak a retry line. Silent
+      // and a tap that made old speech quiet keep 2a's room-only presentation.
+      if (silent || u.room || u.quiet) return void onlyShown(u, text)
+      return notCaught(null)
+    }
     const asks = askNo
-    decideWords(u, text, lostPiece)
+    decidingEndAt = u.closedAt - endQuietFrames * TALK.frameMs
+    try { decideWords(u, text, lostPiece) } finally { decidingEndAt = null }
     if (lostPiece && askNo > asks && !ended) sayOwn(PART_LOST)
     // o0de2 round 4: a turn of his came after the answer he heard: what he says next is no longer right after it.
     answerEndAt = null
@@ -2308,6 +2334,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         guess.text = text
         guess.dropped = dropped
         guess.back = true
+        if (ahead && !silent && text.trim() && utt?.open && !utt.room && !utt.quiet && !utt.talkOver && utt.policy === 'plain' && utt.parts.every(p => p.done && !p.failed)) act({ t: 'prepare', text: textOf(utt.parts) + ' ' + text })
       }
       return
     }
@@ -2326,6 +2353,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       if (waited && !older) settle()
     } else {
       showWords(r.utt)
+      // Only computation may consume this text. decide/ask still wait for the whole utterance and all of its pieces.
+      if (ahead && !silent && r.utt.open && !r.utt.room && !r.utt.quiet && !r.utt.talkOver && r.utt.policy === 'plain' && r.utt.parts.every(p => p.done && !p.failed)) {
+        const partial = textOf(r.utt.parts)
+        if (partial) act({ t: 'prepare', text: partial })
+      }
       settle()
     }
   }
@@ -2751,6 +2783,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   }
   /** F-267 step 2 (o7be4): his Silent, Speak or Say it: what was said before it is only shown, never acted on, and a short sound's check goes. */
   function markQuiet() {
+    if (ahead) act({ t: 'prepare-cancel' })
     for (const u of utt ? [...sealed, utt] : sealed) u.quiet = true
     dropChecks()
   }
@@ -2790,7 +2823,18 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         if (seg.open) {
           seg.reset()
           dropGuess()
-          onSegmentEnd(null, 0)
+          if (ahead) {
+            // Mute abandons the unheard tail. Earlier pieces are NOT a complete
+            // command: discard them, including late recognition callbacks.
+            const abandoned = utt
+            utt = null
+            for (const [req, r] of reqs) if (r.kind === 'part' && r.utt === abandoned) {
+              reqs.delete(req)
+              act({ t: 'stt-abort', req })
+            }
+            act({ t: 'prepare-cancel' })
+            settle()
+          } else onSegmentEnd(null, 0)
         } else seg.reset()
         dirty = true
         return

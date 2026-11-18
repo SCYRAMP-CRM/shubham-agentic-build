@@ -178,6 +178,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/approvals\/devices\/remove$/, OWNER],
   ['POST', /^\/approvals\/devices\/unsigned$/, OWNER],
   ['GET', /^\/approvals\/log$/, OWNER],
+  // The floors' structural history (floor-events.ts): who made, removed, adopted, filled, moved or shared what. The owner's only; no ROUTES rule opens it.
+  ['GET', /^\/floor-events$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents$/, floor('manage')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
   // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).

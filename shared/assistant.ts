@@ -34,7 +34,7 @@ export function parseFrame(raw: unknown): FastServerFrame | null {
   const f = o as Record<string, unknown>
   switch (f.t) {
     case 'state':
-      return STATES.includes(f.state) ? { t: 'state', state: f.state as FastState, reason: str(f.reason) ? f.reason : undefined, model: f.model === 'haiku' || f.model === 'sonnet' ? f.model : undefined, ...(f.holds === true ? { holds: true } : {}) } : null
+      return STATES.includes(f.state) ? { t: 'state', state: f.state as FastState, reason: str(f.reason) ? f.reason : undefined, model: f.model === 'haiku' || f.model === 'sonnet' ? f.model : undefined, ...(f.holds === true ? { holds: true } : {}), ...(f.previews === true ? { previews: true } : {}) } : null
     case 'delta':
       return str(f.id) && str(f.text) ? { t: 'delta', id: f.id, text: f.text } : null
     case 'flush':

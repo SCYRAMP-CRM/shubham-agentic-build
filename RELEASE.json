@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.18-1035",
-  "commit": "434628e",
+  "version": "2026.11.18-1726",
+  "commit": "42d6a3f",
   "dirty": false,
-  "builtAt": "2026-11-18T05:05:22.689Z",
-  "devHash": "56a87ed0f150a9faebf4",
+  "builtAt": "2026-11-18T11:56:12.575Z",
+  "devHash": "7fecb41277ee660621e8",
   "chatHost": {
     "protocol": 1,
     "version": 1
@@ -13,9 +13,9 @@
     "by": {
       "kind": "lead",
       "id": "local-machine",
-      "name": "Lead (Shubham_server)"
+      "name": "Lead (local machine)"
     },
-    "at": "2026-11-18T04:57:44.179Z"
+    "at": "2026-11-18T11:48:07.390Z"
   },
   "crmFsSha256": "29c80cc8580d598691f6dd347f3986bf43467a8cec33ec2049eb86534c018ba1",
   "source": "shubham-agentic-dev"

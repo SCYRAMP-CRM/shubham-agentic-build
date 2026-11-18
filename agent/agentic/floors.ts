@@ -27,6 +27,7 @@ import { executionHttpError, executionIntentId, requireHttpExecutionSnapshot } f
 import { executionIdentityOf, requireLegacyExecution } from './runtime-engine.ts'
 import { validatePreparedConversation } from './prepared-conversation.ts'
 import type { ExecutionCommitStamp } from './execution-intents.ts'
+import type { FloorEventInput } from './floor-events.ts'
 
 // F-018: floors and their agents (agentic-claude-manager server/lib/floors.js), kept in
 // <state>/agent/agentic/floors.json. A floor starts with its boss seated; the page owns the
@@ -217,8 +218,8 @@ export interface FloorStore {
   create(name?: string, as?: ChatOwner | null): Floor
   /** `as` (F-118): who edits the chart; agents they add are theirs. */
   patch(id: string, patch: FloorPatch, as?: ChatOwner | null): Floor
-  /** F-118: replaces who a chat is shared with (the owner's or an admin's call; the caller checks). */
-  setShare(floorId: string, agentId: string, list: ChatShare[]): Floor
+  /** F-118: replaces who a chat is shared with (the owner's or an admin's call; the caller checks). `as`: who changed it (the floor-events line). */
+  setShare(floorId: string, agentId: string, list: ChatShare[], as?: ChatOwner | null): Floor
   /** F-118: the one-time move: every floor and agent without an owner becomes `owner`'s. How many. */
   assignUnowned(owner: ChatOwner): number
   /**
@@ -232,15 +233,21 @@ export interface FloorStore {
    * put right, and the member keeps its own copy as it was. Adoption can then never MINT a floor-holder (it does not stop the Agents row doing so directly).
    */
   adopt(raw: unknown, from: { id: string; name: string }): { floor: Floor; created: boolean; renamedFrom: string | null; restamped?: AdoptRestamped }
-  remove(id: string): Floor | null
+  /**
+   * `as`: who removed it (the floor-events line, which also keeps who made the floor and how many agents it held). `handedTo`: this is not a removal but a member
+   * PC dropping its OWN copy of a floor the Server has taken in (F-127): the line says "handed over, held by that PC", never "removed", so it cannot be read as
+   * the floor having been destroyed.
+   */
+  remove(id: string, as?: ChatOwner | null, handedTo?: { id: string; name: string }): Floor | null
   reorder(order: string[]): Floor[]
   /**
    * F-033: an agent moved, keeping its chat: before `before` (another agent there; last when
    * left out) on its own floor, or onto another floor (under that floor's boss; its own floor's
    * chart repaired, a new boss when it was the boss).
    */
-  moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null): { from: Floor; to: Floor }
-  addAgent(floorId: string, req: NewAgent, as?: ChatOwner | null): { floor: Floor; agent: FloorAgent }
+  moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null, as?: ChatOwner | null): { from: Floor; to: Floor }
+  /** `via`: when a chat's own tool adds the agent, the first 8 characters of that chat's session id (the floor-events line names the chat that acted). */
+  addAgent(floorId: string, req: NewAgent, as?: ChatOwner | null, via?: string): { floor: Floor; agent: FloorAgent }
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
   /** F-134: the Codex conversation id of an agent's chat (null: none yet). Only the agent calls this, never a page. */
@@ -249,7 +256,7 @@ export interface FloorStore {
   /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
   setHome(floorId: string, agentId: string, home: { id: string; name: string } | null): Floor
   /** F-162 slice B: sets a person's own Assistant's duty ('person-assistant') on its boss. Only own-assistant.ts calls this, never a page. */
-  setPersonAssistantDuty(floorId: string, agentId: string): Floor
+  setPersonAssistantDuty(floorId: string, agentId: string, as?: ChatOwner | null): Floor
   /** The floor and agent a chat belongs to: how a tool call knows who is calling. */
   bySession(sessionId: string): { floor: Floor; agent: FloorAgent } | null
   /**
@@ -321,6 +328,11 @@ export interface FloorStoreOptions {
    * local store, a test) takes a floor whole; the hub always passes it.
    */
   adoptTrust?: () => { owner: ChatOwner; admins: readonly string[]; allowed?: (personId: string) => boolean }
+  /**
+   * The floors' structural history (floor-events.ts): told AFTER each change has been made and written (a floor made, removed or adopted, an agent added,
+   * dropped or moved, a share changed, an Assistant made), once per change, never before it and never able to fail it. Names and ids only, no content.
+   */
+  events?: (e: FloorEventInput) => void
   /** Absent in production in this phase: real storage, ACL/source fences and target proof are not wired. */
   executionAuthority?: FloorExecutionAuthority
   /** Check the other canonical stores before persisting a discovered native binding. */
@@ -389,6 +401,12 @@ export function assertCodexThreadAvailable(rows: Floor[], floorId: string, agent
 export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
   const defaultEngine = () => opts.defaultEngine?.() ?? ''
   const executionDefaults = () => opts.executionDefaults?.() ?? { engine: defaultEngine() }
+  // The floors' structural history (floor-events.ts). Told after a change is made and written; a sink that throws never undoes or fails the change.
+  const actorOf = (o: ChatOwner | null | undefined) => (o ? { id: o.id, name: o.name || o.username } : null)
+  const refOf = (x: { id: string; name: string }) => ({ id: x.id, name: x.name })
+  const report = (e: FloorEventInput): void => {
+    try { opts.events?.(e) } catch { /* the change has been made */ }
+  }
   const quarantined = new Set<string>(), quarantinedSessions = new Set<string>()
   let privateCommits: PrivateExecutionCommit[] = [], metadataUnsupported = false, writeUncertain = false
   /** Order o7e6d S1 (H1): what load() found (loadStatus reports it; nothing reads it to decide anything here). Set before load() runs. */
@@ -571,6 +589,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       }
       floors = [floor, ...floors]
       save()
+      report({ kind: 'floor-created', by: actorOf(as), floor: refOf(floor), agents: floor.agents.length })
       return clone(floor)
     },
 
@@ -579,6 +598,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (['executionPrivate', 'stamp', 'fingerprint', 'scopeDigest'].some(k => Object.hasOwn(p, k))) throw executionHttpError('execution-invalid', 'selection')
       // Stage the entire chart: a failure in any conversion must not mutate another binding or field.
       const floor = clone(find(id))
+      const priorAgents = floor.agents.map(refOf)
       if (floor.workspace === 'pc-control') {
         if (!opts.pcControl || Object.keys(p).some(k => !['agents','confirmNewConversation','expectedConversation'].includes(k)) || !Array.isArray(p.agents) || p.agents.length !== 2 || p.agents.some((raw, i) => {
           if (!isObject(raw) || raw.id !== floor.agents[i]?.id || !['claude','codex'].includes(String(raw.engine))) return true
@@ -721,10 +741,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       const previousFloors = floors
       floors = floors.map(f => f.id === floor.id ? floor : f)
       try { save() } catch (error) { floors = previousFloors; throw error }
+      // Only a chart that changes WHICH agents are on the floor is a structural change (a rename or an edited field is not).
+      const added = floor.agents.filter(a => !priorAgents.some(p => p.id === a.id)).map(refOf)
+      const removed = priorAgents.filter(p => !floor.agents.some(a => a.id === p.id))
+      if (added.length || removed.length) report({ kind: 'agents-changed', by: actorOf(as), floor: refOf(floor), added, removed, agents: floor.agents.length })
       return clone(floor)
     },
 
-    remove(id) {
+    remove(id, as, handedTo) {
       assertWritable()
       const f = floors.find(x => x.id === id)
       if (!f) return null
@@ -732,6 +756,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (f.agents.some(a => a.executionProfile === 'codex-in-claude-v1')) throw executionHttpError('execution-capability-required', 'selection')
       floors = floors.filter(x => x !== f)
       save()
+      // A removed floor leaves nothing else behind, so this line keeps who made it, when, and how many agents it held. A floor a member PC hands over to the
+      // Server (it drops its own copy once the Server holds it) is told as that, not as a removal.
+      if (handedTo) report({ kind: 'floor-handed-over', by: null, heldBy: { id: handedTo.id, name: handedTo.name.slice(0, NAME_MAX) }, floor: refOf(f), agents: f.agents.length })
+      else report({ kind: 'floor-removed', by: actorOf(as), floor: refOf(f), agents: f.agents.length, madeBy: actorOf(f.createdBy), madeAt: f.createdAt })
       return clone(f)
     },
 
@@ -744,7 +772,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       return clone(floors)
     },
 
-    moveAgent(fromFloorId, agentId, toFloorId, before) {
+    moveAgent(fromFloorId, agentId, toFloorId, before, as) {
       assertWritable()
       const from = find(fromFloorId)
       const to = find(toFloorId)
@@ -774,10 +802,12 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       to.agents = repairAgents(to.agents)
       to.updatedAt = now()
       save()
+      // A move within one floor is a reorder: neither floor's agents change, so it is not a structural change.
+      if (to !== from) report({ kind: 'agent-moved', by: actorOf(as), floor: refOf(from), to: refOf(to), agent: refOf(agent), agents: to.agents.length })
       return { from: clone(from), to: clone(to) }
     },
 
-    addAgent(floorId, req, as) {
+    addAgent(floorId, req, as, via) {
       assertWritable()
       if (['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(req, k))) throw executionHttpError('execution-capability-required', 'selection')
       const floor = find(floorId)
@@ -828,10 +858,11 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       floor.agents = repairAgents([...floor.agents, agent])
       floor.updatedAt = now()
       save()
+      report({ kind: 'agent-added', by: actorOf(as), ...(via ? { chat: via } : {}), floor: refOf(floor), agent: refOf(agent), agents: floor.agents.length })
       return { floor: clone(floor), agent: clone(agent) }
     },
 
-    setShare(floorId, agentId, list) {
+    setShare(floorId, agentId, list, as) {
       assertWritable()
       const floor = find(floorId)
       if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control sharing is managed by the server.'), { code: 'pc-control-immutable' })
@@ -839,6 +870,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       agent.sharedWith = shareList(list).filter(x => x.id !== agent.owner?.id)
       floor.updatedAt = now()
       save()
+      report({ kind: 'share-changed', by: actorOf(as), floor: refOf(floor), agent: refOf(agent), sharedWith: (agent.sharedWith ?? []).map(s => ({ id: s.id, can: s.can })) })
       return clone(floor)
     },
 
@@ -896,6 +928,18 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       f.updatedAt = now()
       floors = [f, ...floors]
       save()
+      // `madeBy` is who the floor says made it AFTER the trust check (a maker the hub does not list is already the hub's owner here); `restamped` says how many
+      // people were put back or dropped on the way in (absent: this store does not check, so nothing was).
+      report({
+        kind: 'floor-adopted',
+        by: null,
+        pc: { id: from.id, name: from.name.slice(0, NAME_MAX) },
+        floor: refOf(f),
+        agents: f.agents.length,
+        madeBy: actorOf(f.createdBy),
+        madeAt: f.createdAt,
+        ...(trust ? { restamped: { ...restamped } } : {}),
+      })
       return { floor: clone(f), created: true, renamedFrom, ...(trust ? { restamped } : {}) }
     },
 
@@ -914,7 +958,12 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           }
         }
       }
-      if (n) save()
+      if (n) {
+        save()
+        // The Server's own start-up migration: nobody did this, so the line names NOBODY. `owner` is who RECEIVED the rows, not who acted: naming them would tell that person
+        // they did something they did not do (Agent 6's review, 18 Nov; pinned by the store test, which says why).
+        report({ kind: 'owners-assigned', by: null, count: n })
+      }
       return n
     },
 
@@ -986,7 +1035,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       return clone(find(floorId))
     },
 
-    setPersonAssistantDuty(floorId, agentId) {
+    setPersonAssistantDuty(floorId, agentId, as) {
       assertWritable()
       const floor = find(floorId)
       const agent = agentOf(floor, agentId)
@@ -995,6 +1044,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       agent.duty = 'person-assistant'
       floor.updatedAt = now()
       save()
+      report({ kind: 'assistant-made', by: actorOf(as), floor: refOf(floor), agent: refOf(agent) })
       return clone(floor)
     },
 

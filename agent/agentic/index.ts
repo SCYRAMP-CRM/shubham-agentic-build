@@ -99,6 +99,7 @@ import { createChatLog, describeEvents } from './chat-log.ts'
 import { createVoice, type AskView } from './voice.ts'
 import { spawn, spawnSync } from 'node:child_process'
 import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
+import { createFastPreview, QUICK_PREVIEW_FAULT } from './fast-preview.ts'
 import { createQuickHistory, quickHistoryFile, quickSessionId } from './quick-history.ts'
 import { assistantsForPerson, keepsAssistantHistory, readAssistantHistory, requireSavedAssistant } from './assistant-history.ts'
 import { createAssistantNativeHistory, type AssistantNativeBinding } from './assistant-native-history.ts'
@@ -123,6 +124,7 @@ import { OLD_SOCKET } from '../../shared/old-route.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
+import { createFloorEventLog, describeFloorEvent, type FloorEvent, type FloorEventInput } from './floor-events.ts'
 import type { Elevation } from './approval-recovery.ts'
 import { createAutoUpdate } from './auto-update.ts'
 import { withRun, type QuietView } from '../update/coordinator.ts'
@@ -966,11 +968,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
       executionService.authority.persist(file, text)
     },
   }
+  // The floors' structural history (floor-events.ts): ONE append-only line per change, written by the STORE itself, so every entry point (a page, a chat's own
+  // tool, a member's adoption, the own-Assistant path) is covered. Like an approval's record it is written AFTER the change, and a write that fails is never
+  // silent: the change stands, the line that could not be written is kept here (newest first, 50), said in the log, told to the owner once in the heartbeat and
+  // shown by GET /floor-events, so it can be written up by hand. Since this run only. The log's own file is this PC's: a member keeps one for its own floors.
+  const floorEventLog = createFloorEventLog(path.join(o.dir, 'floor-events.jsonl'))
+  const unrecordedFloorEvents: FloorEvent[] = []
+  let unrecordedFloorEventCount = 0, unrecordedFloorEventTold = 0
+  function recordFloorEvent(e: FloorEventInput) {
+    try {
+      floorEventLog.add(e)
+    } catch (err) {
+      unrecordedFloorEvents.unshift({ at: new Date().toISOString(), ...e })
+      unrecordedFloorEvents.splice(50)
+      unrecordedFloorEventCount++
+      log?.error(`floor events: a change could not be recorded (${message(err)}): ${describeFloorEvent(e)}`)
+    }
+  }
   const hubFloors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t),
+  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t), events: recordFloorEvent,
     // F-127: a member's floor arrives whole (its chats, their content), but only the people this hub already lists keep their place in it (floors.ts adopt): an
     // administrator, someone Settings › Access lets use Agents, or someone already on one of its floors. Always on: with no sign-in wired (a test) nobody can be
     // verified, so nobody is `allowed` and only the owner and the people already on its floors keep a place; a lapsed session changes none of these inputs.
@@ -984,7 +1003,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // the hub's and a PC alone's is the usual one.
   const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
     if (mode() === 'member') emitFloors()
-  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
+  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t), events: recordFloorEvent })
   const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
   const controlFloors = createPcControlStore(path.join(o.dir, 'pc-control.json'), () => { emitFloors(); if (mode() !== 'member') pushState() }, { switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
@@ -1015,17 +1034,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     validatePatch: (id, p, as) => storeFor(id).validatePatch(id, p, as),
     setOpenCodeSession: (f, a, n) => storeFor(f).setOpenCodeSession(f, a, n),
     patch: (id, p, as) => storeFor(id).patch(id, p, as),
-    setShare: (f, a, l) => storeFor(f).setShare(f, a, l),
+    setShare: (f, a, l, as) => storeFor(f).setShare(f, a, l, as),
     assignUnowned: owner => pickFloors().assignUnowned(owner),
     adopt: (raw, from) => hubFloors.adopt(raw, from),
-    remove: id => storeFor(id).remove(id),
+    remove: (id, as, handedTo) => storeFor(id).remove(id, as, handedTo),
     reorder: order => pickFloors().reorder(order),
-    moveAgent: (from, agent, to, before) => storeFor(from).moveAgent(from, agent, to, before),
-    addAgent: (f, req, as) => storeFor(f).addAgent(f, req, as),
+    moveAgent: (from, agent, to, before, as) => storeFor(from).moveAgent(from, agent, to, before, as),
+    addAgent: (f, req, as, via) => storeFor(f).addAgent(f, req, as, via),
     bindSession: (f, a, s) => storeFor(f).bindSession(f, a, s),
     setCodexThread: (f, a, t) => storeFor(f).setCodexThread(f, a, t),
     setHome: (f, a, h) => storeFor(f).setHome(f, a, h),
-    setPersonAssistantDuty: (f, a) => storeFor(f).setPersonAssistantDuty(f, a),
+    setPersonAssistantDuty: (f, a, as) => storeFor(f).setPersonAssistantDuty(f, a, as),
     bySession: sid => bySession(sid),
     // Order o7e6d S1 (H1): the main store's load facts (this PC's own floors); the PC Control store's are read where they are needed.
     loadStatus: () => pickFloors().loadStatus(),
@@ -1085,7 +1104,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // orders o0e2a, oc2db: the Accounts page's Codebases tab: its list (the codebases with their detail rows and platform accounts) and the one-way copy from the CRM (no secret is copied: flags and counts only).
   const accountsCodebases = createAccountsCodebases({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // Order ocf00: the Codebases modal's tabs (BE, FE, Deployment, Database and Environment variables), the same database and the owner's rows only.
-  const codebaseTabs = createCodebaseTabs({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  const codebaseTabs = createCodebaseTabs({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen, pcName: () => self().name })
   // order o4029: the platform accounts for the Accounts page's "Accounts" tab (the CRM's Code > Accounts page), read from the same database. The copy above brings them in with the codebases.
   const accountsPlatforms = createAccountsPlatforms({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   const codebaseImport = createCodebaseImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
@@ -3252,7 +3271,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!same) throw new Error(`the Server lists floor "${f.name}" differently from this PC`)
       }
       writeAtomic(path.join(o.dir, `floors-local.adopted-${new Date().toISOString().replace(/[:.]/g, '-')}.json`), `${json({ at: new Date().toISOString(), to: link.name, floors: all })}\n`)
-      for (const f of all) localFloors.remove(f.id)
+      // Its own copy goes now the Server holds the floor: told on this PC's record as a HANDING OVER (not a removal: the floor is alive on the Server).
+      for (const f of all) localFloors.remove(f.id, null, { id: link.id, name: link.name })
       log?.info(`F-127: ${all.length} floors made here while the Server was away joined ${link.name}'s list (${checked} conversations checked)`)
       setAdopt({ state: 'done', floors: all.length, joined: all.length, sessions: checked, why: null })
       emitFloors()
@@ -4534,6 +4554,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         lines.push(`${fresh.length} answer${fresh.length === 1 ? ' was' : 's were'} given but NOT written to the approvals record (the file could not be written): ${fresh.map(e => `${e.by} answered prompt ${e.promptId ?? '?'} in ${e.agent} on ${e.floor}: ${e.choice ?? e.detail}`).join('; ')}.`)
         unrecordedTold = unrecordedCount
       }
+      // The floors' structural history: a change whose line could not be written is told once, with who did what (floor-events.ts).
+      if (unrecordedFloorEventCount > unrecordedFloorEventTold) {
+        const fresh = unrecordedFloorEvents.slice(0, Math.min(unrecordedFloorEventCount - unrecordedFloorEventTold, unrecordedFloorEvents.length))
+        lines.push(`${fresh.length} floor change${fresh.length === 1 ? ' was' : 's were'} made but NOT written to the floors' record (the file could not be written): ${fresh.map(e => describeFloorEvent(e)).join('; ')}.`)
+        unrecordedFloorEventTold = unrecordedFloorEventCount
+      }
       if (prepared.size) lines.push(`${prepared.size} card${prepared.size === 1 ? ' is' : 's are'} prepared for you in the Send tab.`)
       const replies = orders.list().filter(x => x.pending).length
       if (replies) lines.push(`${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.`)
@@ -4919,46 +4945,76 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const fastOn = o.fastAssistant ?? (process.env.SAD_FAST_ASSISTANT === '1' || existsSync(path.join(o.dir, '..', 'fast-assistant.on')))
   // Order of130: the subscription key of the credential the Assistant's headless process was STARTED with (set in env() below, from the same read of the credential), under which its turns' cost is filed.
   let fastSubKey = ''
-  const fastHost: FastHost | undefined =
-    fastOn && mode() !== 'member'
-      ? createFastHost({
-          now: Date.now,
-          spawn: (file, args, so) => spawn(file, args, { cwd: so.cwd, env: so.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }),
-          claude: () => {
-            const c = o.claude ?? findClaude()
-            if (!c) return null
-            return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
-          },
-          env: () => {
-            const cred = o.credential?.() ?? null
-            fastSubKey = usageSubFor(cred)
-            return librarianEnv(process.env, o.token?.() ?? null, cred)
-          },
-          dir: path.join(o.dir, 'fast'),
-          history: quickHistory,
-          toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
-          shim,
-          node: process.execPath,
-          tools: () => FAST_TOOLS.map(t => `mcp__${MCP_SERVER_NAME}__${t.name}`),
-          brief: ctx => buildBrief(fastBriefContext(ctx), namesFor(fastNames)),
-          names: () => fastNames,
-          toolLabel: name => FAST_LABELS[name] ?? 'One moment',
-          onState: st => fastSession?.hostState(st),
-          keepRunning: () => quickSettings.get().keepRunning,
-          // Order ofedf (usage): the turn's running cost, filed under the one person whose Assistant is open (agent/usage; totals only, no text).
-          onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: fastSubKey }),
-          context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
-          memory: readMemory,
-          kill: async (pid, startedAt) => {
-            await killTree(pid, { since: startedAt })
-          },
-          log: o.log?.child('fast'),
-          ...o.fastHostDeps,
-        })
-      : undefined
+  // Disabled/member Quick must not evaluate host dependencies. Cache and freeze
+  // the first permitted construction; previews still spread a fresh host object.
+  let builtFastDeps: FastDeps | undefined
+  const fastDeps = (): FastDeps => builtFastDeps ??= Object.freeze<FastDeps>({
+    now: Date.now,
+    spawn: (file, args, so) => spawn(file, args, { cwd: so.cwd, env: so.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }),
+    claude: () => {
+      const c = o.claude ?? findClaude()
+      if (!c) return null
+      return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
+    },
+    env: () => {
+      const cred = o.credential?.() ?? null
+      fastSubKey = usageSubFor(cred)
+      return librarianEnv(process.env, o.token?.() ?? null, cred)
+    },
+    dir: path.join(o.dir, 'fast'),
+    history: quickHistory,
+    toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
+    shim,
+    node: process.execPath,
+    tools: () => FAST_TOOLS.map(t => `mcp__${MCP_SERVER_NAME}__${t.name}`),
+    brief: ctx => buildBrief(fastBriefContext(ctx), namesFor(fastNames)),
+    names: () => fastNames,
+    toolLabel: name => FAST_LABELS[name] ?? 'One moment',
+    onState: st => fastSession?.hostState(st),
+    keepRunning: () => quickSettings.get().keepRunning,
+    // Order ofedf (usage): the turn's running cost, filed under the one person whose Assistant is open (agent/usage; totals only, no text).
+    onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: fastSubKey }),
+    context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
+    memory: readMemory,
+    kill: async (pid, startedAt) => {
+      await killTree(pid, { since: startedAt })
+    },
+    log: o.log?.child?.('fast') ?? o.log,
+    ...o.fastHostDeps,
+  })
+  const fastHost: FastHost | undefined = fastOn && mode() !== 'member' ? createFastHost(fastDeps()) : undefined
+  // No process until V2 supplies a bounded partial. The factory is single-use;
+  // neither its status nor its (absent) tool key joins the normal Quick host.
+  const fastPreview = fastHost ? createFastPreview({
+    now: Date.now,
+    onFault: () => o.log?.warn(QUICK_PREVIEW_FAULT),
+    context: () => `${fastNames}:${fastHost.contextVersion?.() ?? 0}`,
+    createHost: model => {
+      // Each disposable process captures its own credential once. A preview must
+      // never relabel the still-running warm host's later usage (order of130).
+      let previewSubKey = ''
+      return createFastHost({
+        ...fastDeps(),
+        preview: true,
+        model,
+        env: () => {
+          const cred = o.credential?.() ?? null
+          previewSubKey = usageSubFor(cred)
+          return librarianEnv(process.env, o.token?.() ?? null, cred)
+        },
+        dir: path.join(o.dir, 'fast-preview'),
+        history: undefined,
+        onState: undefined,
+        log: undefined,
+        keepRunning: () => false,
+        // Same existing usage path; numeric totals only, including discarded drafts.
+        onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: previewSubKey }),
+      })
+    },
+  }) : undefined
   // F-086/F-087: the session around the host (owners, the two sockets, hand-off routing); null host = the Assistant is off and its sockets are refused.
   // F-221 (ob98a): with the talk cards, so it can hold hand-offs (a connection's cards go with it).
-  fastSession = createFastSession({ host: fastHost ?? null, snapshot: fastSnapshot, names: () => namesFor(fastNames), log: o.log?.child?.('fast') ?? o.log, cards: talkCards })
+  fastSession = createFastSession({ host: fastHost ?? null, snapshot: fastSnapshot, names: () => namesFor(fastNames), log: o.log?.child?.('fast') ?? o.log, cards: talkCards, preview: fastPreview })
   handoff.listen({
     onReturn: async (order, reply) => {
       // The reply arrives as '[reply from <name> on <floor> to order <id>] <answer>': the answer is what is shown and told.
@@ -5059,6 +5115,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     void oldHost?.tick()
     // F-221 (ob98a): cards past their 10 minutes go. (The spoken latch has no clock: its orders decide.)
     talkCards.sweep()
+    // V2 is optional. Contain ONLY its call, after all existing V1 housekeeping:
+    // a future preview fault must neither skip card expiry nor shut down the app.
+    try { fastPreview?.tick() } catch { /* The coordinator also fails closed at every entry. */ }
   }, 1000)
   voiceTimer.unref?.()
 
@@ -5956,7 +6015,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           reportsTo: typeof args.reportsTo === 'string' && args.reportsTo.trim() ? args.reportsTo : agent.id,
           model: model as AgentModel | undefined,
           effort: effort as AgentEffort | undefined,
-        }, access.ownerOf(me))
+        }, access.ownerOf(me), agent.sessionId?.slice(0, 8))
         log?.info(`${agent.name} hired ${hired.name} on ${floor.name}`)
         return json({ hired: hired.name, role: hired.role, effort: hired.effort || 'inherit', total: after.agents.length, note: 'No chat is started yet; the human opens it from the floor.' })
       }
@@ -6057,7 +6116,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         throw authError(403, 'Only the owner of this app lets someone type in a chat. You can share it to view.', 'admin-only')
       }
     }
-    const floor = floors.setShare(floorId, agentId, list)
+    const floor = floors.setShare(floorId, agentId, list, access.ownerOf(caller))
     log?.info(`chat ${(agentOf(floor, agentId).sessionId ?? '-').slice(0, 8)} is shared with ${list.map(x => `${x.username || x.id.slice(0, 8)} (${x.can})`).join(', ') || 'nobody'}`)
     return { agent: agentOf(floor, agentId) }
   }
@@ -7573,7 +7632,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // default engine (Codex, OpenCode). Not an administrator's own (it is an owner's chat and follows the defaults as every other does). Only a
         // new one: an existing Assistant's record is never switched (an incompatible one is refused when it opens, before any seal).
         if (!access.isAdmin(c)) floors.patch(made.id, { agents: made.agents.map(a => (a.id === boss.id ? { ...a, engine: 'claude' as const } : a)) }, access.ownerOf(c))
-        return { floor: floors.setPersonAssistantDuty(made.id, boss.id).id, created: true }
+        return { floor: floors.setPersonAssistantDuty(made.id, boss.id, access.ownerOf(c)).id, created: true }
       },
     ],
     [
@@ -7679,13 +7738,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/approvals\/devices\/unsigned$/, () => retiredApprovalDevices()],
     // o66aa / o7e97: with the answers given whose record could not be written (who, which prompt, what they chose), since this run.
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecorded.length ? { unrecorded } : {}) })],
+    // The floors' structural history (floor-events.ts): newest first, with the changes whose line could not be written since this run started. The owner's only
+    // (POLICY; no ROUTES rule opens it to anyone else).
+    ['GET', /^\/floor-events$/, (_, r) => ({ events: floorEventLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecordedFloorEvents.length ? { unrecorded: unrecordedFloorEvents } : {}) })],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
-      ([id]) => {
+      ([id], r) => {
         const f = floorOf(id)
         for (const a of f.agents) if (a.sessionId) stopAnywhere(a.sessionId)
-        floors.remove(id)
+        floors.remove(id, access.ownerOf(callerOf(r)))
         memory.drop(id)
         return { ok: true }
       },
@@ -7710,7 +7772,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const to = typeof b.floorId === 'string' && b.floorId ? b.floorId : id
         // R1b: onto another floor changes BOTH floors' agent lists (a same-floor reorder changes neither, so it is not guarded).
         if (to !== id) { const c = callerOf(r); refuseAssistantFloorChange(c, floorOf(id)); refuseAssistantFloorChange(c, floorOf(to)) }
-        return floors.moveAgent(id, agentId, to, typeof b.before === 'string' ? b.before : null)
+        return floors.moveAgent(id, agentId, to, typeof b.before === 'string' ? b.before : null, access.ownerOf(callerOf(r)))
       },
     ],
     [
@@ -7872,11 +7934,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // order o57e2, o4d14: the email accounts for the Accounts page's Email tab, from the new Supabase project: address, note, switched off, where used. Never a password. The owner's (POLICY).
     ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id), 'local'],
     // Order ofd53: the email edit modal. The owner's only (POLICY); the database's rules check the owner again (accounts-email-write.ts).
-    ['POST', /^\/accounts\/email$/, (_, r) => accountsEmailWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
-    ['PUT', /^\/accounts\/email\/([^/]+)$/, ([id], r) => accountsEmailWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['DELETE', /^\/accounts\/email\/([^/]+)$/, ([id], r) => accountsEmailWrite.remove(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/email$/, (_, r) => (humanOnly(r), accountsEmailWrite.create(access.ownerOf(callerOf(r)).id, r.body)), 'local'],
+    ['PUT', /^\/accounts\/email\/([^/]+)$/, ([id], r) => (humanOnly(r), accountsEmailWrite.update(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
+    ['DELETE', /^\/accounts\/email\/([^/]+)$/, ([id], r) => (humanOnly(r), accountsEmailWrite.remove(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Order o8ebe: the password reveal (owner only; logged by the agent, never the password).
-    ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, ([id], r) => accountsEmailWrite.reveal(access.ownerOf(callerOf(r)).id, id), 'local'],
+    // SLICE S (18 Nov): every email route that writes or returns a sealed password goes through humanOnly: "owner" says WHOSE data, not WHICH CALLER. A program holding only the app's token is a machine, a machine is an
+    // administrator, and the owner of what a person-less caller makes is sbskrrt, so without humanOnly any process that could read the token was the owner. accounts-human-only.test.ts pins every such route.
+    ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), accountsEmailWrite.reveal(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Accounts edit slice: the platform accounts (owner only; soft delete).
     // Add account (order oc35dc): a platform account made in the app, with its codebases (the owner's only; nothing is written to the CRM).
     ['POST', /^\/accounts\/platforms$/, (_, r) => accountsPlatformWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
@@ -7890,7 +7954,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/accounts\/databases$/, (_, r) => accountsDatabases.list(access.ownerOf(callerOf(r)).id), 'local'],
     ['POST', /^\/accounts\/databases\/([^/]+)\/ping$/, ([key], r) => accountsDatabases.ping(access.ownerOf(callerOf(r)).id, key), 'local'],
     // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
-    ['POST', /^\/accounts\/email\/import$/, (_, r) => accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
+    ['POST', /^\/accounts\/email\/import$/, (_, r) => (humanOnly(r), accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).
     // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; no password, only that one is stored. The owner's (POLICY).
     ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id), 'local'],
@@ -9216,6 +9280,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       voice.close()
       fastSession?.close()
       const fastStopped = fastHost?.stop('the app is stopping')
+      const previewStopped = fastPreview?.stop()
       stopOldReader('the app is stopping')
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
@@ -9223,7 +9288,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       clearInterval(voiceTimer)
       events.clear()
       // o13d4: settles once the last writes into the state folder are done; never rejects (a failed close was never thrown before either).
-      return Promise.allSettled([crmClosed, fastStopped, convClosed, browserClosed]).then(() => undefined)
+      return Promise.allSettled([crmClosed, fastStopped, previewStopped, convClosed, browserClosed]).then(() => undefined)
     },
   }
 }

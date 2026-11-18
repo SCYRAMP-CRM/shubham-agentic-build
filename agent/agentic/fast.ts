@@ -1,6 +1,7 @@
 import { MAX_ASKS_PER_MIN, orderTurn, parseClientFrame, type CardGoneReason, type FastModel, type FastServerFrame, type FastState, type HandoffPhase } from '../../shared/fast.ts'
 import { namesFor, type Names } from '../../shared/fast-names.ts'
 import type { WsSocket } from '../api.ts'
+import type { FastPreview } from './fast-preview.ts'
 
 // F-086/F-087: the fast Assistant's session: who owns it, the two sockets (the page's and Chris's), the turn frames out, and the way a request handed
 // to the Orchestrator finds its way back to where it was asked. The warm process itself is the host's (Connection: fast-host.ts); this talks to it
@@ -28,7 +29,7 @@ export type HostResult = { ok: true } | { ok: false; reason: string }
 export interface FastHostLike {
   state(): HostState
   status(): HostStatus
-  ask(turn: { id: string; text: string; model: FastModel; snapshot?: string; heard?: string; spoken?: boolean }, emit: (e: HostEvent) => void): HostResult
+  ask(turn: { id: string; text: string; model: FastModel; snapshot?: string; heard?: string; spoken?: boolean; preparation?: string }, emit: (e: HostEvent) => void): HostResult
   interrupt(id?: string): void
   deliver(note: string, turnId: string, emit: (e: HostEvent) => void): HostResult
   /** Claims the process for a client (starts it when memory allows). */
@@ -37,6 +38,8 @@ export interface FastHostLike {
 }
 
 export interface FastDeps {
+  /** Optional V2 computation with no tools, writes to history, or outbound actions. */
+  preview?: FastPreview
   /** The host; null when the Assistant is off (then the sockets are refused: ws() returns null). */
   host: FastHostLike | null
   /** The live snapshot text for the next turn (fast-brief.ts buildSnapshot of what the hub knows). */
@@ -108,6 +111,10 @@ interface Conn {
   talk: boolean
   /** F-267 (order o088b): its last start said it is the Quick page (`page: 'quick'`); see Origin.page. */
   page: 'quick' | null
+  ahead: boolean
+  prepared: Set<string>
+  finals: Set<string>
+  previewAt: number
   /** F-221: the hub's own turns (o:<orderId>) told on this connection and not over yet: the only o: ids its cancel may name. */
   told: Set<string>
 }
@@ -176,8 +183,8 @@ export function createFastSession(deps: FastDeps): FastSession {
     }
   }
   const who = (c: Conn) => `${c.kind}:${c.clientId ?? '?'}`
-  /** F-221 (ob98a): every state frame says whether this hub can hold hand-offs as cards (the page offers live talk only then). */
-  const state = (s: FastState, more: { reason?: string; model?: FastModel } = {}): FastServerFrame => ({ t: 'state', state: s, ...more, ...(deps.cards ? { holds: true } : {}) })
+  /** F-221: cards are hub-wide. V2 preparation is advertised only to a connection that opted in, keeping V1's frames unchanged. */
+  const state = (c: Conn, s: FastState, more: { reason?: string; model?: FastModel } = {}): FastServerFrame => ({ t: 'state', state: s, ...more, ...(deps.cards ? { holds: true } : {}), ...(c.ahead && deps.preview ? { previews: true } : {}) })
   /** F-221: a connection's cards go (closed, taken over, its drop or stop); the store sends card-gone while the connection is still open. */
   const dropCards = (c: Conn, reason: CardGoneReason, card?: string) => {
     try {
@@ -189,13 +196,13 @@ export function createFastSession(deps: FastDeps): FastSession {
 
   function stateFor(c: Conn): FastServerFrame {
     const host = deps.host
-    if (!host) return state('off')
-    if (c.clientId && owner && owner !== c) return state('taken-over')
+    if (!host) return state(c, 'off')
+    if (c.clientId && owner && owner !== c) return state(c, 'taken-over')
     const st = host.status()
     // A switched-on host with no process yet ('off') is usable: the first start wakes it, which is what hello's fast.ready says too.
-    if (st.state === 'off') return state('ready', st.model ? { model: st.model } : {})
+    if (st.state === 'off') return state(c, 'ready', st.model ? { model: st.model } : {})
     const map: Record<HostState, FastState> = { off: 'off', starting: 'starting', ready: 'ready', paused: 'paused', unavailable: 'unavailable' }
-    return state(map[st.state] ?? 'unavailable', { ...(st.reason ? { reason: st.reason } : {}), ...(st.model ? { model: st.model } : {}) })
+    return state(c, map[st.state] ?? 'unavailable', { ...(st.reason ? { reason: st.reason } : {}), ...(st.model ? { model: st.model } : {}) })
   }
 
   /** Wake the process for this client (a cold start takes a moment); asks that come meanwhile wait on `c.opening`. */
@@ -209,6 +216,7 @@ export function createFastSession(deps: FastDeps): FastSession {
   }
 
   function release(c: Conn) {
+    deps.preview?.clear(c.id)
     if (owner !== c) return
     owner = null
     if (active?.conn === c) {
@@ -242,6 +250,10 @@ export function createFastSession(deps: FastDeps): FastSession {
       case 'start': {
         if (f.client !== c.kind) return send(c, { t: 'error', status: 400, message: `This socket is for the ${c.kind}; start says ${f.client}.` })
         c.clientId = f.id
+        deps.preview?.clear(c.id)
+        c.prepared.clear()
+        c.finals.clear()
+        c.ahead = c.kind === 'web' && f.page === 'quick' && f.talk === true && f.ahead === true
         // F-221 (odcd9, Lead's gate): each start says it again (a reconnect's too); a start without it turns it off.
         c.talk = f.talk === true
         // F-267 (order o088b): the Quick page says so in each start; a start without it turns it off. The client's word, so it only ever makes
@@ -260,7 +272,7 @@ export function createFastSession(deps: FastDeps): FastSession {
         if (owner && owner !== c) {
           const old = owner
           release(old)
-          send(old, state('taken-over'))
+          send(old, state(old, 'taken-over'))
           // F-221 (ob98a): cards follow ownership: the screen that lost the Assistant loses its cards (it is told card-gone, taken-over).
           dropCards(old, 'taken-over')
           deps.log?.info(`fast Assistant: ${who(c)} took it from ${who(old)}`)
@@ -277,20 +289,43 @@ export function createFastSession(deps: FastDeps): FastSession {
             // No process (memory is low, or it cannot start): the client is told, and sends its asks to the big chat.
             owner = null
             host.close(who(c))
-            return send(c, state('paused', { reason: opened.reason }))
+            return send(c, state(c, 'paused', { reason: opened.reason }))
           }
           send(c, stateFor(c))
         })()
         return
       }
+      case 'prepare': {
+        // These frames never become active, get an origin, call the normal host, or reach a tool/history.
+        if (owner !== c || !c.ahead || !deps.preview || c.prepared.has(f.id)) return
+        const at = now()
+        if (at - c.previewAt < 1500) return
+        c.previewAt = at
+        c.prepared.add(f.id)
+        while (c.prepared.size > 64) c.prepared.delete(c.prepared.values().next().value!)
+        deps.preview.prepare(c.id, f.id, f.text, f.thorough ? 'sonnet' : model)
+        return
+      }
+      case 'prepare-cancel':
+        deps.preview?.clear(c.id)
+        return
       case 'ask': {
         if (owner !== c) return send(c, { t: 'error', id: f.id, status: 409, message: owner ? 'Another screen has the Assistant now.' : 'Say start first.' })
+        if (c.ahead && c.finals.has(f.id)) return
         const t = now()
         c.asks = c.asks.filter(x => t - x < 60_000)
         if (c.asks.length >= MAX_ASKS_PER_MIN) return send(c, { t: 'error', id: f.id, status: 429, message: 'That is too many questions in a minute.' })
         const st = host.state()
         if (st === 'paused' || st === 'unavailable') return send(c, { t: 'error', id: f.id, status: 503, message: host.status().reason ?? 'The Assistant is not available right now.' })
         c.asks.push(t)
+        if (c.ahead) {
+          c.finals.add(f.id)
+          while (c.finals.size > 64) c.finals.delete(c.finals.values().next().value!)
+        }
+        // Seal before awaiting the process/snapshot. take never waits and exact text/model/connection must match.
+        const preparation = c.ahead && f.preparationId && c.prepared.has(f.preparationId)
+          ? deps.preview?.take(c.id, f.preparationId, f.text, f.thorough ? 'sonnet' : model) : undefined
+        deps.preview?.clear(c.id)
         // o0de2: one line for each ask taken, never its words: the log can tell "the page never asked" from "it asked and the process never
         // answered" (14 Nov's live talk left no line until a turn ended, so neither could be told).
         deps.log?.info(`fast Assistant: ask ${f.id} from ${who(c)} (${f.via}, ${f.text.length} characters${f.heard ? `, ${f.heard.length} heard` : ''})`)
@@ -331,7 +366,7 @@ export function createFastSession(deps: FastDeps): FastSession {
             if (owner === c) send(c, { t: 'done', id: entry.id, text: '', cancelled: true })
             return
           }
-          const asked = host.ask({ id: entry.id, text, model: sonnet ? 'sonnet' : model, ...(snap ? { snapshot: snap } : {}), ...(heard ? { heard } : {}), ...(spoken ? { spoken: true } : {}) }, forward(c, entry.id))
+          const asked = host.ask({ id: entry.id, text, model: sonnet ? 'sonnet' : model, ...(snap ? { snapshot: snap } : {}), ...(heard ? { heard } : {}), ...(spoken ? { spoken: true } : {}), ...(preparation ? { preparation } : {}) }, forward(c, entry.id))
           if (!asked.ok) {
             active = null
             send(c, { t: 'error', id: entry.id, status: 503, message: asked.reason })
@@ -343,6 +378,7 @@ export function createFastSession(deps: FastDeps): FastSession {
       }
       case 'cancel': {
         if (owner !== c) return
+        deps.preview?.clear(c.id)
         // F-221 (ob98a): barge-in on the hub's own turn that tells a hand-off's answer: only one told on this connection, and only while it runs.
         if (f.id.startsWith('o:')) {
           if (c.told.has(f.id)) host.interrupt(f.id)
@@ -357,7 +393,7 @@ export function createFastSession(deps: FastDeps): FastSession {
       case 'stop': {
         if (owner === c) {
           release(c)
-          send(c, state('stopped'))
+          send(c, state(c, 'stopped'))
         }
         // F-221: End (or a stop word) drops this connection's cards too, and (fix round 3) lets go of its hold, its client's too when it owns it.
         lowerHold(c)
@@ -380,7 +416,7 @@ export function createFastSession(deps: FastDeps): FastSession {
     socket(kind) {
       if (!deps.host) return null
       return ws => {
-        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, page: null, told: new Set() }
+        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, page: null, ahead: false, prepared: new Set(), finals: new Set(), previewAt: -Infinity, told: new Set() }
         conns.add(c)
         send(c, stateFor(c))
         ws.onText(raw => onFrame(c, raw))
@@ -426,6 +462,7 @@ export function createFastSession(deps: FastDeps): FastSession {
       const host = deps.host
       // The origin first; else whoever owns the Assistant now (a reconnect after a restart); else nobody.
       const c = o && !o.conn.closed && owner === o.conn ? o.conn : owner && !owner.closed ? owner : null
+      if (c) deps.preview?.clear(c.id)
       if (!c || !host || host.state() !== 'ready') return 'no-listener'
       origins.delete(orderId)
       send(c, { t: 'handoff-answer', orderId, text: reply, ...(cancelled ? { cancelled: true } : {}) })
