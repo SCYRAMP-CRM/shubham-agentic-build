@@ -14,6 +14,13 @@ import { MAX_TEXT, type CardGoneReason, type FastServerFrame, type HandoffPhase,
 // it said), its stop words and its early guess. Every number is in TALK, and talk.test.ts reads the classic's file to check each ported one.
 // New (his answers to the plan, order ob98a): Quick or the Assistant chat answers; Chris's fillers; on the PC or earbuds a voice of
 // 500 ms cuts the answer off. Spoken words never confirm anything: there is no action for that here (a card is sent only by his tap).
+// F-267 step 2 (orders o088b, o7be4), the Quick page only (TalkOptions.quickPage): Silent (it hears and shows, says nothing, asks nothing but a
+// wake), its command words ("Quick, stop", "Quick, speak", "Quick, continue", "Hey Quick ..."; quickCommandOf), his Silent, Speak and Say it
+// (user acts), and the answer kept for him while Silent. No new action and no new event: a few optional fields (stt room, tone wake, the view's
+// silent, waiting and stuck, a 'room' line). Lead's ruling (fail closed), F-267 step 2, to his order o790b (PLAN.md B8: "then when i say stop
+// it continues listening but doesnt seak till i tell it to"): a short sound's words over the answer that cannot be read keep it held (stuck)
+// until his Speak, or his next words, decide; the caption says which, in two lines (STUCK_LISTENING while they may still come back, STUCK_FAILED
+// once they cannot), so he is never told they failed and then hears it go on.
 
 /** Every number of the brain. The classic's names are in the comments; the parity test checks those against its file. */
 export const TALK = {
@@ -158,6 +165,20 @@ export const TALK = {
   /** oeb56: with no such boundary yet, the first piece goes after this long of streaming, at its last word boundary, once it has this many words. */
   firstPieceWaitMs: 1200,
   firstPieceWaitWords: 5,
+  // --- F-267 step 2 (orders o088b, o7be4): the Quick page only (TalkOptions.quickPage) ------------------------------------------
+  /** An answer kept for him while Silent waits this long after its last sentence came, for "Quick, continue" (PLAN 4.7: 5 minutes). */
+  keptAnswerMs: 300_000,
+  /**
+   * Silent ends the talk after this long with no "Quick" command, wake or tap of his (PLAN decision 15's fail-safe), when the page ends it by
+   * itself at all: anyone's "Quick, stop" cannot turn its 2 minutes of quiet into a talk that never ends.
+   */
+  silentEndMs: 900_000,
+  /**
+   * Lead's ruling (fail closed), F-267 step 2: an answer held for a short sound's words is silent from the hold on (his voice's onset), so words
+   * still out this long after the hold tell him it is still listening for them (STUCK_LISTENING, never the failure line: they may still come
+   * back): the 20 s give-up, or the 2 minutes while the PC says it is busy, are never the first sign.
+   */
+  checkTellMs: 4500,
 } as const
 
 // --- options (Settings › Chats › Assistant › Live voice) --------------------------------------------------------------------
@@ -191,6 +212,12 @@ export interface TalkOptions {
   idPrefix: string
   /** What the chats are called (Settings): the lines that name them follow it. */
   names: Names
+  /**
+   * F-267 step 2 (orders o088b, o7be4): a session the Quick page hosts (Quick mode only): Silent, the page's command words ("Quick, stop",
+   * "Quick, speak", "Quick, continue", "Hey Quick"), the answer kept for him and the room shown only as "Someone spoke". Only the page sets it
+   * (talkBrainOptions' page.quickPage); left out, every rule is exactly as before.
+   */
+  quickPage?: true
 }
 
 /**
@@ -237,6 +264,8 @@ export function talkOptions(raw: unknown): TalkOptions {
     lang: oneOf(o.lang, ['auto', 'en', 'hi', 'mr'] as const, TALK_DEFAULTS.lang),
     idPrefix: typeof o.idPrefix === 'string' && ID_PREFIX.test(o.idPrefix) ? o.idPrefix : TALK_DEFAULTS.idPrefix,
     names: big && fast ? { big, fast } : TALK_DEFAULTS.names,
+    // F-267 step 2 (o7be4): only an exact true, and left out otherwise (so no options of before change shape).
+    ...(o.quickPage === true ? { quickPage: true as const } : {}),
   }
 }
 
@@ -348,8 +377,11 @@ export function parseTalkSettings(raw: unknown): TalkSettings {
   }
 }
 
-/** The brain's options for one session: his settings, and what the page decides (the mode it may use, where the sound comes out, the session's id prefix, the names). */
-export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device: TalkDevice; idPrefix: string; names: Names }): TalkOptions {
+/**
+ * The brain's options for one session: his settings, and what the page decides (the mode it may use, where the sound comes out, the session's id
+ * prefix, the names). F-267 step 2 (o7be4): `quickPage`, only a session the Quick page hosts (src/talk/session.ts, its page 'quick').
+ */
+export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device: TalkDevice; idPrefix: string; names: Names; quickPage?: boolean }): TalkOptions {
   return talkOptions({
     mode: page.mode,
     cutIn: s.cutIn,
@@ -362,6 +394,7 @@ export function talkBrainOptions(s: TalkSettings, page: { mode: TalkMode; device
     lang: s.lang,
     idPrefix: page.idPrefix,
     names: page.names,
+    ...(page.quickPage === true ? { quickPage: true } : {}),
   })
 }
 
@@ -411,7 +444,12 @@ export interface TalkDirectView {
   held?: boolean
 }
 
-export type TalkUserAct = 'stop' | 'end' | 'mute' | 'unmute'
+/**
+ * His buttons. F-267 step 2 (o7be4), the Quick page's only (a brain without TalkOptions.quickPage does nothing on them): silent (Silent),
+ * speak (Speak: out of Silent, listening) and continue (Say it: what was kept for him is said). Lead's ruling (fail closed), F-267 step 2:
+ * listening, speak over an answer held for his words (stuck, or a check still out) goes on.
+ */
+export type TalkUserAct = 'stop' | 'end' | 'mute' | 'unmute' | 'silent' | 'speak' | 'continue'
 
 /**
  * What happens, each with the page's clock in ms. Frames are counted: the n-th frame event of the session is frame n (from 0, before
@@ -460,9 +498,10 @@ export type TalkAction =
    * Transcribe frames fromFrame <= n < toFrame, then push `stt` (its text) or `stt-fail`. `guess`: the early guess (Whisper may answer
    * 409 busy at once). One with no sign of life for 20 s (o0de2: the page pushes `stt-busy` while the PC works on it), or out 2 minutes, is
    * given up (`stt-abort`) and counts as failed. `check` (review of T3b): a short sound of his over the answer (under 500 ms), whose words
-   * are only looked at for a stop word: not a turn of his, so the page's turn record skips it.
+   * are only looked at for a stop word: not a turn of his, so the page's turn record skips it. `room` (F-267 step 2, o7be4): a piece of the
+   * room's words, heard while Silent (or said before his tap): the hub may refuse it rather than load Whisper or wait for it (PLAN 3.4).
    */
-  | { t: 'stt'; req: number; fromFrame: number; toFrame: number; guess: boolean; check?: true }
+  | { t: 'stt'; req: number; fromFrame: number; toFrame: number; guess: boolean; check?: true; room?: true }
   | { t: 'stt-abort'; req: number }
   /** To Quick: {t:'ask', id, text, via:'voice', heard?}. `heard`: what he heard of the answer he cut off. */
   | { t: 'ask'; id: string; text: string; heard?: string }
@@ -482,8 +521,11 @@ export type TalkAction =
   | { t: 'say'; id: string; text: string; kind: SayKind; turn?: string }
   | { t: 'hush'; at: 'now' | 'word'; hold: boolean }
   | { t: 'resume' }
-  /** The soft end-of-turn tone (a buzz on the phone). */
-  | { t: 'tone' }
+  /**
+   * The soft end-of-turn tone (a buzz on the phone). `wake` (F-267 step 2, o7be4): the same tone out of Silent, listening again: no turn of his
+   * ended, so the page's turn record skips it.
+   */
+  | { t: 'tone'; wake?: true }
   | { t: 'drop-cards' }
   /** Quick mode, once at ready: send {t:'hold', on:true} right after start, and again after every start of a reconnect (every hand-off becomes a card). */
   | { t: 'hold-on' }
@@ -494,7 +536,11 @@ export type TalkAction =
 /** hearing: his voice now; writing (o0de2): his voice ended and his words are with Whisper (it was "hearing" until they were decided). */
 export type TalkPhase = 'starting' | 'listening' | 'hearing' | 'writing' | 'thinking' | 'speaking' | 'ended'
 export interface TalkLine {
-  who: 'you' | 'quick' | 'assistant'
+  /**
+   * F-267 step 2 (o7be4): 'room', a line heard while the Quick page was Silent and not asked: "Someone spoke (n s)" (never the words: Lead's
+   * instruction until he rules on oc093), or the command it was ("Quick, speak"). Drawn without a name: never as "You".
+   */
+  who: 'you' | 'quick' | 'assistant' | 'room'
   text: string
   /** He cut it off: the text is what he heard. */
   cut?: boolean
@@ -509,6 +555,16 @@ export interface TalkView {
   cards: TalkCard[]
   muted: boolean
   endedWhy?: string
+  /** F-267 step 2 (o7be4): the Quick page is Silent: it hears and shows, and says nothing (left out otherwise; never in the overlay). */
+  silent?: boolean
+  /** F-267 step 2: answers kept for him (one for each question or telling), said on "Quick, continue" or his Say it; left out when none. */
+  waiting?: number
+  /**
+   * Lead's ruling (fail closed), F-267 step 2: the Quick page's answer is held for a short sound's words: 'listening' while they are still out
+   * TALK.checkTellMs after the hold (the caption is STUCK_LISTENING), 'failed' once they could not be read or were given up (STUCK_FAILED); his
+   * Speak goes on. Left out otherwise; never in the overlay.
+   */
+  stuck?: 'listening' | 'failed'
 }
 
 export interface TalkBrain {
@@ -530,6 +586,16 @@ export const PART_LOST = 'I missed part of that.'
 /** o0de2: a real turn of his (TALK.noWordsVoiceMs of voice) that Whisper gave no words for. Round 2: said and shown (a cough is shorter). */
 export const NO_WORDS = "I didn't catch any words. Try again."
 export const REST_ON_SCREEN = 'The rest is on the screen.'
+/** F-267 step 2 (o7be4): Silent's own end (TALK.silentEndMs with no "Quick" command, wake or tap of his). */
+export const SILENT_ENDED = `Live talk ended: ${TALK.silentEndMs / 60_000} minutes in Silent with no "Quick" from you.`
+/**
+ * Lead's ruling (fail closed), F-267 step 2: the Quick page's caption while its answer is held for a short sound's words (TalkView.stuck), two
+ * lines so he is never told they failed while they may still come back: still out TALK.checkTellMs after the hold; failed, or given up.
+ */
+export const STUCK_LISTENING = 'Still listening for what you said. Tap Speak to go on.'
+export const STUCK_FAILED = "Didn't catch that: say it again, or tap Speak to go on."
+/** F-267 step 2: what the Quick page shows of the room while Silent, its seconds of voice: never the words, never whose. */
+export const someoneSpoke = (ms: number): string => `Someone spoke (${Math.max(1, Math.round(ms / 1000))} s)`
 
 /** Chris's 25 s line: "Still on it." or "Still on it: <what it is doing>." (his progress1). */
 export function progressEarly(step = ''): string {
@@ -707,6 +773,88 @@ export function gateOf(text: string): TalkGate {
   if (madeOf(w, STOP, [BACK, POLITE])) return 'stop'
   if (madeOf(w, BACK, [])) return 'backchannel'
   return 'words'
+}
+
+// --- F-267 step 2 (orders o088b, o7be4): the Quick page's command words (PLAN 4.5, decision 6) ---------------------------------------
+// "Quick" and the command, before or after it, in English, romanised Hindi or Marathi, or Devanagari, with a please or an okay around them.
+// Only a page session takes them (TalkOptions.quickPage); bare, each word is what it was (a stop word stops, anything else is asked), and
+// STOP_WORDS (the overlay's list) is not changed.
+
+/** The name: "Quick" even when the assistants are called something else (decision 6). */
+export const QUICK_NAMES: readonly string[] = ['quick', 'क्विक']
+/** The first word of a wake: "Hey Quick", "Okay Quick". */
+export const WAKE_HEADS: readonly string[] = ['hey', 'ok', 'okay', 'hi', 'हे', 'ओके', 'हाय']
+/** The word after "hey quick" that makes it no wake (PLAN 4.5's guard): "hey, quick question" is said to a person. */
+export const NOT_WAKE_WORDS: readonly string[] = ['question', 'questions', 'one', 'thing', 'word', 'call', 'favour', 'favor', 'update']
+/** Silent (PLAN's STOP class). Every one is in STOP_WORDS as well: said bare, it is today's stop. */
+export const SILENT_WORDS: readonly string[] = [
+  'stop', 'stop it', 'stop talking', 'shut up', 'quiet', 'be quiet', 'enough', "that's enough", 'chup', 'chup karo', 'chup raho', 'bas',
+  'bas karo', 'bas kar', 'band karo', 'thamb', 'thamba', 'स्टॉप', 'बस', 'बस करो', 'चुप', 'चुप करो', 'चुप रहो', 'बंद करो', 'थांब', 'थांबा',
+]
+/** Out of Silent, listening (PLAN's SPEAK class). */
+export const SPEAK_WORDS: readonly string[] = ['speak', 'bolo', 'bol', 'you can talk', 'go ahead', 'बोलो', 'बोल']
+/** What was kept for him, said (PLAN's CONTINUE class). */
+export const CONTINUE_WORDS: readonly string[] = ['continue', 'go on', 'carry on', 'aage bolo', 'pudhe bol', 'आगे बोलो', 'पुढे बोल']
+
+const QUICK_NAME = phrases(QUICK_NAMES)
+const WAKE_HEAD = phrases(WAKE_HEADS)
+const NOT_WAKE = phrases(NOT_WAKE_WORDS)
+const SILENT_SAID = phrases(SILENT_WORDS)
+const SPEAK_SAID = phrases(SPEAK_WORDS)
+const CONTINUE_SAID = phrases(CONTINUE_WORDS)
+/** What may stand around a command: the name, a wake's first word, a please, an okay. */
+const AROUND = [QUICK_NAME, WAKE_HEAD, POLITE, BACK]
+/** After "hey quick", nothing to ask: a please, an okay, the name again. */
+const NOTHING_ASKED = new Set([...BACK, ...POLITE, ...QUICK_NAME])
+
+/**
+ * A command of the Quick page: Silent, speak, continue, or 'stop' (the name with one of today's stop words that is not Silent's: "Quick, wait",
+ * "Quick ruko" stop as a bare stop word does, and are not a question Quick answers out loud); or a wake, with what is asked after it (`rest`,
+ * '' for a bare "Hey Quick"). `said`: the words of it to show (a wake's from its "hey" on: what the room said before it is never shown).
+ */
+export type QuickCommand = { t: 'wake'; rest: string; said: string } | { t: 'silent' | 'speak' | 'continue' | 'stop'; said: string }
+
+/** The words of a text as talkWords gives them, each with where it starts in the text (NFKC). */
+function wordsAt(text: string): { w: string; at: number }[] {
+  const out: { w: string; at: number }[] = []
+  for (const m of text.matchAll(/[\p{L}\p{M}\p{N}'’]+/gu)) {
+    const w = m[0].toLowerCase().replace(/['’]/g, '')
+    if (w) out.push({ w, at: m.index })
+  }
+  return out
+}
+
+/** A command made of these words alone: its phrases with the name (before or after them), and a please, an okay or a "hey" around them. */
+function commandIn(words: readonly string[]): 'silent' | 'speak' | 'continue' | 'stop' | null {
+  if (!words.some(w => QUICK_NAME.has(w))) return null
+  if (madeOf(words, SILENT_SAID, AROUND)) return 'silent'
+  if (madeOf(words, SPEAK_SAID, AROUND)) return 'speak'
+  if (madeOf(words, CONTINUE_SAID, AROUND)) return 'continue'
+  if (madeOf(words, STOP, AROUND)) return 'stop'
+  return null
+}
+
+/**
+ * The page's command in what was said, or null (then today's rules decide it). The whole text a command ("Quick, stop", "stop Quick", "Quick,
+ * please stop", "Hey Quick, bolo"); else a wake: the LAST "hey quick" anywhere in it (the room may have talked just before, in the same breath:
+ * the review's major 2), unless the word after it is the guard's ("hey, quick question"); what follows it is the question, or the command it
+ * is. Not a wake: "Quick, what time is it?" with no "hey" before it (decision 6).
+ */
+export function quickCommandOf(text: string): QuickCommand | null {
+  const t = text.normalize('NFKC')
+  const at = wordsAt(t)
+  const words = at.map(x => x.w)
+  const whole = commandIn(words)
+  if (whole) return { t: whole, said: t.trim() }
+  let i = words.length - 2
+  while (i >= 0 && !(WAKE_HEAD.has(words[i]) && QUICK_NAME.has(words[i + 1]))) i--
+  if (i < 0 || NOT_WAKE.has(words[i + 2] ?? '')) return null
+  const said = t.slice(at[i].at).trim()
+  const command = commandIn(words.slice(i))
+  if (command) return { t: command, said }
+  const rest = words.slice(i + 2)
+  if (rest.length === 0 || madeOf(rest, NOTHING_ASKED, [])) return { t: 'wake', rest: '', said }
+  return { t: 'wake', rest: t.slice(at[i + 2].at).trim(), said }
 }
 
 /** Talk-over's check (the classic's yoursIn): his "words" are its own echo when 2 of 3 of them are in what it said lately (no words: echo too). */
@@ -999,6 +1147,8 @@ interface Say {
    * is taken as over a filler (onOnset): while it thinks, so his added words and his question are ONE ask.
    */
   leadIn: boolean
+  /** F-267 step 2 (o7be4): its text is in the transcript already (it played, or it was kept while Silent): said again, it is not written twice. */
+  logged: boolean
 }
 
 interface Turn {
@@ -1010,6 +1160,11 @@ interface Turn {
   /** What he heard of the answer before it (the ask's `heard`): o0de2, a question merged with his later words still carries it. */
   heard: string
   at: number
+  /**
+   * F-267 step 2 (Agent 14's F-B): when its last frame came (its ask, at first). A quiet turn still being written holds its kept answer
+   * only while frames keep coming: one that stalls (no "done" ever) lets it go TALK.keptAnswerMs after its last frame.
+   */
+  lastFrameAt: number
   /** Quick is still writing it; in direct mode, the order is out. */
   generating: boolean
   cancelled: boolean
@@ -1041,6 +1196,11 @@ interface Turn {
   /** Something was said in this turn (a filler or the answer). */
   spoke: boolean
   orderId: string | null
+  /**
+   * F-267 step 2 (o7be4): what it says is kept for him, not said (it was out when Silent began, or it is a telling that came while Silent),
+   * until "Quick, continue" or his Say it; it gets no fillers, and his voice neither cancels it nor joins it. A new question drops it.
+   */
+  quiet: boolean
 }
 
 /**
@@ -1083,6 +1243,14 @@ interface Utterance {
   closedAt: number
   /** o0de2: his words as they come back from Whisper, in the transcript before they are decided (null until some came back). */
   line: TalkLine | null
+  /**
+   * F-267 step 2 (o7be4): the room's, anyone's: begun while Silent, or still being heard or with Whisper when Silent began (the review of 2a).
+   * Its words are never shown as they come back, and decided while Silent it is "Someone spoke (n s)" unless it is a command or a wake (a line
+   * shown before Silent stays as it was); its pieces are room pieces (TalkAction stt `room`); nothing joins it after a pause.
+   */
+  room: boolean
+  /** F-267 step 2: said before his Silent, Speak or Say it tap: only shown, never acted on (his tap is the later word). */
+  quiet: boolean
 }
 /** A transcription out: when it was asked for, and its last sign of life (o0de2: the PC said Whisper was still at work). */
 type Req = ({ kind: 'guess' } | { kind: 'part'; utt: Utterance; part: Part } | { kind: 'check'; part: Part }) & { at: number; alive: number }
@@ -1172,6 +1340,32 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   let ackAt = -1
   let info = ''
 
+  // F-267 step 2 (orders o088b, o7be4): the Quick page's Silent. Only with TalkOptions.quickPage (Quick mode): the overlay never sets it, so for
+  // it all of this stays idle (silent false, nothing kept, nothing checked).
+  const page = o.quickPage === true && quick
+  /** Silent: it hears and shows what it hears, says nothing (no answer, filler, line or tone), and asks Quick nothing but a wake. */
+  let silent = false
+  /** When Silent began, or his last "Quick" (a command or a wake) or tap since: Silent's own end counts from it (TALK.silentEndMs). */
+  let silentAt = 0
+  /** Answer sentences kept for him, in order (Silent, or a quiet turn), and when the last came: said on "Quick, continue" or his Say it. */
+  let kept: Say[] = []
+  let keptAt = 0
+  /** Short sounds of his over the answer whose words are not back yet: the answer stays held for them ("Quick, stop" is often under 500 ms). */
+  const checking = new Set<Part>()
+  /**
+   * Lead's ruling (fail closed), F-267 step 2: the answer is held for a short sound's words, which may have been "Quick, stop": 'listening' while
+   * they are still out TALK.checkTellMs after the hold, 'failed' once they could not be read (failed, or given up). It stays held (resume
+   * refuses) until his Speak (goOn), his words read (onStt), or his next words decide (a question drops it); Silent, a stop and the end clear
+   * it. The caption says so.
+   */
+  let stuck: 'listening' | 'failed' | null = null
+  /** The newest check whose words failed (its req), while stuck is 'failed': an OLDER check read late does not undo it. */
+  let failedReq: number | null = null
+  /** Lead's ruling (fail closed), F-267 step 2: when the answer was held (hold, at his voice's onset): TALK.checkTellMs counts from it. */
+  let heldAt = 0
+  /** The room's last "Someone spoke" line and its voice: the room's next turn adds to it while nothing came after it. */
+  let roomSpoke: { line: TalkLine; ms: number } | null = null
+
   // orders, cards, the transcript
   const orders = new Map<string, Order>()
   let lastOrder: string | null = null
@@ -1193,9 +1387,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
 
   // --- turns ------------------------------------------------------------------------------------------------------------
   const turnOf = (id: string | null): Turn | undefined => (id === null ? undefined : turns.find(t => t.id === id))
-  const hasSays = (t: Turn) => queue.some(s => s.turn === t.id) || pending.some(s => s.turn === t.id)
+  const hasSays = (t: Turn) => queue.some(s => s.turn === t.id) || pending.some(s => s.turn === t.id) || kept.some(s => s.turn === t.id)
   function newTurn(id: string, kind: Turn['kind'], text: string, heard = ''): Turn {
-    const t: Turn = { id, kind, text, heard, at: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, firstAt: null, firstOut: false, said: [], leadSaid: 0, line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null }
+    // F-267 step 2: a turn that starts while Silent (a telling) is kept for him from its first word.
+    const t: Turn = { id, kind, text, heard, at: now, lastFrameAt: now, generating: true, cancelled: false, byVoice: false, buffer: '', received: '', answered: false, firstAt: null, firstOut: false, said: [], leadSaid: 0, line: null, toolSeen: false, label: '', labelDone: false, ackDone: false, progress: 0, fillers: 0, spoke: false, orderId: null, quiet: silent }
     turns.push(t)
     while (turns.length > TALK.turnsMax) {
       const i = turns.findIndex(x => !x.generating && !hasSays(x))
@@ -1217,7 +1412,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   function outTurn(): Turn | null {
     for (let i = turns.length - 1; i >= 0; i--) {
       const t = turns[i]
-      if (t.cancelled) continue
+      // F-267 step 2 (o7be4): a quiet turn is kept for him, not out: his voice after Speak is a new question, never cancels or joins it.
+      if (t.cancelled || t.quiet) continue
       if (t.generating) return t
       if (queue.some(s => s.turn === t.id && s.kind === 'answer') || pending.some(s => s.turn === t.id && s.kind === 'answer')) return t
     }
@@ -1259,6 +1455,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     if (!clean) return
     const id = `${o.idPrefix}-a${++askNo}`
     lost = null
+    // F-267 step 2 (o7be4): a new question drops what was kept for him: a stale answer is never said after it (the review's major 1).
+    if (page) dropKept()
     if (quick) for (const t of turns) if (t.generating && t.kind !== 'direct') stopTurnQuietly(t)
     // Whatever was held for his words is moot once he asks something new.
     if (held) dropAudio(false)
@@ -1288,12 +1486,17 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    */
   function say(text: string, kind: SayKind, turn: Turn | null, keep = turn?.kind === 'direct', of: string | null = turn?.id ?? null) {
     for (const piece of sayPieces(text)) {
-      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of, own: false, leadIn: false }
-      if (blocked()) pending.push(s)
+      const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text: piece, kind, turn: turn?.id ?? null, started: false, ms: 0, marks: null, cutting: false, keep, of, own: false, leadIn: false, logged: false }
+      // F-267 step 2 (o7be4): Silent's gate comes before the wait for his words, so nothing of it is left waiting in pending to be said later
+      // (the review's major 1: a sentence that came while the room talked was said out of order on "continue", or after a wake).
+      if (hushed(s)) keepQuietly(s)
+      else if (blocked()) pending.push(s)
       else emitSay(s)
     }
   }
   function emitSay(s: Say) {
+    // F-267 step 2 (o7be4): the one gate every say passes (also those that waited in pending): never while Silent, never a quiet turn's.
+    if (hushed(s)) return keepQuietly(s)
     // The first words of an answer cut a filler at its next word, so the two never overlap.
     if (s.kind === 'answer' && queue.length > 0 && queue.every(q => q.kind !== 'answer')) {
       act({ t: 'hush', at: 'word', hold: false })
@@ -1305,7 +1508,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     dirty = true
   }
   function flushPending() {
-    if (pending.length === 0 || blocked()) return
+    // F-267 step 2: while Silent nothing waits to be said: anything that waits goes to what is kept (emitSay's gate), his voice or not.
+    if (pending.length === 0 || (blocked() && !silent)) return
     const list = pending
     pending = []
     for (const s of list) emitSay(s)
@@ -1313,10 +1517,16 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   function hold() {
     if (held || queue.length === 0) return
     held = true
+    // Lead's ruling (fail closed), F-267 step 2: the tell timer counts from here (checkTell).
+    heldAt = now
     act({ t: 'hush', at: 'now', hold: true })
   }
   function resume() {
-    if (!held) return
+    // F-267 step 2 (o7be4): held while the words of a short sound of his over it are still with Whisper (see checking), and never while Silent.
+    if (!held || checking.size > 0 || silent) return
+    // Lead's ruling (fail closed), F-267 step 2: never a stuck answer, by any path (settle, wasNothing, a sound too short to be words, a mute):
+    // only his Speak (goOn) or his words read (onStt, onSegmentEnd) clear it first.
+    if (stuck !== null) return
     held = false
     act({ t: 'resume' })
   }
@@ -1332,13 +1542,131 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     pending = [...queue.filter(keep).map(s => ({ ...s, id: `${o.idPrefix}-s${++sayNo}` })), ...pending.filter(keep)]
     queue = []
     held = false
+    // F-267 step 2: nothing is held now, so nothing is held for a short sound's words either.
+    checking.clear()
+    // Lead's ruling (fail closed), F-267 step 2: and nothing is stuck.
+    setStuck(null)
   }
   function logSay(s: Say) {
     const t = s.kind === 'answer' ? turnOf(s.turn) : undefined
-    if (!t || t.kind === 'direct') return
+    if (!t || t.kind === 'direct' || s.logged) return
+    s.logged = true
     if (t.line) t.line.text = capText(`${t.line.text} ${s.text}`, TALK.lineMaxChars)
     else t.line = addLine('quick', s.text)
     dirty = true
+  }
+
+  // --- F-267 step 2 (orders o088b, o7be4): Silent, and the answer kept for him (the Quick page only) -------------------------------------
+  /** A say that is not said: anything while Silent, and a quiet turn's (its answer kept for him until "Quick, continue" or his Say it). */
+  const hushed = (s: Say): boolean => page && (silent || turnOf(s.turn ?? s.of)?.quiet === true)
+  /** A quiet turn still being written: its answer will be kept for him too. */
+  const keepComing = (): boolean => turns.some(t => t.quiet && t.generating && !t.cancelled && now - t.lastFrameAt < TALK.keptAnswerMs)
+  /**
+   * A say not said. An answer's sentence (or the error line that ends a question) is kept for him, in order, and its text is on screen now (a
+   * sentence said later is not written again); a filler, a progress or waiting line, or its own line about his words is only the caption.
+   */
+  function keepQuietly(s: Say) {
+    if (s.kind !== 'answer' || s.own || (s.turn ?? s.of) === null) {
+      info = s.text
+      dirty = true
+      return
+    }
+    logSay(s)
+    kept.push({ ...s, started: false, ms: 0, marks: null, cutting: false })
+    keptAt = now
+    dirty = true
+  }
+  /** What was kept for him goes (a new question, a stop), and nothing of a quiet turn waits to be said. */
+  function dropKept() {
+    if (kept.length > 0) dirty = true
+    kept = []
+    pending = pending.filter(s => !hushed(s))
+    for (const t of turns) t.quiet = false
+  }
+  /**
+   * Silent (his Silent, or "Quick, stop" and its forms). Nothing more is said from now: what played or waited of an answer is kept for him,
+   * whole and in order (a sentence that had started is said again from its start), and what is out is kept as it is written (no cancel:
+   * "Quick, continue" says it); fillers, progress lines and its own lines go. Hearing goes on, and the cards stay.
+   */
+  function enterSilent() {
+    const answers = [...queue, ...pending].filter(s => s.kind === 'answer' && !s.own && (s.turn ?? s.of) !== null)
+    if (queue.length > 0 || held) act({ t: 'hush', at: 'now', hold: false })
+    queue = []
+    pending = []
+    held = false
+    checking.clear()
+    // Lead's ruling (fail closed), F-267 step 2: a stuck answer is kept for him like any other (the rest of it, below); Silent is not stuck.
+    stuck = null
+    silent = true
+    silentAt = now
+    // What is still being heard or with Whisper is the room's from now (the review of 2a: the TV still talking at his tap, or a turn said
+    // before "Quick, stop" was decided, came back as "You: <its words>" under "Silent"): its words are not written out as they come back.
+    for (const u of utt ? [...sealed, utt] : sealed) u.room = true
+    for (const t of turns) if (t.generating && !t.cancelled) t.quiet = true
+    for (const s of answers) keepQuietly(s)
+    lost = null
+    info = ''
+    dirty = true
+  }
+  /** Out of Silent: listening, and the 2 minutes of quiet (auto-end) count again from now. */
+  function leaveSilent() {
+    silent = false
+    lastActive = now
+    dirty = true
+  }
+  /** The soft tone out of Silent, listening again (a buzz on the phone); with fillers off, none, as at the end of his turn. */
+  function wakeTone() {
+    if (fillers === 'off' || silent) return
+    act({ t: 'tone', wake: true })
+    echoTail = TALK.echoTailFrames
+  }
+  /** Something kept for him, or still being written for him. */
+  const hasKept = (): boolean => kept.length > 0 || keepComing()
+  /**
+   * "Quick, continue" or his Say it: what was kept is said, from where it stopped, before anything else waiting (the review's major 1), and a
+   * quiet turn's next sentences after it. False when nothing was kept and nothing is being written for him.
+   */
+  function sayKept(): boolean {
+    const coming = keepComing()
+    for (const t of turns) t.quiet = false
+    if (kept.length === 0) return coming
+    pending = [...kept.map(s => ({ ...s, id: `${o.idPrefix}-s${++sayNo}` })), ...pending]
+    kept = []
+    dirty = true
+    flushPending()
+    return true
+  }
+  /** Kept for TALK.keptAnswerMs after its last sentence came, never while more of it is being written; then it goes (its text stays on screen). */
+  function expireKept() {
+    if (kept.length === 0 || now - keptAt < TALK.keptAnswerMs || keepComing()) return
+    kept = []
+    dirty = true
+  }
+  /** Lead's ruling (fail closed), F-267 step 2: stuck, or no longer (see stuck); the view (its caption) says so in the same event. */
+  function setStuck(to: 'listening' | 'failed' | null) {
+    if (to !== 'failed') failedReq = null
+    if (stuck === to) return
+    stuck = to
+    dirty = true
+  }
+  /**
+   * Lead's ruling (fail closed), F-267 step 2, the tell timer: the answer is silent from the hold on, so words still out TALK.checkTellMs after
+   * it tell him it is still listening for them: never the failure line, as they may still come back (read, they decide as ever), and never over
+   * it once they failed.
+   */
+  function checkTell() {
+    if (stuck !== null || checking.size === 0 || now - heldAt < TALK.checkTellMs) return
+    setStuck('listening')
+  }
+  /**
+   * Lead's ruling (fail closed), F-267 step 2: his Speak while listening, over an answer held for a short sound's words (stuck, or a check still
+   * out), is "go on". The checks still out are given up (their words are not taken: his tap is the later word), and the answer RESUMES from
+   * where it stopped: nothing of it lost, nothing said again from its start.
+   */
+  function goOn() {
+    dropChecks()
+    setStuck(null)
+    resume()
   }
   function onPlayed(id: string, ms: number, marks: readonly TalkMark[] | undefined) {
     const i = queue.findIndex(q => q.id === id)
@@ -1397,6 +1725,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     if (!o.guess || !seg.open) return
     if (guess && seg.lastVoice !== guess.lastVoice) dropGuess()
     if (guess || seg.quiet !== TALK.tailFrames) return
+    // F-267 step 2 (o7be4): none for the room's words while Silent: a second job for Whisper, wasted when they go on.
+    if (silent || utt?.room === true) return
     const r = seg.guessRange()
     if (!r) return
     const req = ++reqNo
@@ -1419,9 +1749,14 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     if (g && reqs.delete(g.req)) act({ t: 'stt-abort', req: g.req })
     const p: Part = { req: ++reqNo, from: r.from, to: r.to, text: null, done: false, failed: false, guess: false, voiced, dropped: null }
     reqs.set(p.req, u ? { kind: 'part', utt: u, part: p, at: now, alive: now } : { kind: 'check', part: p, at: now, alive: now })
-    act({ t: 'stt', req: p.req, fromFrame: r.from, toFrame: r.to, guess: false, ...(u ? {} : { check: true as const }) })
+    act({ t: 'stt', req: p.req, fromFrame: r.from, toFrame: r.to, guess: false, ...(u ? {} : { check: true as const }), ...roomOf(u) })
     return p
   }
+  /**
+   * F-267 step 2 (o7be4): a piece of the room's words: sent while Silent, or of a turn begun while Silent or said before his tap (only shown).
+   * The hub may refuse it rather than load Whisper or wait for it (PLAN 3.4): nothing he asks is lost by that.
+   */
+  const roomOf = (u: Utterance | null): { room?: true } => (page && (silent || u?.room === true || u?.quiet === true) ? { room: true } : {})
   /** His voice starts: what it means depends on what is out and what plays. */
   function onOnset() {
     lastActive = now
@@ -1431,8 +1766,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       dirty = true
     }
     if (utt) {
-      // He goes on before his words were asked, within the merge gap: one ask (the merge).
-      if (utt.open || now - utt.closedAt <= TALK.mergeGapMs) {
+      // He goes on before his words were asked, within the merge gap: one ask (the merge). F-267 step 2 (o7be4): never while Silent, nor into
+      // the room's turn or one said before his tap: each new voice is a turn of its own then (the review's major 2: "<the TV> hey Quick, ..."
+      // was one turn and no wake, and his words 1 s after the TV were only shown after his Speak).
+      const merge = !(silent || utt.room || utt.quiet)
+      if (utt.open || (merge && now - utt.closedAt <= TALK.mergeGapMs)) {
         utt.open = true
         if (sounding()) hold()
         return
@@ -1443,7 +1781,13 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       sealed.push(utt)
       utt = null
     }
-    const fresh = (policy: Policy, turn: Turn | null, cancelled = false, talkOver = false): Utterance => ({ policy, turn, cancelled, talkOver, heard: '', parts: [], open: true, startedAt: now, closedAt: now, line: null })
+    const fresh = (policy: Policy, turn: Turn | null, cancelled = false, talkOver = false): Utterance => ({ policy, turn, cancelled, talkOver, heard: '', parts: [], open: true, startedAt: now, closedAt: now, line: null, room: false, quiet: false })
+    // F-267 step 2 (o7be4): Silent: the room's turn (anyone's) is heard and nothing else: no voice holds, cancels or cuts anything (nothing plays,
+    // and an answer being written for him goes on).
+    if (silent) {
+      utt = { ...fresh('plain', null), room: true }
+      return
+    }
     // Tap only: he is heard only while nothing is out or playing (see deaf()), and his voice never cuts anything off.
     if (style === 'tap') {
       utt = fresh('plain', null)
@@ -1459,7 +1803,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     // (leadInOnly; oeb56's review 2: also once all of it is written and that answer waits to play): his voice over it is as over a filler
     // (while it thinks, below), so his added words and his question are ONE ask. Taken as over an answer, under 500 ms of it his words were
     // only looked at for a stop word and dropped, and 500 ms or more asked them alone.
-    const playing = held ? undefined : queue.find(s => s.started)
+    // F-267 step 2 (o7be4): held only for a short sound's words still with Whisper (the page's, see checking), it is over that answer still.
+    // Lead's ruling (fail closed), F-267 step 2: and so is a stuck answer: his voice now is over it, and decides it (a question drops it, a
+    // short sound read as no command lets it go on).
+    const playing = held && checking.size === 0 && stuck === null ? undefined : queue.find(s => s.started)
     if (playing?.kind === 'answer' && !playing.own && !leadInSay(playing)) {
       hold()
       utt = fresh(over, turnOf(playing.turn) ?? null)
@@ -1517,6 +1864,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   /** 500 ms of his voice over the answer (Auto on the PC or earbuds): it is cut off, and he is asked about what he heard. */
   function watchCutIn() {
     if (utt?.policy !== 'barge' || seg.voiced < TALK.cutInFrames) return
+    // F-267 step 2 (o7be4): Silent began over his voice (his tap, or a "Quick, stop" decided meanwhile): what played is kept for him, never cut.
+    if (silent || utt.quiet) return
+    // F-E (recorded, not fixed in 2a; Lead's candidate for 2b): a "Quick, stop" of 500 ms or more over a playing answer (cut-in Auto) is cut
+    // here like any voice, so its turn is cancelled and nothing is kept for him; under 500 ms it is held and kept (onSegmentEnd).
     utt.policy = 'cut'
     utt.heard = heardOf(utt.turn)
     markCut(utt.turn, utt.heard)
@@ -1529,9 +1880,26 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       dropGuess()
       return
     }
+    // F-267 step 2 (o7be4): Silent began over his voice (his tap, or a "Quick, stop" decided meanwhile): nothing plays to go on with or to stop,
+    // so it is a turn like any other (decided while Silent, or only shown after his tap).
+    if (u.policy === 'barge' && (silent || u.quiet)) u.policy = 'plain'
     if (u.policy === 'barge') {
       // Less than 500 ms over the answer: it goes on. A stop word in it still stops it, when its words come back.
       utt = null
+      // F-267 step 2 (o7be4), the review's major 3: on the page it stays held until those words are back. A "Quick, stop" is often under 500
+      // ms: let go at once, the answer played 2-3 s more before it went silent. Its words let it go on (settle) unless they stop it; a sound
+      // too short to be words lets it go on at once, as before (not a stuck answer: resume). Lead's ruling (fail closed), F-267 step 2: words
+      // that cannot be read (failed, given up) do NOT let it go on (stuck, onSttFail), and words not back TALK.checkTellMs after the hold tell
+      // him it is still listening for them (checkTell).
+      if (page && range && held) {
+        const p = partOf(range, null, voiced)
+        if (p.done) {
+          // Lead's ruling (fail closed), F-267 step 2: back already, and read: they decide, a stuck answer's too (no command lets it go on).
+          setStuck(null)
+          onCheck(p.text ?? '')
+        } else checking.add(p)
+        return settle()
+      }
       resume()
       if (range) {
         const p = partOf(range, null, voiced)
@@ -1541,7 +1909,12 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       return settle()
     }
     if (range) {
-      if (fillers !== 'off') {
+      // F-267 step 2 (o7be4): no tone while Silent, nor at the end of the room's turn or one said before his tap (no turn of his is taken).
+      // F-D (Lead: a named exception, not a defect): the guarantee is "no sound starts after Silent is KNOWN". This tone ends a spoken "Quick,
+      // stop" before its words are known; holding every turn's tone back to close that is the worse trade. The phone's buzz is in scope (Agent
+      // 14's harness counts it as a sound start): it only ever comes with a tone (player.ts tone()), this one or the wake's once Silent is
+      // over, so no buzz starts after Silent is known either.
+      if (fillers !== 'off' && !silent && !u.room && !u.quiet) {
         act({ t: 'tone' })
         echoTail = TALK.echoTailFrames
       }
@@ -1583,8 +1956,9 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   }
   /** o0de2: his words in the transcript as soon as Whisper gives them back, before they are decided (it was a bare "Hearing you" till then). */
   function showWords(u: Utterance) {
-    // Talking over its own sound, his "words" may be its echo: they show once decided.
-    if (u.policy === 'hold' || u.talkOver) return
+    // Talking over its own sound, his "words" may be its echo: they show once decided. F-267 step 2 (o7be4): the room's words are never shown
+    // as they come back (decided, they are "Someone spoke", or asked).
+    if (u.policy === 'hold' || u.talkOver || u.room) return
     const text = textOf(u.parts.filter(p => p.done))
     if (text) youLine(u, text)
   }
@@ -1616,6 +1990,14 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     return null
   }
   function onCheck(text: string) {
+    if (page) {
+      // F-267 step 2 (o7be4): Silent began meanwhile: a short sound over what played is moot.
+      if (silent) return
+      // A short "Quick, stop" over the answer: Silent, the answer kept for him; "Quick, wait": today's stop. Anything else as before.
+      const c = quickCommandOf(text)
+      if (c?.t === 'silent') return goSilent(null, c.said)
+      if (c?.t === 'stop') return stopWords(c.said)
+    }
     if (gateOf(text) === 'stop') stopWords(text)
   }
   /** A stop word: hush, cancel what runs, drop the cards; nothing is asked. Direct-mode orders stay out (voice cannot stop an order). */
@@ -1628,6 +2010,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   function stopAll() {
     dropAudio(true)
     lost = null
+    // F-267 step 2 (o7be4): nothing kept for him is said after a stop either (the Stop button while Silent too: Silent stays).
+    if (page) dropKept()
     for (const t of turns) {
       if (t.kind === 'direct') {
         if (t.generating) t.fillers = TALK.maxFillers
@@ -1667,11 +2051,13 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    * again") is still waiting or playing. Returns the line he will hear (the caption shows that one).
    */
   function sayOwn(text: string): string {
+    // F-267 step 2 (o7be4): Silent says none of its own lines either (the caller shows it as the caption).
+    if (silent) return text
     const again = (t: string) => t === NOT_CAUGHT || t === NO_WORDS
     const same = (s: Say) => s.turn === null && s.of === null && (s.text === text || (again(s.text) && again(text)))
     const waiting = queue.find(same) ?? pending.find(same)
     if (waiting) return waiting.text
-    const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text, kind: 'answer', turn: null, started: false, ms: 0, marks: null, cutting: false, keep: false, of: null, own: true, leadIn: false }
+    const s: Say = { id: `${o.idPrefix}-s${++sayNo}`, text, kind: 'answer', turn: null, started: false, ms: 0, marks: null, cutting: false, keep: false, of: null, own: true, leadIn: false, logged: false }
     if (held) pending.push(s)
     else emitSay(s)
     return text
@@ -1715,6 +2101,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     return rightAfterAnswer(u) && voiceMs(u) <= TALK.thanksMaxVoiceMs ? 'backchannel' : 'empty'
   }
   function decideWords(u: Utterance, text: string, lostPiece: boolean) {
+    // F-267 step 2 (o7be4): the Quick page's own rules first (Silent, its command words); what they leave is decided as before.
+    if (page && pageDecides(u, text)) return
+    // But never the room's turn into a question asked after it began (a wake's, decided while these words were with Whisper; one room piece
+    // goes at a time): only shown (the review of 2a: the TV's words were "You:" and asked with his wake's question, and a TV "stop" cancelled it).
+    if (page && u.room && askedSince(u) !== null) return void onlyShown(u, text)
     const gate = gateOfTurn(u, text, lostPiece)
     const t = u.turn
     // Words lost after a cut-off go with these, when nothing newer is going on (a turn out, an answer playing); else they are moot.
@@ -1795,6 +2186,101 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     }
   }
   /**
+   * F-267 step 2 (orders o088b, o7be4): the Quick page's rules for a turn, before today's: true when they decided it. Turns are decided in the
+   * order they were said, so Silent's state when one is decided says what it may do ("Hey Quick." then "what's on?" asks the second; "Quick,
+   * stop." then "and then" only shows it). Voices are not checked: anyone's "Quick" counts, as in Q1.
+   *   said before his tap: only shown.
+   *   Silent: a wake asks its words (a bare one listens, with the tone); "Quick, speak" listens; "Quick, continue" says what was kept (else
+   *     listens); anything else is only shown: nothing asked, cut, stopped or said (never "didn't catch that": a sound too).
+   *   listening: "Quick, stop" is Silent; "Quick, wait" today's stop; "Quick, speak" nothing (an answer held for it goes on); "Quick, continue"
+   *     says what was kept; the room's turn that came back with no words is only shown; the rest (a wake too) as before, except the room's
+   *     turn when a question was asked after it began: only shown (decideWords).
+   */
+  function pageDecides(u: Utterance, text: string): boolean {
+    if (u.quiet) return onlyShown(u, text)
+    const c = quickCommandOf(text)
+    // Talking over its own sound, its echo is no command of his: today's talk-over check (wasNothing) has it.
+    const echo = c !== null && (u.policy === 'hold' || u.talkOver) && isEcho(text, spoken)
+    if (silent) {
+      if (!c || echo) return onlyShown(u, text)
+      // His "Quick" (anyone's: voices are not checked): Silent's own end counts from now.
+      silentAt = now
+      if (c.t === 'wake' && c.rest) {
+        leaveSilent()
+        youLine(u, c.said)
+        ask(c.rest)
+        return true
+      }
+      commandLine(u, c.said)
+      if (c.t === 'wake' || c.t === 'speak') {
+        leaveSilent()
+        wakeTone()
+      } else if (c.t === 'continue') {
+        leaveSilent()
+        if (!sayKept()) wakeTone()
+      }
+      // "Quick, stop" or "Quick, wait" while Silent: it is silent already.
+      return true
+    }
+    if (u.room && talkWords(text).length === 0) return onlyShown(u, text)
+    if (!c || echo) return false
+    // His own words over its sound: those loud frames were his, never its echo to learn (as wasNothing has it).
+    if (u.policy === 'hold' || u.talkOver) doubts = []
+    // Each shows the command it was (from its "hey" on, when it followed one: never what the room said before it).
+    switch (c.t) {
+      case 'silent':
+        goSilent(u, c.said)
+        return true
+      case 'stop':
+        stopWords(c.said, u)
+        return true
+      case 'speak':
+        // Listening already. When his voice cut something off (cut, or cancelled while it thought), it is asked as before, so nothing is lost.
+        if (u.policy === 'cut' || u.cancelled) return false
+        commandLine(u, c.said)
+        return true
+      case 'continue':
+        if (!hasKept()) return false
+        commandLine(u, c.said)
+        sayKept()
+        return true
+      default:
+        return false
+    }
+  }
+  /**
+   * F-267 step 2 (o7be4): a turn only shown, never acted on. The room's is "Someone spoke (n s)": never its words, never as his (Lead's
+   * instruction until he rules on oc093). A line already on screen stays as it was: his words that came back before Silent began, or (his
+   * Say it while listening) as they came back (showWords).
+   */
+  function onlyShown(u: Utterance, text: string): true {
+    if (!u.room || u.line) return true
+    const ms = voiceMs(u)
+    // A cough or a click (no words, less voice than a turn of his) is nothing to show.
+    if (talkWords(text).length === 0 && ms < TALK.noWordsVoiceMs) return true
+    const last = roomSpoke !== null && transcript.at(-1) === roomSpoke.line ? roomSpoke : null
+    if (last) {
+      last.ms += ms
+      last.line.text = someoneSpoke(last.ms)
+      dirty = true
+    } else roomSpoke = { line: addLine('room', someoneSpoke(ms)), ms }
+    return true
+  }
+  /**
+   * F-267 step 2: a command of the page, shown as the command: the room's never as his; his own as his words always are (and so is a line
+   * shown before Silent: one line a turn).
+   */
+  function commandLine(u: Utterance, said: string) {
+    if (u.room && !u.line) u.line = addLine('room', said)
+    else youLine(u, said)
+  }
+  /** F-267 step 2: "Quick, stop" (or a form of it) while listening: its line, then Silent (nothing cancelled; the answer is kept for him). */
+  function goSilent(u: Utterance | null, text: string) {
+    if (u) commandLine(u, text)
+    else youLine(null, text)
+    enterSilent()
+  }
+  /**
    * o0de2: a real turn of his that Whisper gave no words for is noted. Round 2: by his voice (TALK.noWordsVoiceMs of it, never the room sent
    * around it), said and shown: a short "Hello?" that came back empty was silence (a cough is shorter).
    */
@@ -1828,8 +2314,17 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     r.part.text = text
     r.part.dropped = dropped
     r.part.done = true
-    if (r.kind === 'check') onCheck(text)
-    else {
+    if (r.kind === 'check') {
+      // F-267 step 2 (o7be4): the answer held for these words goes on now, unless they stopped it (settle lets it go).
+      const waited = checking.delete(r.part)
+      // Lead's ruling (fail closed), F-267 step 2: read, they decide: a stuck answer is stuck no more (a cough or an okay lets it go on with no
+      // tap, also once the page said it was still listening for them). But words of an OLDER sound, read late, never undo the failure of a
+      // newer one: those unread words may have been "Quick, stop" (it stays held; a stop word in these still acts).
+      const older = stuck === 'failed' && failedReq !== null && req < failedReq
+      if (waited && !older) setStuck(null)
+      onCheck(text)
+      if (waited && !older) settle()
+    } else {
       showWords(r.utt)
       settle()
     }
@@ -1851,12 +2346,22 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       r.part.guess = false
       r.part.req = ++reqNo
       reqs.set(r.part.req, { ...r, at: now, alive: now })
-      act({ t: 'stt', req: r.part.req, fromFrame: r.part.from, toFrame: r.part.to, guess: false, ...(r.kind === 'check' ? { check: true as const } : {}) })
+      act({ t: 'stt', req: r.part.req, fromFrame: r.part.from, toFrame: r.part.to, guess: false, ...(r.kind === 'check' ? { check: true as const } : {}), ...roomOf(r.kind === 'part' ? r.utt : null) })
       return
     }
     r.part.done = true
     r.part.failed = true
     if (r.kind === 'part') settle()
+    // F-267 step 2 (o7be4): a short sound's words lost (or given up, expireReqs' 408) while the answer is held for them (only the page holds for
+    // a check). The review's major 3 let it go on; Lead's ruling (fail closed) overrides that, to his order o790b (PLAN.md B8: "then when i say
+    // stop it continues listening but doesnt seak till i tell it to"): those words may have been "Quick, stop", so it stays held, and the caption
+    // says they failed (STUCK_FAILED) in this event. His Speak (goOn), or his next words, decide.
+    else if (checking.delete(r.part)) {
+      if (page) {
+        setStuck('failed')
+        failedReq = Math.max(failedReq ?? req, req)
+      } else settle()
+    }
   }
   /** o0de2: the PC says Whisper is still at work on what was sent: nothing out is given up while it is. */
   function onSttBusy() {
@@ -1878,9 +2383,10 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
   /**
    * Tap only: while it answers, his voice is not taken at all (the classic's mic was off then). Quick telling an order's answer is
    * answering too (review of T3a: his words there became an ask, which cut the telling off). A direct order out is not: an order runs
-   * for minutes and his next words never cut it off.
+   * for minutes and his next words never cut it off. F-267 step 2 (o7be4): nor an answer kept for him (a quiet turn), and never while
+   * Silent: it says nothing then, and must hear "Hey Quick".
    */
-  const deaf = () => style === 'tap' && (queue.length > 0 || turns.some(t => t.generating && t.kind !== 'direct'))
+  const deaf = () => style === 'tap' && !silent && (queue.length > 0 || turns.some(t => t.generating && t.kind !== 'direct' && !t.quiet))
   function onFrame(db: number) {
     const n = frameNo++
     if (muted) return
@@ -1996,6 +2502,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         // Quick telling an order's answer: a turn the hub starts after the answer's frame, spoken like any other.
         if (!t && f.id.startsWith('o:') && tellable.delete(f.id.slice(2))) t = newTurn(f.id, 'telling', '')
         if (!t || !t.generating || t.cancelled || !f.text) return
+        t.lastFrameAt = now
         t.answered = true
         // oeb56: the first piece's wait counts from here (checkFirstPiece, after every event, this one too).
         t.firstAt ??= now
@@ -2005,12 +2512,16 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
       }
       case 'flush': {
         const t = turnOf(f.id)
-        if (t?.generating && !t.cancelled) release(t, true)
+        if (t?.generating && !t.cancelled) {
+          t.lastFrameAt = now
+          release(t, true)
+        }
         return
       }
       case 'tool': {
         const t = turnOf(f.id)
         if (!t?.generating || t.cancelled) return
+        t.lastFrameAt = now
         // odcd9 (from oeb56's review): what it said of this turn before its first tool call is its lead-in (markLeadIn, onOnset).
         markLeadIn(t)
         t.toolSeen = true
@@ -2142,7 +2653,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     for (let i = turns.length - 1; i >= 0; i--) {
       const t = turns[i]
       if (t.kind === 'telling') continue
-      return t.generating && !t.cancelled && t.fillers < TALK.maxFillers ? t : null
+      // F-267 step 2 (o7be4): none for an answer kept for him (a quiet turn).
+      return t.generating && !t.cancelled && !t.quiet && t.fillers < TALK.maxFillers ? t : null
     }
     return null
   }
@@ -2152,7 +2664,8 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
    * over another sound (one at a time).
    */
   function checkFillers() {
-    if (fillers !== 'words' || blocked() || queue.length > 0 || pending.length > 0) return
+    // F-267 step 2: never while Silent.
+    if (fillers !== 'words' || silent || blocked() || queue.length > 0 || pending.length > 0) return
     const t = fillerTurn()
     if (!t) return
     const filler = (text: string, kind: SayKind) => {
@@ -2189,6 +2702,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     pending = []
     held = false
     lost = null
+    // F-267 step 2: nothing kept for him and nothing held for a short sound's words after the end.
+    kept = []
+    checking.clear()
+    // Lead's ruling (fail closed), F-267 step 2: nor stuck.
+    stuck = null
     if (reason === 'end') {
       act({ t: 'drop-cards' })
       // The view agrees with what the page was told (review of T3a: the dropped cards were still listed).
@@ -2200,27 +2718,68 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     endedWhy = why
     dirty = true
   }
-  /** Something is going on: he talks or is being heard, a turn or an order is out, or it speaks. The silence of auto-end is none of these. */
+  /**
+   * Something is going on: he talks or is being heard, a turn or an order is out, or it speaks. The silence of auto-end is none of these. Lead's
+   * ruling (fail closed), F-267 step 2: nor is a stuck answer (held, and what waits behind it), so 2 minutes of quiet still end a talk he walked
+   * away from; a check still out is something going on, as before (reqs).
+   */
   const busy = () =>
     seg.hearing ||
     (utt !== null && utt.parts.length > 0) ||
     sealed.length > 0 ||
     reqs.size > 0 ||
-    queue.length > 0 ||
-    pending.length > 0 ||
-    held ||
+    (stuck === null && (queue.length > 0 || pending.length > 0 || held)) ||
     turns.some(t => t.generating) ||
     [...orders.values()].some(od => OUT.includes(od.phase))
   function checkAutoEnd() {
     if (o.autoEndMs === null || !started || ended) return
+    // F-267 step 2 (o7be4): not while Silent (its own end is checkSilentEnd); out of it, the quiet counts again from then (leaveSilent).
+    if (silent) return
     if (busy()) lastActive = now
     else if (now - lastActive >= o.autoEndMs) {
       const min = Math.round(o.autoEndMs / 60_000)
       finish('silence', min >= 1 ? `Ended after ${min} minute${min === 1 ? '' : 's'} of quiet.` : 'Ended after a quiet while.')
     }
   }
+  /**
+   * F-267 step 2 (o7be4): Silent's own end, when the page ends a talk by itself at all (its auto-end is on): TALK.silentEndMs with no "Quick"
+   * command, wake or tap of his. With only End ending it, Silent goes on until End, as listening does.
+   */
+  function checkSilentEnd() {
+    if (!silent || o.autoEndMs === null || !started || ended) return
+    if (now - silentAt >= TALK.silentEndMs) finish('silence', SILENT_ENDED)
+  }
+  /** F-267 step 2 (o7be4): his Silent, Speak or Say it: what was said before it is only shown, never acted on, and a short sound's check goes. */
+  function markQuiet() {
+    for (const u of utt ? [...sealed, utt] : sealed) u.quiet = true
+    dropChecks()
+  }
+  /** The checks of his short sounds over the answer are given up (Stop; F-267 step 2: his Silent, Speak or Say it too). */
+  function dropChecks() {
+    for (const [req, r] of reqs) {
+      if (r.kind !== 'check') continue
+      reqs.delete(req)
+      act({ t: 'stt-abort', req })
+    }
+    checking.clear()
+  }
+  /**
+   * F-267 step 2 (o7be4): his Speak or Say it: the room's words still with Whisper are given up (they would only be shown, as "Someone spoke"),
+   * so his next words are not decided after them.
+   */
+  function giveUpRoom() {
+    for (const [req, r] of reqs) {
+      if (r.kind !== 'part' || !r.utt.room) continue
+      reqs.delete(req)
+      act({ t: 'stt-abort', req })
+      r.part.done = true
+      r.part.failed = true
+    }
+  }
 
   function onUser(a: TalkUserAct) {
+    // F-267 step 2 (o7be4): any tap of his while Silent is his "Quick": Silent's own end counts from it.
+    if (silent) silentAt = now
     switch (a) {
       case 'end':
         return finish('end', 'Live talk ended.')
@@ -2246,11 +2805,7 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         stopAll()
         // o0de2 round 2: a question his voice cut off and he then stopped is over: it is never merged into his later words (askedSince).
         for (const t of turns) t.byVoice = false
-        for (const [req, r] of reqs) {
-          if (r.kind !== 'check') continue
-          reqs.delete(req)
-          act({ t: 'stt-abort', req })
-        }
+        dropChecks()
         // o0de2: his earlier turns still with Whisper too (each is decided on its own, as a new question).
         for (const u of utt ? [...sealed, utt] : sealed) {
           u.policy = 'plain'
@@ -2260,6 +2815,35 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         }
         dirty = true
         return
+      // F-267 step 2 (o7be4): the Quick page's own buttons (a brain without TalkOptions.quickPage does nothing on them).
+      case 'silent':
+        if (!page || silent) return
+        enterSilent()
+        markQuiet()
+        return settle()
+      case 'speak':
+        // Lead's ruling (fail closed), F-267 step 2: listening, his Speak over an answer held for a short sound's words (stuck, or a check still
+        // out) is "go on". While Silent it is as before.
+        if (page && !silent && (stuck !== null || checking.size > 0)) return goOn()
+        if (!page || !silent) return
+        markQuiet()
+        giveUpRoom()
+        leaveSilent()
+        wakeTone()
+        return settle()
+      case 'continue': {
+        // Say it: shown only while something is kept (or being written) for him; while Silent it listens again with nothing kept, as Speak.
+        if (!page || (!silent && !hasKept())) return
+        // Lead's ruling (fail closed), F-267 step 2: listening, over an answer held for a short sound's words, Say it goes on with that answer
+        // first (as Speak does: no stale "still listening" line with no check out); what was kept is said after it.
+        if (!silent && (stuck !== null || checking.size > 0)) goOn()
+        const was = silent
+        markQuiet()
+        giveUpRoom()
+        if (was) leaveSilent()
+        if (!sayKept() && was) wakeTone()
+        return settle()
+      }
       default:
     }
   }
@@ -2271,14 +2855,21 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
     if (!started) return utt?.open ? 'hearing' : [...sealed, utt].some(u => u?.parts.some(p => !p.done)) ? 'writing' : 'starting'
     // His voice now; o0de2: then his words with Whisper while he is quiet (it said "hearing you" for as long as Whisper took).
     if (utt?.open) return 'hearing'
-    if (utt || sealed.length > 0) return 'writing'
+    // F-267 step 2 (o7be4): a short sound's words still with Whisper hold the answer (the page's, see checking): his words are being written.
+    if (utt || sealed.length > 0 || checking.size > 0) return 'writing'
+    // Lead's ruling (fail closed), F-267 step 2: a stuck answer is not being said: it listens for his Speak or his next words (look.ts: Paused).
+    if (stuck !== null) return 'listening'
     if (queue.some(s => s.kind === 'answer') || pending.some(s => s.kind === 'answer')) return 'speaking'
-    if (turns.some(t => t.generating)) return 'thinking'
+    // F-267 step 2: an answer being written for him to hear later (a quiet turn) is not "thinking": nothing will be said of it by itself.
+    if (turns.some(t => t.generating && !t.quiet)) return 'thinking'
     if (queue.length > 0) return 'speaking'
     return 'listening'
   }
   function caption(): string {
     if (ended) return endedWhy ?? ''
+    // Lead's ruling (fail closed), F-267 step 2: held for his words, the caption is its line (nothing plays). Read from stuck, so a tool line, an
+    // error or its own line written meanwhile never hides it, and it is gone the moment stuck is (a resume, his tap, a drop, Silent, the end).
+    if (stuck !== null) return stuck === 'failed' ? STUCK_FAILED : STUCK_LISTENING
     const s = held ? undefined : queue.find(q => q.started)
     return s ? s.text : info
   }
@@ -2340,6 +2931,12 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         flushPending()
         checkFillers()
         checkAutoEnd()
+        // F-267 step 2 (o7be4): the kept answer's 5 minutes, and Silent's own end; Lead's ruling (fail closed), F-267 step 2: the tell timer.
+        if (page) {
+          expireKept()
+          checkTell()
+          checkSilentEnd()
+        }
       }
       const sig = `${phase()}|${caption()}|${muted}`
       if (dirty || sig !== lastSig) {
@@ -2359,6 +2956,11 @@ export function createTalkBrain(given: Partial<TalkOptions> = {}): TalkBrain {
         cards: cards.map(c => ({ ...c })),
         muted,
         ...(endedWhy !== undefined ? { endedWhy } : {}),
+        // F-267 step 2 (o7be4): only on the Quick page, and only when so (the views of before keep their shape).
+        ...(silent && !ended ? { silent: true } : {}),
+        ...(kept.length > 0 ? { waiting: new Set(kept.map(s => s.turn ?? s.of)).size } : {}),
+        // Lead's ruling (fail closed), F-267 step 2: only on the Quick page, and only while so.
+        ...(stuck !== null && !ended ? { stuck } : {}),
       }
     },
   }

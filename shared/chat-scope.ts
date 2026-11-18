@@ -106,7 +106,9 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
 // Order obb81: the Agents page (every agent's brief, notes, memory files and replies) is the owner's for now. Placed before '/phone-app': other pages'
 // wiring tests pin the tail of this list ('/phone-app', OLD_ROUTE ... and OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE at the end).
 // Order o088b (F-267): the Quick page (live talk on its own page, the locked "talk" feature) is the owner's; placed before '/phone-app' too.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', AGENT_DIRECTORY_ROUTE, QUICK_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+// Orders o5c05 / o7c7c: Getting started ('/start') is a page of its own (its Access rows are in shared/access.ts), so it is open to the people the owner chose when the agent sends the
+// list; with no list (an older agent) it is the owner's like every page that is not Home, Features, Themes, Agents, Chats or Settings. Placed after '/setup', where it belongs.
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/start', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', AGENT_DIRECTORY_ROUTE, QUICK_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

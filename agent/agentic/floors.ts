@@ -38,6 +38,16 @@ const NAME_MAX = 80
 const ROLE_MAX = 120
 const LIST_MAX = 64
 
+/**
+ * The most a PATCH /floors/<id> body may weigh (order o869c follow-up). The page saves ONE field by sending EVERY agent (store.ts patchFloor), so the
+ * body grows with the floor: Agentic Platform passed the API's usual 64 KiB (api.ts MAX_BODY) with 19 agents, and every save from the page there
+ * (rename, brief, engine switch, model) failed with 413. This is what a full floor can legitimately weigh: the most agents, each with the longest
+ * brief and 16 KiB for the rest of its record.
+ * THE CAP IS A PLASTER, NOT THE ANSWER. The defect is that one change carries every other agent's record past the server; the cure is a narrow save
+ * that sends only what changed (PATCH /floors/<id>/agents/<agentId>). Until then a whole-floor save grows with the floor and will meet any cap.
+ */
+export const MAX_FLOOR_BODY = MAX_AGENTS_PER_FLOOR * (AGENT_BRIEF_MAX + 16 * 1024)
+
 const now = () => new Date().toISOString()
 const str = (v: unknown, max: number, fallback = '') => (typeof v === 'string' ? v.slice(0, max) : fallback)
 const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback)
@@ -215,8 +225,13 @@ export interface FloorStore {
    * F-127: a floor a member made while the hub was out of reach, taken in WHOLE with its ids, owners, shares and chats. Its chats' home is the member.
    * A floor that is here already (same id) is left as it is: adopting twice is a no-op. Another floor with the same name: this one is named
    * "<name> (<member's name>)" (and numbered if that too is taken). `created` is false for the no-op.
+   * Whose word it takes (opts.adoptTrust): a member's floor names its maker, its chats' owners and who they are shared with, and none of that is the
+   * hub's to accept on the member's say. With `adoptTrust` set (the hub, always), a person is kept only when the hub already lists them (an administrator,
+   * someone Settings > Access lets use Agents, or someone already on one of its own floors); any other maker or chat owner becomes the hub's owner and any
+   * other sharee is dropped, and `restamped` counts what was put back. The floor, its chats and their content all arrive; only who they belong to is
+   * put right, and the member keeps its own copy as it was. Adoption can then never MINT a floor-holder (it does not stop the Agents row doing so directly).
    */
-  adopt(raw: unknown, from: { id: string; name: string }): { floor: Floor; created: boolean; renamedFrom: string | null }
+  adopt(raw: unknown, from: { id: string; name: string }): { floor: Floor; created: boolean; renamedFrom: string | null; restamped?: AdoptRestamped }
   remove(id: string): Floor | null
   reorder(order: string[]): Floor[]
   /**
@@ -288,8 +303,24 @@ export function ensureDuty(floors: Floor[]): boolean {
   return changed
 }
 
+/** F-127: what adopt() put back on a member's floor because the hub did not list the person: makers and chat owners made the hub's owner, sharees dropped. */
+export interface AdoptRestamped {
+  makers: number
+  owners: number
+  sharees: number
+}
+
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
 export interface FloorStoreOptions {
+  /**
+   * F-127 (the trust boundary of adopt): the hub's owner and administrators, and `allowed`: whether the owner's Settings > Access lets this person use Agents
+   * (named, or everyone). Read at each adopt. Given, adopt() keeps a maker, a chat owner or a sharee only if the hub already lists that person: an administrator,
+   * someone `allowed`, or someone already on one of its OWN floors as maker, owner or sharee. Each of those can make or hold a floor here already, so adopting
+   * adds no floor-holder the owner did not make. A person that cannot be verified is the same case as one that is not listed (no `allowed`: nobody is verified),
+   * so there is no "no sign-in, take them whole" branch for a hub to fall into. ONLY a store made without `adoptTrust` (one that adopts nothing: a member's own
+   * local store, a test) takes a floor whole; the hub always passes it.
+   */
+  adoptTrust?: () => { owner: ChatOwner; admins: readonly string[]; allowed?: (personId: string) => boolean }
   /** Absent in production in this phase: real storage, ACL/source fences and target proof are not wired. */
   executionAuthority?: FloorExecutionAuthority
   /** Check the other canonical stores before persisting a discovered native binding. */
@@ -824,6 +855,35 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         a.homePc = a.sessionId ? from.id : null
         a.homePcName = a.sessionId ? from.name.slice(0, NAME_MAX) : null
       }
+      // F-127: the member's word about WHO made, owns or was shared the floor is kept only for people this hub already lists (opts.adoptTrust). The people it
+      // lists are its administrators and everyone on one of its OWN floors (read before this floor is added): they are floor-holders already, so an adopted
+      // floor cannot make a new one. Any other maker or chat owner is put back as the hub's owner; any other sharee is dropped (a share cannot be made to the owner).
+      const restamped: AdoptRestamped = { makers: 0, owners: 0, sharees: 0 }
+      const trust = opts.adoptTrust?.()
+      if (trust) {
+        const known = new Set<string>([trust.owner.id, ...trust.admins])
+        for (const x of floors) {
+          if (x.createdBy) known.add(x.createdBy.id)
+          for (const a of x.agents) {
+            if (a.owner) known.add(a.owner.id)
+            for (const s of a.sharedWith ?? []) known.add(s.id)
+          }
+        }
+        const listed = (id: string) => known.has(id) || trust.allowed?.(id) === true
+        if (f.createdBy && !listed(f.createdBy.id)) {
+          f.createdBy = { ...trust.owner }
+          restamped.makers++
+        }
+        for (const a of f.agents) {
+          if (a.owner && !listed(a.owner.id)) {
+            a.owner = { ...trust.owner }
+            restamped.owners++
+          }
+          const kept = (a.sharedWith ?? []).filter(s => listed(s.id))
+          restamped.sharees += (a.sharedWith ?? []).length - kept.length
+          a.sharedWith = kept
+        }
+      }
       const clash = (name: string) => floors.some(x => x.name.trim().toLowerCase() === name.trim().toLowerCase())
       let renamedFrom: string | null = null
       if (clash(f.name)) {
@@ -836,7 +896,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       f.updatedAt = now()
       floors = [f, ...floors]
       save()
-      return { floor: clone(f), created: true, renamedFrom }
+      return { floor: clone(f), created: true, renamedFrom, ...(trust ? { restamped } : {}) }
     },
 
     assignUnowned(owner) {

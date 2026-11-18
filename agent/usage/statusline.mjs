@@ -36,14 +36,18 @@ function writeAtomic(file, text) {
   fs.renameSync(tmp, file)
 }
 
+// Order of130: no figure is not 0. Number(null) and Number('') are 0, so a window Claude Code had no figure for (null, an empty string) read as "0% used": in the snapshot that goes to the CRM, where it could stand
+// in for a real reading, and in the line printed below. Only a null, an empty string or a missing value is "no figure"; a real 0, a number and a numeric string read as they always did.
+const figure = v => (v === null || v === undefined || (typeof v === 'string' && v.trim() === '') ? NaN : Number(v))
+
 function windowOf(w) {
   if (!w || typeof w !== 'object') return null
-  const percent = Number(w.used_percentage)
-  const resets = Number(w.resets_at)
-  return {
-    percent: Number.isFinite(percent) && percent >= 0 && percent <= 101 ? percent : null,
-    resetsAt: Number.isFinite(resets) && resets > 0 ? new Date(resets * 1000).toISOString() : null,
-  }
+  const percent = figure(w.used_percentage)
+  const resets = figure(w.resets_at)
+  const p = Number.isFinite(percent) && percent >= 0 && percent <= 101 ? percent : null
+  const r = Number.isFinite(resets) && resets > 0 ? new Date(resets * 1000).toISOString() : null
+  // A window with neither a percentage nor a reset time is no reading at all (snapshots.ts says the same): writing it would wipe the last real reading of that account with nulls.
+  return p === null && r === null ? null : { percent: p, resetsAt: r }
 }
 
 function chained(input) {
@@ -114,7 +118,7 @@ function main() {
   const model = j?.model?.display_name ?? j?.model?.id ?? ''
   const five = j?.rate_limits?.five_hour?.used_percentage
   const week = j?.rate_limits?.seven_day?.used_percentage
-  const parts = [model, Number.isFinite(Number(five)) ? `5h ${Math.round(Number(five))}%` : null, Number.isFinite(Number(week)) ? `week ${Math.round(Number(week))}%` : null]
+  const parts = [model, Number.isFinite(figure(five)) ? `5h ${Math.round(figure(five))}%` : null, Number.isFinite(figure(week)) ? `week ${Math.round(figure(week))}%` : null]
   process.stdout.write(`${parts.filter(Boolean).join(' · ')}\n`)
 }
 

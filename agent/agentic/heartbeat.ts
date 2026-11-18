@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import { writeAtomic } from '../config.ts'
 
 // F-078: the Heartbeat. Every few minutes (5 by default; a setting) the hub looks over every chat on
@@ -149,7 +150,27 @@ export interface HeartbeatDeps {
   log?: { info(m: string): void; warn(m: string): void }
 }
 
-export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent' | 'alarm'
+export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent' | 'alarm' | 'drift'
+
+/**
+ * What the heartbeat's news pushes to the phone (index.ts hands the rest to nobody: the Assistant is told and the log has it either way).
+ * F-083: no push between 23:00 and 07:00 for what the watchdog found (menu, down, silent); it is in the morning summary.
+ * A DRIFT (codex/drift.ts) is STAGED (Lead, 18 Nov): it is told to the Assistant and logged from the first beat, and pushed to the phone only once
+ * `<state>/agent/drift-push.on` exists (or SAD_DRIFT_PUSH=on). Create it only after several beats after the publish that carries the check have read clean: a
+ * detector that false-fires does not annoy an agent, it wakes Shubham on his phone, at night, about nothing, and he stops trusting the next one. Once on, a drift
+ * follows the night rule too.
+ */
+export function phoneItems<T extends { kind: FindingKind }>(items: readonly T[], o: { hour: number; driftPush: boolean }): T[] {
+  // (the switch itself is driftPushOn below)
+  const quiet = o.hour >= 23 || o.hour < 7
+  return items.filter(i => {
+    if (i.kind === 'drift') return o.driftPush && !quiet
+    return !(quiet && (i.kind === 'menu' || i.kind === 'down' || i.kind === 'silent'))
+  })
+}
+
+/** The staging switch of a drift's phone push: the file `drift-push.on` in the agent's state folder (beside chat-host.on), or SAD_DRIFT_PUSH=on. Read at every push, so creating the file needs no restart. */
+export const driftPushOn = (agentDir: string, env: NodeJS.ProcessEnv = process.env): boolean => env.SAD_DRIFT_PUSH === 'on' || existsSync(path.join(agentDir, 'drift-push.on'))
 
 export interface Finding {
   kind: FindingKind

@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { apiError, type ApiMount, type WsSocket } from '../api.ts'
 import type { Logger } from '../log.ts'
-import { DICTATION_WINDOW, type Engine, type TranscribeOptions } from './engine.ts'
+import { DICTATION_WINDOW, SILENT_HOLD_MB, type Engine, type TranscribeOptions } from './engine.ts'
 import { DictationChunker } from './dictation.ts'
 import { Segmenter } from './segmenter.ts'
 import { marksHeader, type Tts } from './tts.ts'
@@ -9,8 +9,10 @@ import { pcmMs, wavToPcm } from './wav.ts'
 
 // F-080: the hub's speech service, under /agent-api/speech (the app's token, like the rest of the page's API).
 //   GET  /speech/status                   {available, why?, model, loaded, busy, voice}   (voice: the PC voice's status, F-221)
-//   POST /speech/warm                     load the model now (the mic was pressed)
-//   POST /speech/transcribe?lang=&before=&words=a,b&guess=1   one utterance, whole, as a raw body: audio/wav
+//   POST /speech/warm                     load the model now (the mic was pressed). F-267 step 2 (o7be4): {silent: true} (the Quick page's
+//                                         keep-warm while Silent) loads or holds it only with SILENT_HOLD_MB free, else nothing is loaded or
+//                                         touched; its answer adds `held` (whether it holds it now)
+//   POST /speech/transcribe?lang=&before=&words=a,b&guess=1&room=1   one utterance, whole, as a raw body: audio/wav
 //                                         (16 kHz mono 16-bit) or application/octet-stream (that PCM) -> {text, raw, dropped?, audioMs, ms}
 //                                         o0de2 round 3: `dropped` when ALL of what Whisper wrote was one of its known inventions on
 //                                         silence or noise (words.ts: "Thank you.", "you", "[BLANK_AUDIO]"...): what it was; the text is ''.
@@ -19,7 +21,10 @@ import { pcmMs, wavToPcm } from './wav.ts'
 //                                         or queued, or is loading the model, it is 409 {busy: true} at once, and nothing is queued. A request
 //                                         the page drops (an aborted fetch, a closed tab) before Whisper has started on it (still queued, or
 //                                         waiting for the model to load) is dropped: never run.
-//                                         Every job leaves one log line, numbers only (engine.ts).
+//                                         F-267 step 2 (o7be4): room=1 is a piece the Quick page heard while Silent: 503 {error, refused:
+//                                         'memory' | 'busy'} at once, with nothing loaded, touched or queued, under SILENT_HOLD_MB free or while
+//                                         Whisper has any work; else it is written as any piece.
+//                                         Every job leaves one log line, numbers only (engine.ts); room pieces one line of counts a minute.
 // F-221 (order ob98a): the PC voice (agent/speech/tts.ts: Windows' own voices, rendered on this PC for live talk's page to play):
 //   POST /speech/say                      {text, voice?, lang?, rate?} -> audio/wav (16-bit PCM, silence at the ends trimmed), with
 //                                         X-Speech-Marks (encodeURIComponent of the JSON [{ms, start, end}]: each word's start in the audio, and
@@ -119,10 +124,13 @@ export function transcribeRaw(engine: Engine) {
       const q = new URL(req.url ?? '/', 'http://agent').searchParams
       const words = (q.get('words') ?? '').split(',').filter(Boolean)
       const guess = q.get('guess') === '1'
-      const r = await engine.transcribe(pcm, { ...opts({ lang: q.get('lang') ?? undefined, before: q.get('before') ?? undefined, words }), ...(guess ? { guess: true } : {}) }, { signal: gone })
+      // F-267 step 2 (o7be4): a piece the Quick page heard while Silent (the engine may refuse it rather than wait, load or keep Whisper).
+      const room = q.get('room') === '1'
+      const r = await engine.transcribe(pcm, { ...opts({ lang: q.get('lang') ?? undefined, before: q.get('before') ?? undefined, words }), ...(guess ? { guess: true } : {}), ...(room ? { room: true } : {}) }, { signal: gone })
       answerJson(res, 200, r ?? { text: '', raw: '', audioMs: pcmMs(pcm), ms: 0 })
     } catch (e) {
-      answerJson(res, (e as { status?: number }).status ?? 500, { error: e instanceof Error ? e.message : String(e), ...((e as { busy?: unknown }).busy === true ? { busy: true } : {}) })
+      const refused = (e as { refused?: unknown }).refused
+      answerJson(res, (e as { status?: number }).status ?? 500, { error: e instanceof Error ? e.message : String(e), ...((e as { busy?: unknown }).busy === true ? { busy: true } : {}), ...(refused === 'memory' || refused === 'busy' ? { refused } : {}) })
     }
   }
 }
@@ -416,8 +424,15 @@ export function speechMount(engine: Engine, log?: Logger, tts?: Tts): ApiMount {
       const { method, rest } = r
       if (method === 'GET' && rest === '/status') return status()
       if (method === 'POST' && rest === '/warm') {
-        await engine.warm()
-        return status()
+        // F-267 step 2 (o7be4, PLAN 3.4 rule 2): the Quick page's keep-warm while Silent holds Whisper only with SILENT_HOLD_MB free, and says
+        // whether it holds it (`held`). A plain warm is as before. (A body can only make a warm stricter.)
+        const silent = r.body !== null && typeof r.body === 'object' && (r.body as Record<string, unknown>).silent === true
+        if (!silent) {
+          await engine.warm()
+          return status()
+        }
+        const held = await engine.warm({ minFreeMb: SILENT_HOLD_MB })
+        return { ...status(), held }
       }
       if (method === 'GET' && rest === '/voices') return voice().voices()
       if (method === 'POST' && rest === '/say/warm') return voice().warm()

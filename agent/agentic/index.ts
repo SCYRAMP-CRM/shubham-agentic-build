@@ -27,6 +27,7 @@ import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { createUsage, buildIdOf, type Usage } from '../usage/usage.ts'
+import { usageSubKeyOf } from '../usage/sub-key.ts'
 import { claudeConfigDir, ownStatusLineCommand } from '../usage/own-status-line.ts'
 import {
   AGENTIC_PREFIX,
@@ -92,7 +93,7 @@ import { createTalkStage } from './talk-stage.ts'
 import { LATCH_NAME } from './latch-hook.ts'
 import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
-import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
+import { createHeartbeat, driftPushOn, phoneItems, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
 import { createVoice, type AskView } from './voice.ts'
@@ -131,7 +132,7 @@ import type { SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalLogEntry, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
-import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from './floors.ts'
+import { createFloorStore, assertCodexThreadAvailable, MAX_FLOOR_BODY, type FloorStore } from './floors.ts'
 import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
 import { appCommand, STAFF_OWNER_RE, STAFF_POLICY, STAFF_TOOLS, STAFF_TOOLS_STAMP, staffBrief, staffMcpConfig, staffSettings, staffToolAllowed, staffUsageEnv } from './staff-policy.ts'
 import { staffMayScreen } from '../../shared/staff-screen.ts'
@@ -146,6 +147,7 @@ import { buildMcpInventory, findRunner, planInstall, registerCurated, removeCura
 import { MCP_CURATED, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
+import { readLaunched, readRunning, type DriftReading } from '../codex/drift.ts'
 import { watchForThread } from '../codex/discovery.ts'
 import { switchConversationComplete } from '../codex/complete-conversion.ts'
 import { createConversionProgress } from './conversion-progress.ts'
@@ -415,8 +417,11 @@ export interface AgenticOptions {
   codex?: CodexManager | null
   /** F-134, tests: shorter waits for the sender of a Codex chat. */
   codexSend?: SendOptions
-  /** F-138: the Claude credential the CRM handed out (claude/index.ts credentialEnv): exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY. Left out (tests), `token` applies as before. */
-  credential?: () => { name: string; value: string } | null
+  /**
+   * F-138: the Claude credential the CRM handed out (claude/index.ts credentialEnv): exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY. Left out (tests), `token` applies as before.
+   * Order of130: with the id of the CRM subscription it belongs to (claude/index.ts credentialWithSubscription: ONE read), which the usage of a chat started on it is filed under.
+   */
+  credential?: () => { name: string; value: string; subscriptionId?: string } | null
   /** F-127, tests: how long the Server must be out of reach before new chats are made here (default 20 s). */
   offlineAfterMs?: number
   /** F-127, tests: how long after a failed joining it is tried again (default 30 s). */
@@ -833,6 +838,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
       SAD_STATUSLINE_CHAIN: own ? Buffer.from(own, 'utf8').toString('base64') : '',
     }
   }
+  /**
+   * Order of130: the subscription key a Claude process started on the credential `cred` files its usage under (usage/sub-key.ts): the credential's subscription id, else the blank key (the PC's own login, and the
+   * old way: the marker file usage-sub.off beside the agent folder). Built on the PC that starts the chat, from that PC's own credential: the hub never labels a chat that runs on another PC. A label that is not a
+   * UUID would be dropped by the status line without a word, so it is said here, once per id.
+   */
+  const notKeys = new Set<string>()
+  const usageSubFor = (cred: { subscriptionId?: string } | null | undefined): string =>
+    usageSubKeyOf(cred, path.join(o.dir, '..'), id => {
+      if (notKeys.has(id)) return
+      notKeys.add(id)
+      log?.warn(`claude usage: the CRM's subscription id "${id.slice(0, 40)}" is not a UUID, so the usage of the chats started on it is filed as "this PC's own login" (not managed)`)
+    })
   /** What a Claude chat starts with (chats.ts asks once per start, never for Codex or Codex in Claude Code). */
   function chatSettings(s: StartChat): string | undefined {
     // Order o7e6d: a staff chat gets its own file (never the memory's recall, the voice lock or a coding chat's file); a failed write throws.
@@ -953,7 +970,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
+  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t),
+    // F-127: a member's floor arrives whole (its chats, their content), but only the people this hub already lists keep their place in it (floors.ts adopt): an
+    // administrator, someone Settings › Access lets use Agents, or someone already on one of its floors. Always on: with no sign-in wired (a test) nobody can be
+    // verified, so nobody is `allowed` and only the owner and the people already on its floors keep a place; a lapsed session changes none of these inputs.
+    adoptTrust: () => ({
+      owner: SBSKRRT_OWNER,
+      admins: [SBSKRRT_OWNER.id, ...(o.auth?.admins() ?? [])],
+      ...(o.auth && o.featureAccess ? { allowed: (id: string) => o.featureAccess!.allows({ person: { id, username: '', name: '', canSeeAll: false }, via: 'local', sid: null }, 'agents') === true } : {}),
+    }) })
   // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
   // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
   // the hub's and a PC alone's is the usual one.
@@ -1690,6 +1715,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     token: o.token,
     credential: o.credential,
+    // Order of130: a chat started on the CRM's credential files its usage under that subscription (the same read of the credential gives the label).
+    usageSub: usageSubFor,
     // F-051: recall in every prompt, once the memory layer is on (main.ts). Else the prompt report (12 Nov), unless it is switched off:
     // asked each time a chat starts, so the switch is looked at then. F-221 (T4): the Orchestrator's chat gets its own file, with the voice lock.
     settings: chatSettings,
@@ -3220,7 +3247,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       for (const f of all) {
         const theirs = replica.floors.find(x => x.id === f.id)!
-        const same = f.agents.length === theirs.agents.length && f.agents.every(a => theirs.agents.some(b => b.id === a.id && b.sessionId === a.sessionId && b.owner?.id === a.owner?.id))
+        // The Server puts its OWN owner where the floor named a person it does not list (floors.ts adopt, F-127): that is the one owner that may differ.
+        const same = f.agents.length === theirs.agents.length && f.agents.every(a => theirs.agents.some(b => b.id === a.id && b.sessionId === a.sessionId && (b.owner?.id === a.owner?.id || b.owner?.id === SBSKRRT_OWNER.id)))
         if (!same) throw new Error(`the Server lists floor "${f.name}" differently from this PC`)
       }
       writeAtomic(path.join(o.dir, `floors-local.adopted-${new Date().toISOString().replace(/[:.]/g, '-')}.json`), `${json({ at: new Date().toISOString(), to: link.name, floors: all })}\n`)
@@ -3251,8 +3279,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (isObject(f) && (f.workspace === 'pc-control' || (typeof f.id === 'string' && controlAlias(f.id)) || (Array.isArray(f.agents) && f.agents.some(a => isObject(a) && (a.pcControlSlot !== undefined || [a.id, a.sessionId, a.codexThread, a.opencodeSession].some(x => typeof x === 'string' && controlAlias(x))))))) throw immutablePcControl()
     }
     for (const f of raw.floors) {
-      const { floor, created, renamedFrom } = hubFloors.adopt(f, from)
+      const { floor, created, renamedFrom, restamped } = hubFloors.adopt(f, from)
       out.push({ id: floor.id, name: floor.name, created, renamedFrom })
+      // F-127: a floor that named people this hub does not list was taken in with its owner in their place: said here, never silently.
+      if (created && restamped && (restamped.makers || restamped.owners || restamped.sharees)) {
+        log?.warn(`F-127: ${from.name}'s floor "${floor.name}" named people this Server does not list: ${restamped.makers} maker and ${restamped.owners} chat owner(s) put back as its owner, ${restamped.sharees} share(s) dropped`)
+      }
       const list = notes[floor.id]
       if (created && Array.isArray(list)) {
         for (const x of list.slice(0, 500)) {
@@ -4357,6 +4389,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
   const startedAtMs = Date.now()
+  /**
+   * Lead's order after Agent 19 (18 Nov): the model and effort a Codex chat on this PC RUNS on, from its own conversation file, against what the app started it with
+   * (its profile) and what is saved (codex/drift.ts). Null when it cannot be told: not Codex, not on this PC, no conversation yet, nothing recorded since it started.
+   * A row written a moment before the app noted the start still counts (the start is noted when the chat object is made, the row when Codex is up).
+   */
+  function codexDrift(sid: string): DriftReading | null {
+    const at = floors.bySession(sid), info = chats.info(sid)
+    if (!o.codex || !at || !info || info.engine !== 'codex') return null
+    const thread = at.agent.codexThread
+    const since = Date.parse(info.startedAt)
+    if (!thread || !Number.isFinite(since)) return null
+    const home = o.codex.paths.home
+    const file = findRollout(home, thread)
+    const running = file ? readRunning(file, since - 3000) : null
+    if (!running) return null
+    const d = defaultsNow()
+    return { running, launched: readLaunched(home, sid), saved: { model: at.agent.codexModel || d.codexModel || '', effort: at.agent.codexEffort || d.codexEffort || '' } }
+  }
+
   // F-083: the watchdog (watchdog.ts) is called by each beat of the heartbeat, so it needs no chat to be alive.
   const watchdogOn = o.watchdog ?? process.env.SAD_WATCHDOG !== '0'
   const watchdog = createWatchdog({
@@ -4399,6 +4450,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     asking: sid => chats.asking(sid),
     press: (sid, keys) => chats.press(sid, keys),
     activity: sid => chats.activity(sid),
+    drift: codexDrift,
     record: e => chatLog.append({ event: 'watch', sessionId: e.sessionId, agent: e.agent, floor: e.floor, cause: e.cause, what: e.what, did: e.did }),
   })
 
@@ -4462,10 +4514,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     wake: body => tellAssistant(body),
     news: items => {
-      // F-083: no phone push between 23:00 and 07:00 for what the watchdog found; it is in the morning summary (chat-events.jsonl).
-      const h = new Date().getHours()
-      const quiet = h >= 23 || h < 7
-      const shown = quiet ? items.filter(i => !['menu', 'down', 'silent'].includes(i.kind)) : items
+      // F-083: no phone push between 23:00 and 07:00 for what the watchdog found; it is in the morning summary (chat-events.jsonl). A drift is STAGED: told to the
+      // Assistant and logged at once, pushed to the phone only once <state>/agent/drift-push.on exists (heartbeat.ts phoneItems says why).
+      const shown = phoneItems(items, { hour: new Date().getHours(), driftPush: driftPushOn(path.join(o.dir, '..')) })
       if (shown.length) voice.beat(shown.map(i => i.text).join(' '), shown.filter(i => i.agent).map(i => ({ floor: i.floor ?? '', agent: i.agent ?? '', what: i.kind })))
     },
     newerBuild: () => o.newerBuild?.() ?? null,
@@ -4866,6 +4917,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const quickForwarding = createQuickForwarding(path.join(o.dir, 'quick-forwarding.json'))
   if (quickForwarding.unreadable()) log?.warn('quick forwarding: the saved choice (quick-forwarding.json) could not be read; Quick asks first (the card until his tap) until he chooses again in Settings')
   const fastOn = o.fastAssistant ?? (process.env.SAD_FAST_ASSISTANT === '1' || existsSync(path.join(o.dir, '..', 'fast-assistant.on')))
+  // Order of130: the subscription key of the credential the Assistant's headless process was STARTED with (set in env() below, from the same read of the credential), under which its turns' cost is filed.
+  let fastSubKey = ''
   const fastHost: FastHost | undefined =
     fastOn && mode() !== 'member'
       ? createFastHost({
@@ -4876,7 +4929,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (!c) return null
             return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
           },
-          env: () => librarianEnv(process.env, o.token?.() ?? null, o.credential?.() ?? null),
+          env: () => {
+            const cred = o.credential?.() ?? null
+            fastSubKey = usageSubFor(cred)
+            return librarianEnv(process.env, o.token?.() ?? null, cred)
+          },
           dir: path.join(o.dir, 'fast'),
           history: quickHistory,
           toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
@@ -4889,7 +4946,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           onState: st => fastSession?.hostState(st),
           keepRunning: () => quickSettings.get().keepRunning,
           // Order ofedf (usage): the turn's running cost, filed under the one person whose Assistant is open (agent/usage; totals only, no text).
-          onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: '' }),
+          onCost: r => usage?.reading({ ...r, userId: fastOwner(), orgId: null, subscriptionKey: fastSubKey }),
           context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
           memory: readMemory,
           kill: async (pid, startedAt) => {
@@ -8915,6 +8972,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     scoped: true,
     // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall' || rest === '/mcp/tools',
+    // Order o869c follow-up: the page's whole-floor save (PATCH /floors/<id>) carries every agent, which passes the usual 64 KiB on a big floor. Only
+    // that path gets the larger limit (the only route with a body there; DELETE has none), and api.ts reads the body after the token and the access
+    // gate, so no anonymous caller reaches it. A plaster: floors.ts MAX_FLOOR_BODY says what the cure is.
+    maxBody: rest => (/^\/floors\/[^/]+$/.test(rest) ? MAX_FLOOR_BODY : undefined),
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
     raw: (rest, url) => {
       // F-221 (order oeb56): a turn record of live talk for the log. A raw route (its own small body, read in it), so the owner's-page check

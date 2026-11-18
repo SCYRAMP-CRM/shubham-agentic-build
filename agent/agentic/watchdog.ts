@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { writeAtomic } from '../config.ts'
+import { driftOf, driftText, type DriftReading } from '../codex/drift.ts'
 import type { ChatEvent } from './chat-log.ts'
 import type { AgentRef, ChatNow, Finding } from './heartbeat.ts'
 import { NUDGE_PREFIX } from './heartbeat.ts'
@@ -18,6 +19,8 @@ import { NUDGE_PREFIX } from './heartbeat.ts'
 //     screen (the same title, "Enter to continue") is never sent a key: the chat is started again, which discards the
 //     screen without pressing anything. Every other prompt is the heartbeat's to report; the Assistant's own is reported here.
 //   - a chat "running" with no output for SILENT_AFTER_MS is reported, never stopped.
+//   - a Codex chat that RUNS on another model or effort than the app started it with and than is saved (codex/drift.ts) is reported, never touched: the effect is
+//     read from Codex's own record, so it is caught whoever or whatever changed it (Agent 19, 18 Nov: sol/max became astra/ultra and nobody saw for 57 minutes).
 // Every event is one plain line in chat-events.jsonl (chat-log.ts). SAD_WATCHDOG=0 turns this off (the heartbeat goes on).
 
 export const MIN_FREE_COMMIT_MB = 3500
@@ -118,6 +121,11 @@ export interface WatchDeps {
   asking(sessionId: string): boolean
   press(sessionId: string, keys: string): boolean
   activity(sessionId: string): { lastOutputAt: number; background: string | null } | null
+  /**
+   * A Codex chat's model and effort as it RUNS now, against what it was started with and what is saved (codex/drift.ts); null for a chat that cannot be read:
+   * not Codex, not on this PC, or nothing recorded since it started. Optional: without it no drift is looked for.
+   */
+  drift?(sessionId: string): DriftReading | null
   sleep?(ms: number): Promise<void>
   /** One line in the chat log for the pattern and the morning summary. */
   record(e: { sessionId: string; agent: string; floor: string; what: string; cause: string; did: string }): void
@@ -134,6 +142,8 @@ interface Saved {
   downSince: Record<string, number>
   /** First seen at the same menu (ms). */
   menuSince: Record<string, number>
+  /** The drift written to the log for each chat (its key), so one drift is one line however many beats it lasts; gone when the drift is. */
+  drift: Record<string, string>
 }
 
 export interface WatchState {
@@ -181,6 +191,7 @@ export function createWatchdog(deps: WatchDeps): Watchdog {
     const events = deps.events(now - LOOKBACK_MS)
     const seenDown = new Set<string>()
     const seenMenu = new Set<string>()
+    const seenDrift = new Set<string>()
     const nowDown: WatchState['down'] = []
     let started = 0
     let freeMB: number | null | undefined
@@ -238,6 +249,24 @@ export function createWatchdog(deps: WatchDeps): Watchdog {
               const mins = Math.round(quiet / 60_000)
               findings.push({ kind: 'silent', key: `silent:${sid}:${Math.floor(act.lastOutputAt / 60_000)}`, did: false, agent: a.agentName, floor: a.floorName, text: `${who} says it is working but has printed nothing for ${mins} min. The app did not touch it.` })
               note('shows working but prints nothing', 'silent', `told Shubham after ${mins} min; did nothing to it`)
+            }
+          }
+        }
+        // ---- a Codex chat that runs on other settings than it was started with and than are saved: the EFFECT, whoever or whatever changed it. Reported, never touched.
+        if (deps.drift) {
+          let reading: DriftReading | null = null
+          try {
+            reading = deps.drift(sid)
+          } catch (e) {
+            deps.log?.warn(`watchdog: the model and effort of ${who} could not be read: ${e instanceof Error ? e.message : String(e)}`)
+          }
+          if (reading && driftOf(reading).length > 0) {
+            seenDrift.add(sid)
+            const key = `drift:${sid}:${reading.running.model}/${reading.running.effort}`
+            findings.push({ kind: 'drift', key, did: false, agent: a.agentName, floor: a.floorName, text: driftText(who, reading) })
+            if (saved.drift[sid] !== key) {
+              saved.drift[sid] = key
+              note(`runs ${reading.running.model} at ${reading.running.effort}, but was started on ${reading.launched.model} at ${reading.launched.effort}`, 'drift', 'told Shubham; changed nothing')
             }
           }
         }
@@ -305,6 +334,7 @@ export function createWatchdog(deps: WatchDeps): Watchdog {
     // Things no longer true are forgotten.
     for (const k of Object.keys(saved.downSince)) if (!seenDown.has(k)) delete saved.downSince[k]
     for (const k of Object.keys(saved.menuSince)) if (!seenMenu.has(k)) delete saved.menuSince[k]
+    for (const k of Object.keys(saved.drift)) if (!seenDrift.has(k)) delete saved.drift[k]
     for (const k of Object.keys(saved.restarts)) if (!(saved.restarts[k] ?? []).some(t => now - t < 3_600_000) && !seenDown.has(k)) delete saved.restarts[k]
     for (const k of Object.keys(saved.nextTry)) if (saved.nextTry[k] <= now) delete saved.nextTry[k]
     downNow = nowDown
@@ -319,12 +349,12 @@ export function createWatchdog(deps: WatchDeps): Watchdog {
 }
 
 function load(file: string | undefined): Saved {
-  const fresh: Saved = { restarts: {}, nextTry: {}, downSince: {}, menuSince: {} }
+  const fresh: Saved = { restarts: {}, nextTry: {}, downSince: {}, menuSince: {}, drift: {} }
   if (!file || !existsSync(file)) return fresh
   try {
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<Saved>
     const obj = <T>(v: unknown): Record<string, T> => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, T>) : {})
-    return { restarts: obj<number[]>(raw.restarts), nextTry: obj<number>(raw.nextTry), downSince: obj<number>(raw.downSince), menuSince: obj<number>(raw.menuSince) }
+    return { restarts: obj<number[]>(raw.restarts), nextTry: obj<number>(raw.nextTry), downSince: obj<number>(raw.downSince), menuSince: obj<number>(raw.menuSince), drift: obj<string>(raw.drift) }
   } catch {
     return fresh
   }

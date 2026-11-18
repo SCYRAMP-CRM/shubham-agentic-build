@@ -81,6 +81,11 @@ export const FEATURES: readonly Feature[] = [
   { key: 'dependencies', group: 'pages', label: 'Dependencies', blurb: 'What Codex in Claude needs on each PC.', pages: ['/dependencies'], locked: 'It changes what is installed on your PCs.' },
   { key: 'mcps', group: 'pages', label: 'MCPs', blurb: 'The chats’ tools, across engines.', pages: ['/mcps'], locked: 'It installs tools for the chats on your PCs.' },
   { key: 'setup', group: 'pages', label: 'Setup', blurb: 'A new PC, step by step.', pages: ['/setup'], locked: 'It joins PCs to your app.' },
+  // Orders o5c05 ("please make it") and o7c7c ("yes give genreic setup page and once a role logs in show them thier desired page please"): "Getting started", the generic page for
+  // everyone but the owner, at /start. It is NOT under /setup on purpose: a path under /setup falls under the lock above, which stays locked, the owner's only, with all three tabs.
+  // Both rows start as Only me like every new row, and they open nothing the lock protects: no API route names either (shared/access.test.ts and agent/api-access.test.ts pin it).
+  { key: 'setup-normal', group: 'pages', label: 'Getting started', blurb: 'The steps for using the app on your own PC, and what this page already knows about it. Nothing here joins a PC or changes one.', pages: ['/start'] },
+  { key: 'setup-admin', group: 'pages', label: 'Getting started › Admin tab', blurb: 'The Admin tab of that page: the extra steps for people who manage PCs. A person chosen here is an Admin.', needs: 'setup-normal' },
   { key: 'paperclip', group: 'pages', label: 'Paperclip', blurb: 'Goals, issues and runs (empty for now).', pages: ['/paperclip'] },
   { key: 'schedules', group: 'pages', label: 'Schedules', blurb: 'Scheduled runs (empty for now).', pages: ['/schedules'] },
   { key: 'phone-app', group: 'pages', label: 'Phone app', blurb: 'The Android apps, to download.', pages: ['/phone-app'] },

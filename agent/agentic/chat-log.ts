@@ -13,7 +13,7 @@ export interface ChatEvent {
   sessionId: string
   agent: string
   floor: string
-  /** stop: stopped, idle-reaper, agent-stop, exited, crashed, ended. start: new, resumed, heartbeat, watchdog. watch (F-083): watchdog-restart, memory, limit, home-offline, restart-failed, menu, silent. */
+  /** stop: stopped, idle-reaper, agent-stop, exited, crashed, ended. start: new, resumed, heartbeat, watchdog. watch (F-083): watchdog-restart, memory, limit, home-offline, restart-failed, menu, silent, drift (a Codex chat runs other settings than it was started with). */
   cause: string
   /** watch (F-083): what the watchdog found, in plain words. */
   what?: string

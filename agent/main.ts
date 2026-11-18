@@ -356,7 +356,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     openCodeCredential: provider => provider === 'opencode' ? Promise.resolve(FREE_CREDENTIAL) : openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
     openCodeIdentity: () => { const s = loadSession(paths.crmSession); return s ? `${s.user.id}:${s.signedInAt}` : null },
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).
-    credential: () => claude.credentialEnv(),
+    // Order of130: with the id of the subscription it belongs to, from the same read (the chats file their usage under it); everything else reads name and value as before.
+    credential: () => claude.credentialWithSubscription(),
     auth,
     featureAccess,
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,

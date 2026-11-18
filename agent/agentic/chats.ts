@@ -384,7 +384,14 @@ export interface ChatPoolOptions {
    * and ANTHROPIC_API_KEY (an API key). When it gives one, a Claude chat is started with that one and with the other two ways in (and an inherited ANTHROPIC_AUTH_TOKEN) taken
    * out of its environment, because an API key silently wins over a subscription. When it gives none, `token` applies exactly as before.
    */
-  credential?: () => { name: string; value: string } | null
+  credential?: () => { name: string; value: string; subscriptionId?: string } | null
+  /**
+   * Order of130: the subscription key a Claude chat started on that credential files its usage under (usage/sub-key.ts usageSubKeyOf): the id of the CRM subscription the credential belongs to (the one read above
+   * gives it: `subscriptionId`), or '' for the PC's own login, which is also the old way (the marker file usage-sub.off). Asked once per start, from the SAME object the chat's credential came from, so the
+   * credential and its label can never be two reads a switch could separate; fixed at the start like the token. Never for a staff chat (staff-policy.ts keeps its blank key), a Codex chat or a Codex in Claude Code
+   * chat, and nothing happens when usage is off (no SAD_USAGE_DIR). Left out: the key stays what chatEnv gave it (blank).
+   */
+  usageSub?: (cred: { subscriptionId?: string } | null) => string
   /** Live set or a chat's state changed. */
   onChange?: () => void
   /** F-078: a chat ended, and why (chat-log.ts keeps the pattern). */
@@ -1365,6 +1372,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         } else if (cred) {
           for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
           env[cred.name] = cred.value
+          // Order of130: this chat runs on the CRM's subscription, so its usage is filed under it (the CRM can then place it); chatEnv's blank key means "the PC's own login", which this chat is not on.
+          if (!s.policy && env.SAD_USAGE_DIR && o.usageSub) env.SAD_USAGE_SUB = o.usageSub(cred)
         } else {
           const token = o.token?.()
           if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token

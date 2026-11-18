@@ -5,7 +5,8 @@ import type { TalkEndRule, TalkSettings } from './talk.ts'
  * (QUICK_PAGE_SETTINGS_KEY), so the overlay's Live voice settings (their own key and TALK_SETTINGS_VERSION, src/talk/store.ts) never change
  * because of the page:
  *   - lang: English, Hindi or Marathi, always set. No Auto: Whisper's guess of the language is slow and mistakes Indian English (decision 12).
- *   - end: it ends by itself after 2 minutes of silence ('silence', TALK.autoEndMs), on by default (Q1's page safety; Q2 changes it).
+ *   - end: it ends by itself after 2 minutes of silence ('silence', TALK.autoEndMs), on by default (Q1's page safety; Q2 changes it). F-267
+ *     step 2 (o7be4): and after 15 minutes in Silent with no "Quick" or tap of his (TALK.silentEndMs); off, only End ends it, Silent too.
  * Everything else a session needs (the voice, the PC voice, the speed, how he cuts in, the fillers, the pause, the early guess) is read from
  * his Live voice settings, never written: one place to tune his voice. The page talks to Quick only, whatever those say (no direct line).
  * Stored sparse: only what he changed, so a later default change moves nothing of his.

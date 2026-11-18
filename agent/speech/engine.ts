@@ -57,6 +57,14 @@ const INFER_TIMEOUT_MS = 60_000
 const OVERHEAD_MB = 400
 /** Always leave this much for everything else. */
 const KEEP_FREE_MB = 800
+/**
+ * F-267 step 2 (orders o088b, o7be4; PLAN 3.4 rule 2): the free memory, in MB, Whisper may use for the room while the Quick page is Silent
+ * (Whisper's 0.85 GB, Quick's own 1.2 GB floor and a 0.65 GB margin). Under it a room piece is refused and the Silent keep-warm holds nothing:
+ * the ears give way before Quick.
+ */
+export const SILENT_HOLD_MB = 2700
+/** F-267 step 2: room pieces are counted, and their counts logged once a minute (never one line each: when the room spoke is no log's business). */
+const ROOM_LOG_MS = 60_000
 
 export interface EngineStatus {
   available: boolean
@@ -97,6 +105,12 @@ export interface TranscribeOptions {
    * anything running or queued or is loading the model, and then nothing is queued, so a guess never waits behind anything or delays a real turn.
    */
   guess?: boolean
+  /**
+   * F-267 step 2 (orders o088b, o7be4; PLAN 3.4): a room piece, heard while the Quick page is Silent: refused at once (503, `refused`: 'memory'
+   * under SILENT_HOLD_MB free, 'busy' while Whisper has anything running or queued or is loading the model), and then nothing is queued, loaded
+   * or touched: the room never waits in Whisper's queue, adds to it, or keeps the model loaded when memory is short.
+   */
+  room?: boolean
 }
 
 /** F-221: the request a job is for. */
@@ -129,11 +143,20 @@ export interface EngineDeps {
   self?: { pid: number; created: number }
 }
 
+/** F-267 step 2: what a warm may ask. */
+export interface WarmOptions {
+  /** The Quick page while Silent (SILENT_HOLD_MB): with less free than this, nothing is loaded or touched, and the warm answers false. */
+  minFreeMb?: number
+}
+
 export interface Engine {
   status(): EngineStatus
   transcribe(pcm: Buffer, o?: TranscribeOptions, job?: TranscribeJob): Promise<Transcript | null>
-  /** Loads the model now (the mic was pressed), so the first sentence doesn't wait for it. */
-  warm(): Promise<void>
+  /**
+   * Loads the model now (the mic was pressed), so the first sentence doesn't wait for it. F-267 step 2: true when the model is held, false when
+   * `minFreeMb` was not free (then nothing was loaded or touched).
+   */
+  warm(o?: WarmOptions): Promise<boolean>
   stop(): Promise<void>
 }
 
@@ -144,6 +167,12 @@ export function SpeechError(message: string, status: number): Error & { status: 
 
 /** F-221: a guess while Whisper has work: refused, nothing queued (the route answers 409 {busy: true}). */
 export const busyError = () => Object.assign(SpeechError('Whisper is busy', 409), { busy: true as const })
+
+/** F-267 step 2 (o7be4): why a room piece was refused. */
+export type RoomRefusal = 'memory' | 'busy'
+/** F-267 step 2: a room piece refused at once, nothing queued, loaded or touched (the route answers 503 {error, refused}). */
+export const roomError = (why: RoomRefusal) =>
+  Object.assign(SpeechError(why === 'memory' ? 'Not written: the PC is short of memory' : 'Not written: Whisper is busy', 503), { refused: why })
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -181,6 +210,27 @@ export function createEngine(d: EngineDeps = {}): Engine {
   let queue: Promise<unknown> = Promise.resolve()
   let pending = 0
   let orphansChecked = false
+  /**
+   * F-267 step 2 (o7be4): the room's pieces this minute (taken, then written or lost; refused for memory or because Whisper was busy) and how
+   * long Whisper ran on them: one log line of numbers when the minute is over (roomLine), never a line per piece.
+   */
+  let roomCounts: { taken: number; written: number; lost: number; memory: number; busy: number; ran: number; timer: NodeJS.Timeout } | null = null
+  function countRoom(k: 'taken' | 'written' | 'lost' | RoomRefusal, ran = 0) {
+    if (!roomCounts) {
+      const timer = setTimeout(roomLine, ROOM_LOG_MS)
+      timer.unref?.()
+      roomCounts = { taken: 0, written: 0, lost: 0, memory: 0, busy: 0, ran: 0, timer }
+    }
+    roomCounts[k] += 1
+    roomCounts.ran += Math.max(0, ran)
+  }
+  function roomLine() {
+    const c = roomCounts
+    roomCounts = null
+    if (!c) return
+    clearTimeout(c.timer)
+    log?.info(`speech: room pieces in a minute: taken=${c.taken} written=${c.written} lost=${c.lost} refused-memory=${c.memory} refused-busy=${c.busy} run=${c.ran}ms`)
+  }
 
   // The ggml weights take about their file size in memory; read the size, never the file.
   let sizeMb: number | null = null
@@ -368,11 +418,15 @@ export function createEngine(d: EngineDeps = {}): Engine {
 
   return {
     status,
-    async warm() {
+    async warm(w = {}) {
+      // F-267 step 2 (o7be4, PLAN 3.4 rule 2): the Quick page's keep-warm while Silent holds the model only while that much is free; under it
+      // nothing is loaded or touched, so Whisper is let go after its idle time and the room never keeps it from Quick.
+      if (w.minFreeMb !== undefined && freeMb() < w.minFreeMb) return false
       await load()
       // oeb56: a warm is a use: the model's idle time starts again (live talk asks every 4 minutes while it runs, so a long pause of his never
       // lets the model go; before, a warm of a loaded model did nothing and it was let go 15 minutes after its last transcription).
       if (child) touch()
+      return true
     },
     transcribe(pcm, o = {}, job = {}) {
       if (o.partial && pending > 0) return Promise.resolve(null)
@@ -383,14 +437,24 @@ export function createEngine(d: EngineDeps = {}): Engine {
         return Promise.reject(busyError())
       }
       if (pcm.length < 3200) return Promise.resolve({ text: '', raw: '', audioMs, ms: 0 }) // < 0.1 s
+      // F-267 step 2 (o7be4, PLAN 3.4): a room piece (the Quick page heard it while Silent) is refused at once, nothing queued, loaded or
+      // touched, under SILENT_HOLD_MB free or while Whisper has any work (a load too): it never waits in the queue nor makes anyone wait.
+      if (o.room) {
+        const why: RoomRefusal | null = freeMb() < SILENT_HOLD_MB ? 'memory' : pending > 0 || starting !== null ? 'busy' : null
+        countRoom(why ?? 'taken')
+        if (why) return Promise.reject(roomError(why))
+      }
       // F-221: one line per job, numbers only (never the words): how long it waited (the queue, and a load), how long Whisper ran, whether it
       // was a guess, dropped before it started (its page went away), or written for a page that had gone by then. o0de2: also the language it
       // was asked for (auto: Whisper detects it first) and how many characters of words came back (0: Whisper heard none, or never ran), so a
       // "nothing happens" can be told from the log: no words, or words the page never asked.
       const yn = (b: boolean | undefined) => (b ? 'yes' : 'no')
       const lang = whisperLang(o.lang)
-      const note = (wait: number, run: number, f: { dropped?: boolean; closed?: boolean; failed?: boolean } = {}, chars = 0) =>
+      const note = (wait: number, run: number, f: { dropped?: boolean; closed?: boolean; failed?: boolean } = {}, chars = 0) => {
+        // F-267 step 2: a room piece is counted in its minute's line instead (roomLine).
+        if (o.room) return countRoom(f.dropped || f.failed ? 'lost' : 'written', run)
         log?.info(`speech: whisper job audio=${audioMs}ms wait=${Math.max(0, wait)}ms run=${Math.max(0, run)}ms guess=${yn(o.guess)} dropped=${yn(f.dropped)} closed=${yn(f.closed)} failed=${yn(f.failed)} lang=${lang} chars=${chars}`)
+      }
       const dropped = () => SpeechError('The page went away before Whisper started on it', 499)
       const { signal } = job
       const asked = now()
@@ -442,6 +506,8 @@ export function createEngine(d: EngineDeps = {}): Engine {
       return run.finally(release)
     },
     async stop() {
+      // F-267 step 2: the room's counts so far are not lost with the agent.
+      roomLine()
       await unload('the agent is stopping')
     },
   }

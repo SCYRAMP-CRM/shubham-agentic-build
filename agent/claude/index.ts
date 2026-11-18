@@ -142,6 +142,12 @@ export interface ClaudeSubscription {
   status(): ClaudeInfo
   /** F-138: the credential the app put in this account for the CRM's Claude subscription or API key, as the variable it is in and its value, for the chats and tools the app starts (exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY). Null when the app put nothing there. Never logged or sent to a page. */
   credentialEnv(): { name: string; value: string } | null
+  /**
+   * Order of130: credentialEnv(), read ONCE, with the id of the CRM subscription the credential belongs to (the placed record's): { name, value, subscriptionId } while the PC's variable is still the one the
+   * app put there, else null. A chat started on it runs on that subscription's account, so the usage it makes is filed under that id (agent/usage/sub-key.ts); one read, so the credential a chat gets and the
+   * label it carries can never come from two moments a switch could separate. Never logged or sent to a page.
+   */
+  credentialWithSubscription(): { name: string; value: string; subscriptionId: string } | null
   /** Signs in to the CRM and asks it at once; throws CrmError when the CRM says no or can't be reached. */
   signIn(login: string, password: string): Promise<ClaudeInfo>
   /** Asks the CRM again (when signed in). `replace` takes over a CLAUDE_CODE_OAUTH_TOKEN something else set. */
@@ -675,6 +681,11 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
       if (!placed) return null
       const value = current(placed.var)
       return value !== null && ours(value, placed.var) ? { name: placed.var, value } : null
+    },
+    credentialWithSubscription() {
+      if (!placed) return null
+      const value = current(placed.var)
+      return value !== null && ours(value, placed.var) ? { name: placed.var, value, subscriptionId: placed.subscription.id } : null
     },
 
     signIn: (login, password) =>
