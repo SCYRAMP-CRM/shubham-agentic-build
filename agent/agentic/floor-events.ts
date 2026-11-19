@@ -1,5 +1,4 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
-import path from 'node:path'
+import { createAuditFile } from './audit-file.ts'
 
 // The floors' structural history (Agent 3, built 18 Nov 2026 on Lead's order; the gap was found 17 Nov): who made, removed, adopted, filled, moved or shared
 // what, and when. The audit trail already said who changed an ACCESS choice (access-log.jsonl) and what was answered (approvals.jsonl), but nothing said who
@@ -84,7 +83,6 @@ export interface FloorEventLog {
 
 const NAME_CAP = 80
 const LIST_CAP = 64
-const TAIL = 512 * 1024
 
 const text = (v: unknown, cap = NAME_CAP): string => (typeof v === 'string' ? v : '').replace(/[\r\n\t]+/g, ' ').slice(0, cap)
 const ref = (v: unknown): FloorEventRef | null => {
@@ -146,56 +144,7 @@ export function describeFloorEvent(e: FloorEventInput): string {
   }
 }
 
-/** The log: one JSON line per change, in one file, kept (never rewritten); a read looks at its end. Same shape and care as the approvals log (approvals.ts). */
+/** The log: one JSON line per change, in one file, kept (never rewritten); a read looks at its end. Same shape and care as the approvals log (approvals.ts); the machinery is audit-file.ts (shared with the chat-presence record). */
 export function createFloorEventLog(file: string, now = () => new Date()): FloorEventLog {
-  mkdirSync(path.dirname(file), { recursive: true })
-  /** A write cut short (a crash, a full disk) leaves a partial line with no newline: the next line must not be glued onto it, or one torn row costs two. */
-  function endsMidLine(): boolean {
-    try {
-      const size = statSync(file).size
-      if (size === 0) return false
-      const fd = openSync(file, 'r')
-      try {
-        const last = Buffer.alloc(1)
-        readSync(fd, last, 0, 1, size - 1)
-        return last[0] !== 0x0a
-      } finally {
-        closeSync(fd)
-      }
-    } catch {
-      return false
-    }
-  }
-  return {
-    add(e) {
-      const entry = floorEventOf(e, now().toISOString())
-      appendFileSync(file, `${endsMidLine() ? '\n' : ''}${JSON.stringify(entry)}\n`, { mode: 0o600 })
-      return entry
-    },
-    list(limit = 100) {
-      if (!existsSync(file)) return []
-      const size = statSync(file).size
-      const from = Math.max(0, size - TAIL)
-      const buf = Buffer.alloc(size - from)
-      const fd = openSync(file, 'r')
-      try {
-        readSync(fd, buf, 0, buf.length, from)
-      } finally {
-        closeSync(fd)
-      }
-      const rows = buf.toString('utf8').split('\n')
-      // A read that starts in the middle of a row drops that row.
-      if (from > 0) rows.shift()
-      const out: FloorEvent[] = []
-      for (let i = rows.length - 1; i >= 0 && out.length < limit; i--) {
-        if (!rows[i]) continue
-        try {
-          out.push(JSON.parse(rows[i]) as FloorEvent)
-        } catch {
-          // A torn row.
-        }
-      }
-      return out
-    },
-  }
+  return createAuditFile<FloorEventInput, FloorEvent>(file, floorEventOf, now)
 }

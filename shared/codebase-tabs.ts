@@ -118,6 +118,9 @@ export interface TabsLink {
   accountName: string | null
   accountPlatform: string | null
   accountEmail: string | null
+  /** Slice D (disable, never delete): set only on a link that is disabled, and only when the list was asked for with "Show disabled" (a disabled row is hidden by default and can only be enabled again). `disabledAt` is when (ISO). */
+  disabled?: true
+  disabledAt?: string
 }
 
 /** Order o26c8: the platform a link's address points at, to put its accounts first in the pick (github.com, vercel.app, supabase.co). Null: no suggestion. */
@@ -136,11 +139,18 @@ export interface TabsVar {
   secret: boolean
   /** The value, for a name that does not look like a secret; null for a secret, or when the key file is not on this PC. */
   value: string | null
+  /** Slice D (disable, never delete): set only on a variable that is disabled, and only when the list was asked for with "Show disabled" (a disabled row is hidden by default and can only be enabled again). `disabledAt` is when (ISO). */
+  disabled?: true
+  disabledAt?: string
 }
 export interface TabsSubset {
   id: string
   name: string
+  /** The variables of a LIVE set. A disabled set lists none: its variables stay where they are, unlisted and sealed, until the set is enabled. */
   vars: TabsVar[]
+  /** Slice D (disable, never delete): set only on a set that is disabled, and only when the list was asked for with "Show disabled" (a disabled row is hidden by default and can only be enabled again). `disabledAt` is when (ISO). */
+  disabled?: true
+  disabledAt?: string
 }
 export interface TabsAnswer {
   codebaseId: string

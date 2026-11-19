@@ -1721,6 +1721,61 @@ as any non-local route.
   path or a hit by id. **Routes** (the page's, a member's to the hub): `GET /memory/status`,
   `/memory/search?q=&kinds=&limit=`, `/memory/wiki`, `/memory/page?path=`, `/memory/read?ref=`,
   `/memory/brief`, `POST /memory/compile {mode}`, `PATCH /memory/settings`.
+- **One layer per person (oc65c, slice S1, 18 Nov 2026; his order o5321: a personal memory, first only his).** The layer belongs to a
+  person, keyed by their CRM person id (a UUID, the key `assistant-history/<person-id>/` uses; never a name or a path from a client:
+  `memoryPersonId`). `memory-people.ts` makes a person's layer when it is first asked for (`createMemoryPeople`: `scope`, `layer`,
+  `notesChanged`, `close`: S2), at `memoryHome`. **The app owner's layer stays where it always was** (`<agentic>/memory-layer` and `<agentic>/wiki`; nothing
+  moves, every text it makes is the same, and only his scope reaches it). Everyone else's would be
+  `<agentic>/personal-memory/<person id>/{layer,wiki}`, never shared, seeing only the agents that person owns (`floorsOwnedBy`; an agent made
+  before owners were recorded is the app owner's). **Their version is not built (S9): the registry refuses to make it** (409
+  `memory-others-not-built`); `allowOthers` is for tests. `createMemoryLayer` takes `person` (its name goes in every text it makes, the
+  product's name does not), `home`, `wikiDir`, and `settings` (what a NEW state starts with: a person's memory starts from "learns only
+  what they tell it", `fromChats` and `pastChats` off; a saved state keeps its own). `wiki.ts` `schemaFor(name)` / `coreStartFor(name)`
+  are the starting pages (the owner's are byte-identical to before). Not yet: each door (routes, tools, recall, brief) asking "whose?"
+  (S2), redaction of notes and memory files and the end of the global memory-file sweep for personal layers (S3), feeding by owner (S4),
+  and the words that say "he" and "his" for other people (S9). **Open for S4, before anyone else's layer can exist:** `floorsOwnedBy`
+  filters agents, not notes, and a floor's shared notes belong to the floor, so it does not by itself keep another owner's notes out of a
+  person's layer: S4 settles which notes a personal layer reads (their own, or a floor's only when every agent on it is theirs).
+  Tests: `memory-people.test.ts`, and "whose it is" and "the wiki of a person" in `memory-layer.test.ts`.
+- **One door (oc65c, slice S2, 18 Nov 2026; his order o5321; read independently by Agent 14, Agent 3 and Agent 7; Lead's rulings of that evening).** Every way to a
+  layer, or to its brief, goes through one question, "whose memory?", at the doors that already existed: **S2 adds no new door.** A layer is handed out only for a
+  `MemoryScope` (memory-people.ts), which only `MemoryPeople.scope()` makes, and which answers none for anyone but the app owner, for an id that is not a person id (no throw),
+  and for EVERYBODY while another administrator exists (the guard `adminsAreOnlyTheOwner`: an administrator can type into his chats and read what was recalled there; the live
+  list has one administrator and the app cannot add another, only a hand edit of auth.json; a registry made without `enabled` offers nothing). The scope is a REAL brand: the
+  registry keeps the scopes it granted and `layer()` refuses any other object (403 `memory-no-scope`), the guard is asked at every use (a layer that already exists is not
+  handed out after the guard goes off), and the registry tells the notes event itself (`notesChanged(personId, floorId)`: no layer ever comes back to a door). **Chat doors**
+  (memory_search, memory_read, the recall hook, the brief at the four chat starts) use the chat's OWNER (`chatMemoryPerson`; an ownerless agent is the app owner's; each tool keeps
+  its administrator test as it was); a chat that is ACTUALLY SHARED with another person (`sharedWith` not empty: a view share reads the transcript, a type share writes in it) has
+  none (D-S2-1, privacy first). A PC-control slot chat is not shared by being a slot (his own Chat 1 / Chat 2 keep their memory; access.ts already keeps others out of it unless it
+  IS shared). The brief is read once, at the start, so a chat shared later keeps the section it started with, and every call is refused from then on. **Page doors** (the eight
+  /memory routes) answer from the CALLER'S own person's layer or 409 (`memory-others-not-built`, or `memory-admins` while another administrator exists), and the refusal is logged
+  with its real code, once an hour per person and route. **Quick**: its tools run as a copy of the Orchestrator's agent, so the LAYER (the hits, memory_read) is offered only to the
+  app owner talking on a web page (`quickMayUseMemory`, fast.ts `talker()`; a phone is a paired device, pairing is for any administrator and records no person). **This is a
+  SEATBELT against a talker of unknown identity, NOT a wall against Quick's admin tools**: `app_read_chat` and `app_read_conversation` are not talker-gated, so whoever holds Quick
+  (his own phone included) can still have transcripts read to them, recalled text in them. Whether a phone paired by the owner is owner-equivalent is the S5 question (B8). The
+  floor notes and memory_recent are as they were; /fast and the eight /talk surfaces are the app owner's (the lock; behind it and the guard the talker rule and `answered()` are
+  seatbelts). The reply to a hand-off is told only to the person who asked, recorded at ask time (newest 64 orders): an order whose asker is not on record (an app restart, or past
+  the 64 newest) is not told to the live holder either: the reply is KEPT (orders.ts offers it again at every tick, up to 4 hours after the order) and told when the asker's own person holds Quick again (memory-answered-kept.test.ts). That is a change even while the memory is OFF: the owner who asks on the web page and then takes Quick
+  over on his phone before the reply is not told on the phone: it waits for his page. Two phones cannot be told apart (a phone records no person): an accepted cost (B10), because
+  with the guard both were paired by the owner; stamping the pairer is S8/S9. **Stated costs:** once the memory is ON his own phone's Quick has no layer; the day it is switched on
+  he is told in plain words: "a reply built from your memory is kept for you and told when you are back on your own page, instead of being spoken on a phone anyone with admin rights could have paired".
+  **The guard is a stopgap:** while it is off an ALREADY STARTED layer keeps its timers and its librarian running (the doors refuse, nothing is read), and S9 must REPLACE it (an
+  administrator stays owner-equivalent in the chat plane). The member PC's brief fetch is made only while the memory is on (the hub refuses it today: no person, not an
+  administrator); S5 gives a member's chat its section per chat through the `tool` link kind by session id, hub-only ON, and the hub must check ITS OWN record of who holds the
+  session (`held`, `homePc`), not the member's live report. **What the tests do not do:** there is no member-PC, K7 or B5 rig, the Codex and OpenCode briefs are counted and not run,
+  and K2 is only a unit test. Tests: `memory-doors.test.ts` (the matrix and the PIN:
+  every accessor is a marked call with exact counts and no alias or value; the gate block's names are a census and its scope / layer / refusal calls are counted and read; the
+  identity choosers toolFor / callTool / fastCall; the import list, with any module named by anything but one plain string red unless listed; allowOthers; the memory's folders
+  and tool names; every /talk row of POLICY, found by its pattern; a small lexer under all of it; red and green stubs), `memory-doors-rig.test.ts` (the real app, a sign-in, a second administrator), `memory-doors-quick.test.ts` (Quick through the real fastCall).
+  **A new door goes in the matrix before it merges** (Lead's rule): a call with no marker, a marker with no call, an alias or a new importer is a red test.
+  Doors (the matrix's IDs): R1 R2 R3 R4 R5 R6 R7 R8 H1 X1 X2 T1 T2 T3 T4 T5 B1 B2 B3 B4 B5 B6 L1 L2 L3 Q1 Q2 Q3 Q4 Q5 E1 N1 N2 N3 I1 I2 I3 I4 P1 P2 P3 P4.
+  **Not closed by S2:** the app's token and any process on the Server that can read it; the disk (a Server-resident chat with file tools reads the layer's files); an
+  administrator in the chat plane (the guard above); a paired member PC is trusted for four things (by, tool session ids, adopt, ui-page by); a chat holding recalled text can copy it
+  out (a floor note, a message, a card, the CRM conversation copy: F-211 uploads the raw chat JSONL); the notes of EVERY floor are ingested whatever "learns from chats" says
+  (T5 and N1 feed his layer: S4); a phone paired by another administrator joins Quick's one conversation (B8, B10); the librarian's file tools (`--restricted` is unverified).
+  **Before S5 (the switch ON), all of:** S4 (feeding by owner); a recorded decision for the disk boundary and for F-211's upload; the engine decision (the section goes verbatim
+  to Codex and OpenCode models); the legacy `turns.jsonl` (14 MB, fromChats on, no compile ever: his plain-words keep-or-erase); and a read-only check that `auth.admins()` holds
+  only the app owner (the guard enforces it at run time). **Also before S5 (stated residual, Agent 14):** a member-PC rig, a K7 and a B5 rig, a run of the Codex and OpenCode briefs, and K2 as a rig and not only a unit test.
 
 ## Stage 1 of the simple chat-terminal layer (agentic/turns.ts; order o400b, 12 Nov 2026)
 
@@ -1803,12 +1858,58 @@ MB (`GET .../messages` was bounded to its last 8 MB for the same reason).
   ("✽ Pollinating… (5s · ↓ 167 tokens)"), only while the footer says "esc to interrupt" or the spinner shows its
   running clock right above the drawn input box (oea35, Claude 2.1.325). The feed polls them
   with the file and says a change once. A chat on another PC has no screen here (no menu, no status).
+- **Unnumbered selects (order o5d4e, 17 Nov 2026; Shubham: "give ability to select on phone", and the AskUserQuestion form's final "Submit answers").**
+  Claude's confirm/select dialogs can be drawn WITHOUT numbers (its select component with `hideIndexes` and `disablePrintableKeybindings`, e.g.
+  the trust prompt "Is this a directory you trust?": "❯ No, exit" / "  Yes, add it", "No, exit" first and focused). A digit does nothing there. They were
+  listed in Approvals as "not a numbered choice: answer it in the chat itself".
+  - **Read (`screen.ts` `findArrowMenu`, via `findMenu`/`readMenu(lines, {arrows})`)**, only when no numbered menu is, and strictly: the NEWEST
+    footer must say "Enter to select" or "Enter to confirm" (the auto-mode setup screen, a pointer over two toggles and a Continue, says "Enter to
+    continue" and is still no menu: approvals.test.ts and approvals-routes.test.ts pin that), the options must END at the footer (blank lines only
+    between), run in one block with no gap or rule, hold exactly ONE "❯" line, sit in one column (a deeper-indented line is the description of the
+    option above), 2 to 12 of them. A rule line ends the block, so the chat's input box (rule, "❯ text", rule) is never joined to a footer below it.
+    The menu has `keys: 'arrows'`, and an option's `n` is its PLACE (1 = the first drawn). A numbered menu is read exactly as before (no `keys`,
+    the same id).
+  - **A numbered menu with NO footer (`findBareNumberedMenu`)**, read after the numbered-with-footer reader and before the arrow reader, only
+    when `arrows` is on: a "❯ N." pointer line, the numbers running on below it and down to 1 above it (notes and blank lines between), 2 to 20
+    options, and NOTHING but blank lines (and indented notes) after the last option, to the end of the screen, so an input box under it (rule,
+    "❯ text", rule, status) or any other text means it is not a menu that is waiting. Its hint is empty; it has no `keys` (a digit answers it, as
+    for any numbered menu). Why: by the installed Claude Code 2.1.326's own source the form's Review step is drawn WITH numbers and the Review
+    component draws no footer line, so the numbered reader (which wants a footer) gave no menu and Approvals listed it as "not a numbered choice"
+    (the chat's state already counted it a question: a "❯ 1." line alone does). This is the likely reason Shubham found "the final Submit only from
+    the terminal"; it is a reading of that source until the real screen is recorded.
+  - **Chosen (`arrow-select.ts` `chooseByArrows`, called from `commitNativeApproval` for an 'answer' on an arrows menu)**: nothing trusts that the
+    keys worked. It looks at the screen (it must be this very prompt: its id, drawn unnumbered), sends the arrow keys one at a time (CSI A / CSI B, 40 ms
+    apart; before each it checks again that this is still the prompt), then READS THE SCREEN until the pointer is seen on the chosen option (2.5 s at
+    most), looks once more, asks the caller's last word (the person's rights now, the grant, the same run, still a question: `validateLocal`, then
+    the once-only claim) and presses Enter, all in one turn. Any failure before Enter confirms nothing: the pointer is put back where it was found
+    (said in the error when that could not be done), and the once-only claim is NOT spent (it is made only right before Enter), so a lost key never costs
+    the person their one answer. The record names the choice as "<place>. <label>".
+  - **Both surfaces, human-only.** The Approvals card already draws a button per option of an answerable menu: it now has them (the number chip is the
+    place). The chat view's menu card (Bubbles.tsx `MenuCard`) draws the same buttons as `data-human-only` controls that ignore an event that is not a
+    real tap, and a tap is `pickArrowOption` (menu-pick.ts): it looks the chat's prompt up in the approvals list, goes on only when it is the very question
+    and options the card showed (menu-same.ts), and POSTs the same `/approvals/answer` (owner or the floor's decision-makers, CRM session, never a
+    chat's key). A numbered menu's button still types its digit through the terminal socket, as always; a staff chat's card still sends nothing.
+  - **The old way is a switch** (Settings › "Buttons for arrow-select prompts", `<state>/arrow-prompts.json` `{"on": bool}`, `GET|PUT
+    /approvals/arrow-prompts`, the owner's, on the Server's page): off, an unnumbered select AND a numbered menu without a footer are read as no
+    menu, with no buttons, as before (also a member PC's snapshot is ignored on the hub). On by default; a missing file is on; an unreadable one
+    is OFF and says so until he chooses.
+  - **The Review step.** The form's Review step ("Review your answers", "Ready to submit your answers?", a confirm select "Submit answers" / "Cancel")
+    is answerable by this either way it is drawn (numbered: a digit, as for any menu; unnumbered: the arrows). Not covered: a MULTI-select question's
+    boxes ("Tick these in the terminal" as before).
+  - **NOT RECORDED.** The test screens (`arrow-menu.fixture.ts`) are CONSTRUCTED from the installed Claude Code 2.1.326's own bundled source (the
+    recorded fixtures here are from 2.1.316) and are stamped so: version, terminal size (120×32) and `source: 'constructed'`. A recording of the
+    real trust prompt and Review step is owed (`agent/scripts/record-screens.ts`, a DEV-ONLY tool that never ships: a disposable `claude` in its own
+    scratch folder and config, restricted to one tool and no MCP, asked for the form and nothing else, cancelled at the Review step, nothing ever
+    submitted, ended by its exact PID; it needs Shubham's yes on his login token and Lead's word, and has not been run). The readers are widened
+    on what the recording shows, not before. Known gap: a screen with a rule line between the options and the footer is not read (as today).
+    `agent/scripts/ship-list.ts` classifies every file in `agent/scripts/` as shipped or left out (never neither: `publish.ts` stops on an
+    unclassified one, and `ship-list.test.ts` is red).
 - **Found in claude 2.1.316** (recordings in `screen.fixture.ts`): in its plain screen it writes an answer in
   one piece when the turn ends (no words stream), the question menu says "Enter to select" (the state
   detection takes `entertoselect`), and a number alone (no Enter) answers it.
 - **Tests:** `chatview.test.ts` (items, tails, paging, a 120 MB file, the follower), `chatroutes.test.ts`
   (the socket, history, previews, say, the menu over the socket), `screen.test.ts` (the model, and the
-  recorded menu and spinner), and in `shared/`: `chat-markdown.test.ts`, `chat-rows.test.ts`.
+  recorded menu and spinner), `arrow-menu.test.ts`, `arrow-select.test.ts`, `arrow-prompts.test.ts` (order o5d4e; `scripts/ship-list.test.ts` and `scripts/record-screens.test.ts` for its Dev-only parts), and in `shared/`: `chat-markdown.test.ts`, `chat-rows.test.ts`.
 
 ### Order o16d2 (F-213): pictures and videos in the chat (agentic/media.ts, shared/media.ts)
 
@@ -3263,6 +3364,7 @@ The page markers, any one of which makes a request a page: the page server's `x-
 One setting, `signInEnough` in `auth.json` (default ON; F-122's `ownerCodes` is the same switch under its old name: both are shown and both are accepted by `PUT /auth/settings`, an old file that said `ownerCodes: false` stays off). Only a signed-in sbskrrt changes it (401 unsigned, 403 admin-only others, logged). While it is on, EVERY place that asks for a registered approval device's signature also accepts a browser signed in as sbskrrt (a real F-118 session: `caller.person.canSeeAll`); `AuthStatus.mayApprove` (and `mayShowCode`, the same value) tells the page. An unsigned page never counts, at any level (the open app acting as sbskrrt included); other people never; a request that carries a `sig` is always checked as a signature, even from sbskrrt. Off = exactly the approval-device rule. Registered devices work either way. Every action done this way is logged with the person ("sbskrrt (019d2ff6) signed in, on this PC / over the tailnet as <login>") and the browser, never a secret.
 The places that check a device signature (all `humanOnly`: a chat's key never reaches them), all through `humanProof(kind, fields, sig, request)` except the two marked:
 - `POST /agentic/approvals/answer` (kind `answer`): a tap on a prompt. `POST /agentic/approvals/cancel` (`cancel`): Esc on a prompt.
+- **F-294 (his order o8c55, "and give button ignroe pleae"): Ignore.** `POST /agentic/approvals/ignore {sessionId, id}`, `POST /agentic/approvals/restore {sessionId, id}` and `GET /agentic/approvals/ignored`: Cancel's proof (`humanOnly` = `requireCrmHuman`: a chat's key 403, the open app 401; then the owner, or a decision-maker of that chat's floor NOW), but they type NOTHING: Ignore hides one card (this exact prompt id of this chat) from the signed-in person only, and the agent that asked keeps waiting (Cancel, or an answer, are what end that). Per person, kept by the app (`agentic/approval-ignores.ts`, in memory: a prompt's id carries this run's epoch, so an Update brings ignored cards back once). A prompt's id differing (a NEW question of the same chat) is a new card; a chat that has been away from its question for 3 s (answered, ended) lets its records go (a sweep each second, and on every list). The record (kinds `ignore` / `restore` in approvals.jsonl: the person, role, floor, chat, prompt id, a fixed sentence; NEVER the prompt's text, size or a count of it) is written FIRST: when it cannot be written nothing is hidden or restored (503) and he is told; ignoring what is already ignored adds no line. `GET /approvals` keeps them out of `items` and lists them apart (`ignored`, only when there are some); the badge reads `GET /approvals/ignored` (ids only, only prompts still current). Left as they are, by Lead's ruling: the heartbeat line, Quick's snapshot and the Assistant's approvals_waiting still count an ignored prompt. Tests: `agentic/approval-ignore.test.ts` (by effect, real HTTP), `agentic/approval-ignores.test.ts`, rows in `approvals-owner-only.test.ts`, `fast-assistant.test.ts`, `crm-login-approvals.test.ts` and `shared/access.test.ts`; the page's part: `src/approvals/ignore-wiring.test.mjs`.
 - `POST /agentic/send-as-me` (`send`): his words into a chat (the Assistant's prepared cards go through it).
 - `POST /agentic/approvals/devices/code` (`code`): the code to add a device. `POST /agentic/approvals/devices/remove` (`remove`). `POST /agentic/approvals/devices/unsigned` (`unsigned`): the old no-signature way on or off.
 - `POST /voice/pair-code` (`pair`; its own check in the voice wiring, the same rule): the pairing code for the phone.
@@ -3386,3 +3488,14 @@ Shubham (order o747c, 14 Nov 2026): "I hate the theming. Can you see the bottom 
 - **The agent** (`chats.ts`): a CLI that asks the terminal for its colours (OSC 10 / 11; Codex asks at start, and draws its bands only once it knows the background) is answered on the chat's PC with the same scheme, and the question is taken out of what the pages get (so no page answers it a second time). On a Linux PC (the Z800) Codex then draws its bands.
 - **Not on Windows yet:** under Windows' own pseudo-console (the inbox ConPTY the app's chats run in) the question never comes out of the console, so the agent cannot answer it and Codex draws no bands there (tried on 14 Nov with Codex 0.163.0: answering through the console's win32 input mode does not reach Codex's question either; the answer is typed into the box instead). node-pty's bundled ConPTY (1.25, \`useConptyDll\`) does pass the question through, and Codex then draws its bands (order o7381, a test build only): it also passes Codex's own scroll regions through, which the agent's screen model must follow first, so it waits for Shubham's and Lead's yes. Claude Code's bands do not depend on it: they show on Windows today, in both looks.
 - Tests: `shared/terminal-colours.test.ts`, `src/agentic/terminal-colours-wiring.test.mjs`, `agentic/chats.test.ts` (a CLI asking is answered; viewers and the replay never see the question). Checked with a real Codex chat's and a Claude chat's output at 1280 and 411 px in both looks.
+
+## The raw keys a chat takes are his hands (Lead's order of 18 Nov 2026; F-076's fence on the page's own key surfaces)
+
+Found by two readers (Agent 6, Agent 14) and confirmed by a census: the Assistant, an agent with the screen driver (src/overlay/driver.ts, ui_control click / type / key), could answer another chat's native prompt through the chat's key surfaces (xterm, the keys toolbar, the phone keys, and the chat view's own question buttons and Stop) with none of the Approvals fence (no data-human-only, no trusted-event check, no approval record), and the presence record would have filed it as him. Nothing legitimate uses it: the Assistant's brief, ui_control's own text, Quick and the voice hold never press a chat's keys (no setting; brief v12 adds one line: a key refused because a chat's terminal has the focus is never retried another way, press the cover's own close button).
+- **Every control that sends a raw key into a chat is human-only and trusted-only.** The chat terminal's host box (`src/agentic/Terminal.tsx`) is `data-human-only`, and its first listeners (`src/agentic/terminal-human.ts`: keydown, keypress, keyup, beforeinput, input, paste, composition, mouse and pointer events; registered for the CAPTURE phase, which matters: a bubble-phase listener would run after xterm's own listeners on its text box, so the unit tests record and assert the flag) drop an event a script made (`isTrusted` false) before xterm can turn it into data for the chat; its key handler and its touch tap on a menu read only trusted events. The keys toolbar (`src/chat/Conversation.tsx`), the phone keys (`src/agentic/TouchKeys.tsx`) and the chat view's question buttons (`MenuCard`, `AskCard` in `src/chat/Bubbles.tsx`) are `data-human-only` and ask `isHuman` before they send; the composer's button is human-only only while it is Stop (it presses Esc), and as Send it stays free (the box and Send are how anyone writes to a chat); the mic button of a chat's terminal window (`ChatGrid.tsx`, voice dictation, whose transcript is typed into the chat as keys: a dictated digit would pick a numbered option and "send when I stop speaking" adds Enter) is human-only and starts only on a trusted click. An attachment types a path line (text) and needs the file picker: unchanged.
+- **The driver** refuses a chat's terminal by what it is: `.xterm` that is not the SSH terminal, marked or not, in click, type and press (a key with no ref goes to the focused element, which with the terminal focused is the chat). The SSH terminal keeps its own rule (order o68f0).
+- **A real key, touch, paste and an assistive technology's own click are trusted** and work as before. No server change.
+- **Closed elsewhere:** the composer's Send never types into a chat that shows a menu: the pool refuses for every caller (`chats.ts` `blocked()`, reason `menu`) while a numbered `❯ N.` option or an "Enter to select / Enter to confirm / Esc to cancel" footer is on the chat's live screen.
+- **Not closable on the page:** phone_control taps on the phone's own Agentic app arrive as trusted events (Android accessibility gestures); the phone-control switch (off by default, on only with his CRM session), Chris's safety rules and the fingerprint for sensitive actions are what hold that. Agent 6 read the Android side: the phone app refuses the Agentic app's own screens by package, with a gap for browsers that are not on its list.
+- **What the tests do not prove (said in the class guard too):** the chat view's keys toolbar and the question cards are held by the AST class guard only (no effect test with fake events, unlike the phone keys and the composer); the scanner reads literal `t: 'in'` keys, `sendKeys` and `keys.current` / `keysRef.current`, so a sender with a computed key or a variable kind slips past it; and only a real browser proves the box's guard works against real xterm: the browser claim must dispatch an UNTRUSTED keydown and input at xterm's helper textarea and show that nothing reaches the socket, and a CDP key (trusted) that does.
+- Tests (source only, unrun when written): `src/agentic/terminal-keys-human-only.test.mjs` (a parser-based class guard: the places that send a raw key are counted exactly, so a new one fails until it is looked at, and each is held to the fence), `src/agentic/terminal-lifecycle.test.mjs` (the box drops a script's events, first), `src/agentic/touch-keys.test.mjs` and `src/chat/composer-send.test.mjs` (the real components with fake events), `src/overlay/driver-keys-fence.test.mjs` (the real driver on a stub page), `src/overlay/brief-voice.test.mjs`; the browser claim runs the real terminal at 360 / 411 / PC.

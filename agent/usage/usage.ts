@@ -48,7 +48,7 @@ export function buildIdOf(version: string): string {
 export function createUsage(o: UsageOptions): Usage {
   const now = o.now ?? Date.now
   const snapshotDir = path.join(o.dir, USAGE_SNAPSHOT_DIR)
-  const ledger = createLedger({ file: path.join(o.dir, USAGE_LEDGER_FILE), onError: o.onError })
+  const ledger = createLedger({ file: path.join(o.dir, USAGE_LEDGER_FILE), onError: o.onError, build: () => o.build()?.id ?? null })
   const reporter: Reporter = createReporter({
     ledger,
     loginFor: userId => {

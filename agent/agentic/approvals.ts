@@ -3,7 +3,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, s
 import path from 'node:path'
 import type { ApprovalLogEntry } from '../../shared/approvals.ts'
 import type { ChatMenu } from '../../shared/chat.ts'
-import { findMenu } from './screen.ts'
+import { findMenu, type MenuOptions } from './screen.ts'
 
 // F-076: reading what a waiting chat asks, from its screen text, and the log of what was answered and sent.
 
@@ -14,7 +14,8 @@ const ESC_FOOTER_RE = /\besc to cancel\b/i
  * A menu option that LEAVES claude: "No, exit", "Exit Claude Code", "Quit". On a prompt that has one, Esc is that option (claude's confirm select starts on its
  * "no" and Esc takes it), so a generic "Cancel" there would be an exit under another name. A second signal only, on prompts whose menu was read; see promptOf.
  */
-const EXIT_LABEL_RE = /^(?:no,?\s+)?(?:exit|quit)\b/i
+// F-294c (Agent 14's follow-up 8): the word as a WORD anywhere in the label, not only at its start: "No, and exit" would have kept Cancel. It only ever withholds Cancel (the safe side); "Exiting" is still not the word.
+const EXIT_LABEL_RE = /\b(?:exit|quit)\b/i
 /** How many lines above the options are kept as what the prompt is about. */
 const CONTEXT_LINES = 28
 
@@ -23,14 +24,14 @@ const CONTEXT_LINES = 28
  * tool), and an id made of both. The id is what an answer names: if the prompt has changed by then (the same
  * "Do you want to proceed?" for another command), the id differs and the answer is refused.
  */
-export function promptOf(screen: string): { menu: ChatMenu | null; context: string; id: string; cancellable: boolean } {
+export function promptOf(screen: string, opts: MenuOptions = {}): { menu: ChatMenu | null; context: string; id: string; cancellable: boolean } {
   const lines = screen.split(/\r?\n/)
   // A footer that says "Esc to cancel" among the last lines drawn: Esc closes this prompt (on a permission prompt that means No).
   const escFooter = lines
     .filter(l => l.trim() !== '')
     .slice(-4)
     .some(l => ESC_FOOTER_RE.test(l))
-  const found = findMenu(lines)
+  const found = findMenu(lines, opts)
   const menu = found?.menu ?? null
   // SAFETY FIX (17 Nov 2026): the generic "Cancel (Esc)" is offered ONLY for a prompt whose menu was READ. A prompt we cannot read is a prompt whose keys we do not
   // know, and on claude 2.1.326's "Adding a new directory" prompt (an unnumbered select that starts on "No, exit") Esc IS "No, exit": it ends the chat's claude. That
@@ -45,7 +46,8 @@ export function promptOf(screen: string): { menu: ChatMenu | null; context: stri
   // The context is what comes before the menu's first option (or the whole screen when there is no menu to press).
   const clean = tidy(found ? lines.slice(0, found.first) : lines)
   const context = clean.slice(Math.max(0, clean.length - CONTEXT_LINES)).join('\n').trim()
-  const basis = JSON.stringify({ context, q: menu?.question ?? '', h: menu?.hint ?? '', o: menu?.options.map(o => [o.n, o.label]) ?? [] })
+  // Order o5d4e: an unnumbered menu says so in its id (a numbered one's id is what it always was); where the pointer stands is not in it, so moving it keeps the id.
+  const basis = JSON.stringify({ context, q: menu?.question ?? '', h: menu?.hint ?? '', o: menu?.options.map(o => [o.n, o.label]) ?? [], ...(menu?.keys ? { k: menu.keys } : {}) })
   return { menu, context, id: createHash('sha1').update(basis).digest('hex').slice(0, 16), cancellable }
 }
 

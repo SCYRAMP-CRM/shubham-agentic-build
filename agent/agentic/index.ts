@@ -66,7 +66,7 @@ import {
   type TuneAnswer,
   type TuneRequest,
 } from '../../shared/agentic.ts'
-import type { PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
+import type { ChatMenu, PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
 import { deliveryBlockWords, diagnosticWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 import { readDraftClear, readDraftView, type DraftKind, type DraftView } from '../../shared/chat-draft.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
@@ -96,6 +96,8 @@ import { readStatus } from './screen.ts'
 import { createHeartbeat, driftPushOn, phoneItems, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
+import { APP, NOT_RECORDED, UNATTRIBUTED, classesOfInput, createPresence, describePresence, screenActOf, screenCallerOf, screenOutcomeOf, screenToolOf, type ChatActor, type ChatRef, type Door } from './chat-presence.ts'
+import { isAutomaticInput } from '../../shared/terminal-automatic.ts'
 import { createVoice, type AskView } from './voice.ts'
 import { spawn, spawnSync } from 'node:child_process'
 import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
@@ -108,7 +110,7 @@ import { namesChoice, namesFor, type NamesChoice } from '../../shared/fast-names
 import { fastHello, ID_RE, MAX_TEXT } from '../../shared/fast.ts'
 import { buildBrief, buildSnapshot, type SnapshotInput } from './fast-brief.ts'
 import { createFastSession, type FastSession, type Origin } from './fast.ts'
-import { fastDenied } from './fast-tools.ts'
+import { FAST_AGENT_ID, fastDenied } from './fast-tools.ts'
 import { readMemory } from './fast-gate.ts'
 import { FAST_TOOLS } from './fast-tools-list.ts'
 import { createOldFiles, createOldReaderStore, findOldRoot, notesPathOf, oldBrief, oldCall, oldRootCandidates, readNotes } from './old-reader.ts'
@@ -124,6 +126,7 @@ import { OLD_SOCKET } from '../../shared/old-route.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
+import { createApprovalIgnores, IGNORE_DETAIL, RESTORE_DETAIL, type IgnoreRecord } from './approval-ignores.ts'
 import { createFloorEventLog, describeFloorEvent, type FloorEvent, type FloorEventInput } from './floor-events.ts'
 import type { Elevation } from './approval-recovery.ts'
 import { createAutoUpdate } from './auto-update.ts'
@@ -132,7 +135,7 @@ import type { WaTools } from '../whatsapp/index.ts'
 import { waTool } from '../whatsapp/tools.ts'
 import type { SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
-import type { AnswerRequest, ApprovalItem, ApprovalLogEntry, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
+import type { AnswerRequest, ApprovalItem, ApprovalLogEntry, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, IgnoreRequest, IgnoredAnswer, PreparedCard, RestoreRequest, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, assertCodexThreadAvailable, MAX_FLOOR_BODY, type FloorStore } from './floors.ts'
 import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
@@ -180,6 +183,8 @@ import { authError, OPEN, type Caller } from '../auth/types.ts'
 import { GOALS_CRM_PATH, routeRule } from '../../shared/access.ts'
 import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
 import { createQuestionRouting } from './question-routing.ts'
+import { createArrowPrompts } from './arrow-prompts.ts'
+import { chooseByArrows } from './arrow-select.ts'
 import { floorRoutable, routableChat } from './decision-routing.ts'
 import {
   candidatesOf, decidesOn, effectiveRoute, OWNER_ROUTE, parseApprovalsScope, routeNames, splitQuestions, type ApprovalsScope, type QuestionRoute,
@@ -218,6 +223,7 @@ import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
+import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, floorsOwnedBy, quickMayUseMemory, type QuickTalker } from './memory-people.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
 import { answer, pullFrom as pullTranscriptFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
 import {
@@ -472,9 +478,10 @@ export interface AgenticOptions {
   /**
    * F-051: the memory layer. meaning: the embedding model (main.ts turns it on; left out, search
    * goes by words and nothing is downloaded); start: started with the agent rather than at first
-   * use. The rest are for tests.
+   * use. The rest are for tests. allowOthers (oc65c S2, tests only, until other people's memory is built in S9): gives every person a layer of their own,
+   * so the tests can prove two people's memories never mix; `main.ts` never sets it, and without it only the app owner has one.
    */
-  memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
+  memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[]; allowOthers?: boolean }
   /** F-078: the heartbeat's timer runs unless this is false (tests) or SAD_HEARTBEAT=0 (the way it was). */
   heartbeat?: boolean
   /** F-083: the watchdog's checks run in the heartbeat's beat unless this is false (tests) or SAD_WATCHDOG=0 (the way it was). */
@@ -516,6 +523,8 @@ export interface AgenticOptions {
   /** How long after the agent starts a chat that does not ask for the new list by itself is left alone (120 s), and how often it is looked at (60 s). Tests shorten them. */
   toolsRefreshGraceMs?: number
   toolsRefreshEveryMs?: number
+  /** F-294, tests: how long a chat must be away from its question before the prompts a person ignored in it are let go (3 s: a state that blinks while a chat paints must not undo an ignore). */
+  approvalIgnoreGraceMs?: number
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
   restartGraceMs?: number
   /**
@@ -731,11 +740,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const log = o.log
   const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
+  // Order o5d4e: "Buttons for arrow-select prompts" (arrow-prompts.json on this PC; on unless he switched it off; the old way, no buttons, is kept).
+  const arrowPrompts = createArrowPrompts(path.join(o.dir, 'arrow-prompts.json'))
+  if (arrowPrompts.unreadable()) log?.warn('arrow-select prompts: the saved setting (arrow-prompts.json) could not be read; they get no buttons until he chooses again')
+  const menuOpts = () => ({ arrows: arrowPrompts.on() })
+  /** A menu as this app shows it: an unnumbered one only while the setting is on (a member PC's snapshot may carry one). */
+  const menuIfOn = (m: ChatMenu | null): ChatMenu | null => (m?.keys === 'arrows' && !arrowPrompts.on() ? null : m)
   // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
   const chatFeeds = createChatFeeds({
     projectsDir,
     log: o.log,
     screen: sid => chats.screen(sid),
+    arrowMenus: () => arrowPrompts.on(),
     // F-134: a Codex chat's conversation is its rollout file, read in Codex's format.
     fileOf: sid => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid),
     formatOf: sid => (isCodexSession(sid) ? CODEX_FORMAT : CLAUDE_FORMAT),
@@ -1152,36 +1168,144 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-051: the memory layer, kept on the hub (or a PC on its own); a member's chats reach it
   // through the hub, as their tool calls do. Started with the agent when main.ts says so, else
   // at first use; meaning (the embedding model) only when main.ts turns it on.
-  const layer: MemoryLayer = createMemoryLayer({
+  // oc65c S1 (the owner key): one layer per PERSON (memory-people.ts), made when it is first asked for. Only the owner's exists: at the folders it
+  // has always had, with the texts it has always made and the floors it has always seen.
+  // oc65c S2 (the one door): EVERY way to a layer, or to its brief, goes through the functions of this block (routeLayer, chatLayer, memoryBrief and
+  // the start-up), and each asks "whose memory?" and answers from that person's layer or from none. Outside this block those names, memoryPeople and
+  // quickMayUseMemory may appear ONLY as a call at a marked site, each marker (`memory-door` and an ID) naming a row of the door x person matrix that
+  // memory-doors.test.ts holds, with an exact count of sites per row: a call with no marker, a marker with no call, an alias, a destructuring or
+  // the name passed as a value is a RED test, so a NEW door goes in the matrix before it merges (Lead's rule, 18 Nov 2026).
+  // memory-gate: begin
+  // The guard (Lead's ruling, 18 Nov 2026): the memory is offered only while the app owner is the ONLY administrator. An administrator is owner-equivalent in
+  // the chat plane (access.ts mayType, chatRights): they can type "search the memory for X" into his chat and read the recalled text in its transcript. Asked at
+  // every scope(); the live list has one administrator (the app cannot add one: only a hand edit of auth.json), so today it changes nothing.
+  let guardWarned = false
+  const memoryEnabled = (): boolean => {
+    const ok = adminsAreOnlyTheOwner(o.auth?.admins() ?? [SBSKRRT_OWNER.id], SBSKRRT_OWNER.id)
+    if (!ok && !guardWarned) {
+      guardWarned = true
+      log?.warn('memory: switched off for everybody while another administrator exists (auth.json admins): an administrator can type into his chats and read what was recalled there')
+    }
+    return ok
+  }
+  const memoryPeople = createMemoryPeople({
     dir: o.dir,
-    modelsDir: path.join(o.dir, '..', 'models'),
-    notes: id => memory.all(id),
-    floors: () => floors.list(),
-    transcript: sid => findTranscript(sid, projectsDir),
-    projectsDir,
-    token: o.token,
-    claude: () => o.claude ?? findClaude(),
-    log,
-    embedder: o.memory?.embedder ?? (o.memory?.meaning ? undefined : noMeaning()),
-    timers: o.memory?.timers,
-    claudeArgs: o.memory?.claudeArgs,
-    active: () => mode() !== 'member',
-    live: !!o.memory?.start,
+    appOwner: SBSKRRT_OWNER,
+    // Tests only, until other people's memory is built (S9): without it only the app owner has a layer.
+    allowOthers: o.memory?.allowOthers,
+    enabled: memoryEnabled,
+    make: (person, home) =>
+      createMemoryLayer({
+        dir: o.dir,
+        home: home.layerDir,
+        wikiDir: home.wikiDir,
+        person,
+        // A person's own memory starts from "learns only what they tell it" (his answer, 18 Nov: A). The owner's saved settings are untouched.
+        settings: home.legacy ? undefined : { fromChats: false, pastChats: false },
+        modelsDir: path.join(o.dir, '..', 'models'),
+        notes: id => memory.all(id),
+        floors: () => (home.legacy ? floors.list() : floorsOwnedBy(floors.list(), person.id, SBSKRRT_OWNER.id)),
+        transcript: sid => findTranscript(sid, projectsDir),
+        projectsDir,
+        token: o.token,
+        claude: () => o.claude ?? findClaude(),
+        log,
+        embedder: o.memory?.embedder ?? (o.memory?.meaning ? undefined : noMeaning()),
+        timers: o.memory?.timers,
+        claudeArgs: o.memory?.claudeArgs,
+        active: () => mode() !== 'member',
+        live: !!o.memory?.start,
+      }),
   })
-  let layerStarted: Promise<void> | null = null
-  /** The memory layer, started (here: this PC keeps the memory). */
-  async function memoryLayer(): Promise<MemoryLayer> {
-    layerStarted ??= layer.start()
-    await layerStarted
+  /** Each layer is started once, at its first use (its wiki, its index, its timers): here, where this PC keeps the memory. */
+  const layersStarted = new WeakMap<MemoryLayer, Promise<void>>()
+  async function startedLayer(layer: MemoryLayer): Promise<MemoryLayer> {
+    let started = layersStarted.get(layer)
+    if (!started) layersStarted.set(layer, (started = layer.start()))
+    await started
     return layer
+  }
+  /**
+   * One WARN per (code, who, where) per hour, in the denial log's own format (`auth <status> <code>: <who> <where>`), with the memory's own codes (AuthErrorCode has none
+   * of them, so auth.deny is not used): his own Memory tab polls every 15 s, and an unlimited line would bury the real ones (Agent 3's read).
+   */
+  const memoryDenials = new Map<string, number>()
+  function whoIs(c: Caller): string {
+    return c.person ? `${c.person.username} (${c.person.id.slice(0, 8)})` : `nobody signed in (${c.via})`
+  }
+  function logMemoryDenial(status: number, code: string, who: string, where: string) {
+    const key = `${code}|${who}|${where}`
+    const now = Date.now()
+    const last = memoryDenials.get(key)
+    if (last !== undefined && now - last < 3_600_000) return
+    if (memoryDenials.size >= 200) memoryDenials.clear()
+    memoryDenials.set(key, now)
+    log?.warn(`auth ${status} ${code}: ${who} ${where}`)
+  }
+  /**
+   * PAGE and API doors: the layer of the CALLER'S OWN person (access.ownerOf: the open app and the PC's own program are the app owner). No route takes a person
+   * from its path, query or body. Asked BEFORE anything is made or started: a caller who has no memory (anyone but the app owner until S9; everybody while another
+   * administrator exists) gets 409 (code memory-others-not-built or memory-admins), and the refusal is LOGGED, once an hour per person and route.
+   */
+  async function routeLayer(r: MountRequest): Promise<MemoryLayer> {
+    const caller = callerOf(r)
+    const scope = memoryPeople.scope(access.ownerOf(caller))
+    if (!scope) {
+      const refusal = memoryPeople.refusal()
+      logMemoryDenial(409, refusal.code, whoIs(caller), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+      throw refusal
+    }
+    return startedLayer(memoryPeople.layer(scope))
+  }
+  /**
+   * CHAT doors (a tool, the recall hook): the STARTED layer of the chat's OWNER (chatMemoryPerson), or null: none (a chat shared with other people, a person with
+   * no memory yet, an owner id that is not a person id, another administrator exists: never a throw). The caller's administrator flag plays no part here (each tool
+   * keeps its own administrator test as it was: an ownerless agent, whose caller is the open one, still gets nothing there). `quick`: set only by Quick's own calls
+   * (fastCall -> toolFor): its talker decides (quickMayUseMemory: the layer is offered to the app owner talking on a web page, never to a phone or anyone else).
+   */
+  async function chatLayer(agent: FloorAgent, quick?: { talker: QuickTalker | null }): Promise<MemoryLayer | null> {
+    const person = chatMemoryPerson(agent, SBSKRRT_OWNER)
+    if (!person) return null
+    if (quick && !quickMayUseMemory(quick.talker, SBSKRRT_OWNER.id)) return null
+    const scope = memoryPeople.scope(person)
+    return scope ? startedLayer(memoryPeople.layer(scope)) : null
+  }
+  /** What Quick says when its layer is withheld (memory_read): the owner is never told "That tool is for the owner of this app" on his own phone. */
+  function quickDenied(talker: QuickTalker | null): Error & { status: number; code: string } {
+    if (!talker) return Object.assign(apiError(403, 'Nobody holds Quick right now, so its memory is not offered.'), { code: 'memory-quick-nobody' })
+    if (talker.kind === 'phone') return Object.assign(apiError(403, "Quick's memory is not offered on the phone yet: the phone cannot say who is talking."), { code: 'memory-quick-phone' })
+    return Object.assign(apiError(403, "Quick's memory is for the app owner, on his own page."), { code: 'memory-quick-talker' })
+  }
+  /**
+   * What a chat door that refuses (memory_read) says, and LOGS (once an hour per chat and tool): a shared chat in its own words, another administrator's presence in
+   * its own, Quick's talker in its own, anyone else the owner-only answer a person who is not the owner gets.
+   */
+  function memoryDenied(agent: FloorAgent, name: string, quick?: { talker: QuickTalker | null }): Error {
+    let e: Error & { status: number; code?: string }
+    if (chatIsShared(agent)) e = Object.assign(apiError(403, "This chat is shared with other people, so the app's memory is off for it until that ends."), { code: 'memory-shared-chat' })
+    else if (!memoryEnabled()) e = memoryPeople.refusal()
+    else if (quick && !quickMayUseMemory(quick.talker, SBSKRRT_OWNER.id)) e = quickDenied(quick.talker)
+    else e = authError(403, 'That tool is for the owner of this app.', 'admin-only')
+    const who = agent.owner ? `${agent.owner.username} (${agent.owner.id.slice(0, 8)})` : 'a chat with no owner on record'
+    logMemoryDenial(e.status, e.code ?? 'memory-refused', who, `tool ${name}${agent.sessionId ? ` chat ${agent.sessionId.slice(0, 8)}` : ''}`)
+    return e
   }
   /** Switched on (main.ts): the chats get it (recall, the brief's section, memory_read, hits). Off, the Memory tab still can. */
   const memoryOn = !!o.memory?.start
-  if (memoryOn && mode() !== 'member') void memoryLayer().catch(e => log?.warn(`memory: couldn't start: ${message(e)}`))
+  // memory-door: I1 (the app's own start-up of the owner's layer, and so of its timers, when the memory is switched on)
+  const startScope = memoryOn && mode() !== 'member' ? memoryPeople.scope(SBSKRRT_OWNER) : null
+  if (startScope) void startedLayer(memoryPeople.layer(startScope)).catch(e => log?.warn(`memory: couldn't start: ${message(e)}`))
   /** F-051, on a member: the hub's memory section for its chats' briefs, as last fetched. */
   let memberBrief = ''
-  function memoryBrief(): string {
-    if (mode() !== 'member') return layer.brief()
+  /**
+   * A member asks the hub for the section and keeps what it is told. Agent 14's F3 and Agent 3's log count (read in source and in the Server's logs, 18 Nov):
+   * the request carries no person, so the hub takes it for the open caller, which is NOT an administrator once a sign-in is wired (production always has one),
+   * and REFUSES it (403, before the handler): a member's chats have always had an empty section, the fetch never shows the layer to anyone and never starts it
+   * (the owner's own Memory tab does). It is asked only while the memory is switched on (the timer below), which ends about 576 warning lines a day and changes
+   * nothing else. NEVER repair it by letting that request through: a member's section is built per chat, through the `tool` link kind (S5).
+   */
+  // memory-door: B5 (the member's fetch of GET /memory/brief)
+  function refreshMemberBrief(): string {
     const link = team?.hub()?.link
     if (link)
       void request<{ text: string }>(link, 'http', { method: 'GET', rest: '/memory/brief', query: '', body: undefined })
@@ -1189,11 +1313,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
         .catch(() => {})
     return memberBrief
   }
-  // A member keeps its copy fresh, so a chat started there has the hub's latest.
+  /** The memory section of ONE chat's brief (B1-B4 of the matrix): its owner's, or '' for a chat that is shared or whose owner has no memory. Read once, at the chat's start. */
+  function memoryBrief(agent: FloorAgent): string {
+    const person = chatMemoryPerson(agent, SBSKRRT_OWNER)
+    const scope = person ? memoryPeople.scope(person) : null
+    if (!scope) return ''
+    if (mode() !== 'member') return memoryPeople.layer(scope).brief()
+    // On a member the only section there is to ask for is the app owner's: only a chat of his asks for it.
+    return scope.person.id.toLowerCase() === SBSKRRT_OWNER.id ? refreshMemberBrief() : ''
+  }
+  // A member keeps its copy fresh, so a chat started there has the hub's latest: only while the memory is switched on (the hub refuses the fetch today: see above).
   const memberBriefTimer = setInterval(() => {
-    if (mode() === 'member') memoryBrief()
+    if (memoryOn && mode() === 'member') refreshMemberBrief()
   }, 5 * 60_000)
   memberBriefTimer.unref()
+  // memory-gate: end
 
   // ---------------------------------------------------------------------------------------
   // F-021 state: on the hub, who holds what and its members' live chats; on a member, the copy
@@ -1515,7 +1649,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       } else if (action === 'stop') {
         if (a.sessionId) await stopAt(device, a.sessionId)
       } else if (action === 'open') {
-        const opened = device === self().id ? await openChat(f.id, a.id, {}) : await openOnPeer(peerOf(device), f, a)
+        const opened = device === self().id ? await openChat(f.id, a.id, {}, undefined, undefined, actorOfCaller(c)) : await openOnPeer(peerOf(device), f, a)
         const workspace = (await controlAnswer(c)).workspaces.find(w => w.device.id === device)!
         emit({ t: 'pc-control', answer: controlRawAnswer() })
         if (mode() !== 'member') pushState()
@@ -1644,6 +1778,64 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
   /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
   const startCause = new Map<string, string>()
+  /** Who asked for the next start of a chat, when the asker said (openChat's `by`): written onto its start event, then forgotten. Absent is NOT "nobody": it is "not said here". */
+  const startBy = new Map<string, ChatActor>()
+  /** The `by` for a start event, taken once (a start site spreads it into its line): nothing when the asker did not say. */
+  const startedBy = (sid: string): { by?: ChatActor } => {
+    const by = startBy.get(sid)
+    startBy.delete(sid)
+    return by ? { by } : {}
+  }
+  // Who was present at a chat (chat-presence.ts): keys that reached a terminal (their CLASS, never the keys) and the screen an Assistant drove (the kind of act, never
+  // what or where), one line per actor and class per minute. A line that cannot be written never stops the typing or the call: it is said in the log and told to the owner
+  // once in the heartbeat (GET /chat-presence shows it too).
+  const presence = createPresence({ file: path.join(o.dir, 'chat-presence.jsonl'), error: m => log?.error(m) })
+  /** The chat `sid` as the record names it: its short id and, when it is on a floor, its agent and floor. */
+  const presenceChat = (sid: string): ChatRef => {
+    const at = bySession(sid)
+    return { id: sid.slice(0, 8), ...(at ? { agent: at.agent.name, floor: at.floor.name } : {}) }
+  }
+  /**
+   * Who is calling a screen tool, for the presence record. QUICK HAS ITS OWN VALUE: its made-up agent (FAST_AGENT_ID, no session) is spread from the Orchestrator's and
+   * PASSES isOrchestratorAgent, so by that test alone its calls would be filed as the overlay Assistant's: a synthetic identity inheriting a real one's attribution (the
+   * shape of the "Others 91.6%" usage bug). Checked first, on purpose, and by the shared id, not by a second copy of the string.
+   */
+  function screenActorOf(floor: Floor, agent: FloorAgent, sid: string): ChatActor {
+    return screenCallerOf({
+      quick: agent.id === FAST_AGENT_ID,
+      personAssistantOf: isPersonAssistant(agent) && agent.owner ? { id: agent.owner.id, name: agent.owner.name } : null,
+      orchestrator: isOrchestratorAgent(floor.name, agent),
+      chat: { id: sid.slice(0, 8), agent: agent.name, floor: floor.name },
+    })
+  }
+  /** Keys reached chat `sid`: the record is told their CLASSES (chat-presence.ts classesOfInput), never the keys. xterm's own replies are not people (`skipAutomatic`). */
+  function noteKeys(sid: string, data: string, by: ChatActor, skipAutomatic: boolean) {
+    try {
+      if (skipAutomatic && isAutomaticInput(data)) return
+      presence.keys(sid, () => presenceChat(sid), classesOfInput(data), by)
+    } catch (err) {
+      log?.error(`chat presence: keys could not be noted (${message(err)})`)
+    }
+  }
+  /**
+   * A terminal frame on its way to a chat on ANOTHER PC never passes through chats.input here. What is noted is that it was HANDED TO THE LINK (`keys-relayed`, with the PC it was handed
+   * toward when the call site knows it), never that it "reached" the terminal: this PC cannot know whether the far PC took it (Agent 6's review, R3, ruled a NAME-ONLY fix). Noting at the
+   * write, where a failed write could be told apart, is FILED. xterm's own replies are not people (`isAutomaticInput`), as for a chat on this PC.
+   */
+  function noteRelayedFrame(sid: string, frame: unknown, by: ChatActor, toPc?: { id: string; name: string }) {
+    try {
+      if (!isObject(frame) || frame.t !== 'in' || typeof frame.d !== 'string') return
+      if (isAutomaticInput(frame.d)) return
+      presence.relayed(sid, () => presenceChat(sid), classesOfInput(frame.d), by, toPc)
+    } catch (err) {
+      log?.error(`chat presence: relayed keys could not be noted (${message(err)})`)
+    }
+  }
+  /** Who a page's socket is, as the presence record names them: the person signed in on it, or the open app of the owner's own PCs; and the door it came through. */
+  const actorOfCaller = (c: Caller): ChatActor => {
+    const door: Door = c.via === 'tailnet' ? 'tailnet' : 'local'
+    return c.person ? { kind: 'person', person: { id: c.person.id, name: c.person.name }, door } : { kind: 'owner-open-app', door }
+  }
   let mirrorOffAt = 0
   let mirrorOffNow = false
   /** F-193: the live mirror is switched off on this PC (SAD_INPUT_MIRROR=0, or the file input-mirror.off beside check-agent-messages.on). */
@@ -1837,7 +2029,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
         const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
         prepareClaudeConfig(cwd, claudeJson, poolOptions.addDirs)
-        const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief() : '', orderReplies())
+        // memory-door: B4
+        const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief(agent) : '', orderReplies())
           + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
         const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
         return { sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: writeBrief(briefsDir, sid, brief),
@@ -2025,8 +2218,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     },
     start: options => { assertLegacySid(options.sessionId); switchFences.assertWritable(options.sessionId); return nativeChats.start(options) },
-    input: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.input(sid, data),
-    press: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.press(sid, data),
+    // Presence (chat-presence.ts): this facade is the ONE place every key to a terminal passes, whatever pool runs the chat, so it is where the record is made: only keys that
+    // REACHED the chat, and a caller that does not say who sent them is `unattributed` (visible, never filed as somebody). press() is the app's own keys.
+    input: (sid, data, by) => {
+      const took = runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.input(sid, data)
+      if (took) noteKeys(sid, data, by ?? UNATTRIBUTED, true)
+      return took
+    },
+    press: (sid, data) => {
+      const took = runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.press(sid, data)
+      if (took) noteKeys(sid, data, APP, false)
+      return took
+    },
     type: (sid, text, options) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && !runFenced(sid) && nativeChats.type(sid, text, options),
     deliver: async (sid, text, options) => {
       // o7e6d: a fenced run takes no message (runFenced).
@@ -2267,7 +2470,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       requireConfirmedThread()
       const dflt = defaultsNow()
-      const brief = composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'Codex')
+      // memory-door: B2
+      const brief = composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies(), 'Codex')
       const mcp: Record<string, McpServerToml> = {
         // The shim is told whose chat it is by the terminal's environment, never by a file.
         [MCP_SERVER_NAME]: { command: process.execPath, args: [shim], env_vars: ['SAD_AGENTIC_KEY', 'SAD_AGENTIC_URL'] },
@@ -2295,7 +2499,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       })
       launched.set(sid, { effort: agent.codexEffort || dflt.codexEffort || '', at: new Date().toISOString(), ultracode: false })
       heartbeat.opened(sid)
-      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new'), ...startedBy(sid) })
       startCause.delete(sid)
       if (!resume) watchThread(sid, floor.id, agent.id, startedMs)
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -2530,7 +2734,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     voiceLockGiven = null
     launched.set(sid, { effort: dflt.effort, at: new Date().toISOString(), ultracode: false })
     heartbeat.opened(sid)
-    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new'), ...startedBy(sid) })
     startCause.delete(sid)
     log?.info(`chat ${sid.slice(0, 8)}: ${agent.name} started under the staff policy (${STAFF_POLICY})`)
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -2553,9 +2757,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const mcp: NonNullable<import('../opencode/backend.ts').BackendOptions['mcp']> = {}
       const registry = readRegistry(mcpRegistryFile)
       for (const name of chosen(registry, agent.mcpServers)) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
-      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'OpenCode'), mcp })
+      // memory-door: B3
+      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies(), 'OpenCode'), mcp })
       heartbeat.opened(sid)
-      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new' })
+      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new', ...startedBy(sid) })
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
       return !!agent.opencodeSession
     }
@@ -2569,8 +2774,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch (e) {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
-    // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on.
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies()))
+    // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on: this chat's OWNER's, never another person's.
+    // memory-door: B1
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies()))
     // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
     const dflt = defaultsNow()
     const effort = agent.effort || dflt.effort
@@ -2601,7 +2807,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     voiceLockGiven = null
     launched.set(sid, { effort, at: new Date().toISOString(), ultracode })
     heartbeat.opened(sid)
-    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new'), ...startedBy(sid) })
     startCause.delete(sid)
     // Ultracode is claude's own mode, on for the session only: asked for once its prompt is up (`/effort ultracode`).
     if (ultracode) chats.typeWhenReady(sid, '/effort ultracode')
@@ -3562,18 +3768,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. Order o7e6d (Lead's first-open GO): two opens of
    * one staff Assistant at once (two pages, a member's forward and a page here) start it once: the second waits for the first's answer.
    */
-  async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
+  async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string, by?: ChatActor): Promise<ChatOpened> {
     let staffKey: string | null = null
     try {
       if (isStaffAssistant(agentOf(floorOf(floorId), agentId))) staffKey = `${floorId}/${agentId}`
     } catch {
       // No such floor or agent: the open itself says so.
     }
-    if (!staffKey) return openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable)
+    if (!staffKey) return openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable, by)
     const key = staffKey
     const pending = staffOpening.get(key)
     if (pending) return { ...(await pending), started: false, resumed: false }
-    const run = openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable)
+    const run = openChatOnce(floorId, agentId, req, executionGuard, nativeExecutable, by)
     staffOpening.set(key, run)
     try {
       return await run
@@ -3582,7 +3788,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  async function openChatOnce(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
+  async function openChatOnce(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string, by?: ChatActor): Promise<ChatOpened> {
     requireHostAdoption()
     executionGuard?.()
     const managed = floorOf(floorId)
@@ -3658,6 +3864,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       executionGuard?.()
       const now = floorOf(floorId)
+      // Who asked, for the start event (chat-log.ts `by`): handed to the start sites through startBy, as startCause is, and forgotten whether or not one used it.
+      if (by) startBy.set(sid, by)
       const resumed = await startHere(now, agentOf(now, agentId), sid, req, executionGuard, nativeExecutable)
       executionGuard?.()
       requireRunningEngine(engineFor(agentOf(floorOf(floorId), agentId)), chats.info(sid)?.engine)
@@ -3665,6 +3873,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch (e) {
       if (mode() === 'hub') release(sid, self())
       throw e
+    } finally {
+      startBy.delete(sid)
     }
   }
 
@@ -3676,7 +3886,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * (stopAt: chats.kill, its last write sent on, the session let go). Then it is opened the way
    * openChat opens it. A member PC does not: the hub holds the session, so it is restarted there.
    */
-  async function restartChat(sid: string): Promise<boolean> {
+  async function restartChat(sid: string, by: ChatActor = APP): Promise<boolean> {
     if (mode() === 'member') return false
     const at = floors.bySession(sid)
     if (at) requireLegacyExecution(at.agent, defaultsNow())
@@ -3691,7 +3901,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       await openCode.abort(sid)
       chats.kill(sid, 'restart')
       await openCode.waitStopped(sid)
-      return resumeChat(sid)
+      return resumeChat(sid, undefined, by)
     }
     // The same draft rule as every message to a chat: /exit pasted after Shubham's unsent words would be sent WITH them, and a
     // chat stopped under them would lose them. A real draft: nothing is typed, nothing is stopped, 409. (A grey suggestion is not one.)
@@ -3702,13 +3912,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     await stopAt(self().id, sid)
     // Opened again the way F-058 brings chats back after a crash (resumeChat, below): one way to open a chat again.
-    return await resumeChat(sid)
+    return await resumeChat(sid, undefined, by)
   }
 
   // ---------------------------------------------------------------------------------------
   // F-058: the chats that were open when the app stopped come back (recover.ts)
 
-  async function resumeChat(sid: string, text?: string): Promise<boolean> {
+  async function resumeChat(sid: string, text?: string, by: ChatActor = APP): Promise<boolean> {
     await adopted
     if (team?.role() === 'member') return false
     const at = floors.bySession(sid)
@@ -3717,7 +3927,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // does it (heldStart) for every way a chat starts, this one included.
     try {
       // Here: it was open on this PC when the app stopped (or needs its token again), so it comes back on this PC.
-      const opened = await openChat(at.floor.id, at.agent.id, isPcControl(at.floor) ? {} : { here: true })
+      // `by` is the app UNLESS a person's call asked for the restart (the restart route passes the caller's actor, Agent 6's review R2): recovery after a stop, a failover restart, a
+      // refresh of the tool list and a lost host are the app bringing a chat back and keep the default; filing a person's own Restart as the app would be a false attribution.
+      const opened = await openChat(at.floor.id, at.agent.id, isPcControl(at.floor) ? {} : { here: true }, undefined, undefined, by)
       // oc65c: an Assistant that went on in a newer native session reopens THERE, so the carry-on goes to the session that was opened.
       if (opened.started && text) chats.typeWhenReady(opened.sessionId, text)
       return opened.started || chats.info(opened.sessionId) !== null
@@ -3894,7 +4106,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!native) return { menu: null, context: 'This PC needs a current app and a live native prompt before approvals can be used.', cancellable: false,
       id: createHash('sha256').update(JSON.stringify([promptEpoch, c, 'unsupported'])).digest('hex'), native: null }
     const p = native.proof
-    return { menu: native.menu, context: native.context, cancellable: native.cancellable,
+    return { menu: menuIfOn(native.menu), context: native.context, cancellable: native.cancellable,
       id: createHash('sha256').update(JSON.stringify([promptEpoch, c.sessionId, c.id, runtime, p.targetEpoch, p.generation, p.hubId, p.hubEpoch, p.floorId, p.agentId, p.promptId])).digest('hex'), native }
   }
 
@@ -4216,6 +4428,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       log?.error(`approvals: an answer's record could not be written (${message(err)}): ${e.by} answered prompt ${e.promptId ?? '?'} in ${e.agent} on ${e.floor}: ${e.choice ?? e.detail}`)
     }
   }
+  // F-294 (his o8c55, "give button ignroe pleae"): the prompts each person has hidden from their own cards. This is only the LIVE set, in memory (approval-ignores.ts says why); who
+  // ignored what, and when, is in the approvals log (kinds ignore and restore: ids and kinds only, never what a prompt said). Nothing here ever touches a chat.
+  const ignores = createApprovalIgnores({ graceMs: o.approvalIgnoreGraceMs })
+  /** Lets go the ignores of every chat that is no longer at a question (answered, ended, gone). Nothing to look at while nothing is ignored. */
+  function sweepIgnores() {
+    if (!ignores.size()) return
+    const where = whereAll()
+    ignores.sweep(sid => where[sid]?.state === 'question')
+  }
   // The phones (browsers) whose signature an approval or a send needs: registered once, here on the hub.
   // F-081: the switch the guard's night-watch reads (auto-update.json in this folder).
   const autoUpdate = createAutoUpdate(path.join(o.dir, 'auto-update.json'))
@@ -4235,7 +4456,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // any reason but its reply being seen or his Let go, or that was told to carry on while held, stays held until a turn end is seen there.
   const residual = createResidualHolds({ now: Date.now, file: path.join(o.dir, 'talk-residual.json'), ...(log ? { log } : {}) })
   // F-221 (order oeb56): live talk's turn records, one log line each, numbers only (talk-stage.ts): POST /talk/stage, his page's only.
-  const talkStage = createTalkStage({ now: Date.now, isOwner: c => access.isAdmin(c), deny: (c, where) => o.auth?.deny(c, 403, 'admin-only', where), ...(log ? { log } : {}) })
+  // oc65c / F-051 S2 (Lead's ruling on Agent 7's F6): live talk is the APP OWNER's (the eighth /talk surface: the other seven reach appOwnerOnly, see talkPage).
+  const talkStage = createTalkStage({ now: Date.now, isOwner: c => access.isAdmin(c) && access.ownerOf(c).id.toLowerCase() === SBSKRRT_OWNER.id, deny: (c, where) => o.auth?.deny(c, 403, 'admin-only', where), ...(log ? { log } : {}) })
   /**
    * T4 review: what a chat here shows a residual hold beyond its state (talk-residual.ts Seen). `live`: its own screen shows it working (its spinner,
    * or a prompt of its turn): a turn of this very run. `readBack`: the turn its record reads as running (or asking) began before this run started
@@ -4268,7 +4490,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     words: sid => readStatus(chats.screen(sid) ?? [])?.text,
     interrupt: sid => {
       if (!chats.info(sid)) return false
-      chats.input(sid, String.fromCharCode(27))
+      chats.input(sid, String.fromCharCode(27), APP)
       return true
     },
     scan: (sid, id) => {
@@ -4448,7 +4670,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const sid = floors.list().find(f => f.id === floorId)?.agents.find(a => a.id === agentId)?.sessionId
         if (sid) startCause.set(sid, 'watchdog')
         // On its home PC (F-064); offline: it is not started here, that is reported.
-        const opened = await openChat(floorId, agentId, { say: text })
+        const opened = await openChat(floorId, agentId, { say: text }, undefined, undefined, APP)
         if (!opened.on) chats.typeWhenReady(opened.sessionId, text, { holdForDraft: true })
         return null
       } catch (e) {
@@ -4520,7 +4742,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       try {
         const sid = floors.list().find(f => f.id === floorId)?.agents.find(a => a.id === agentId)?.sessionId
         if (sid) startCause.set(sid, 'heartbeat')
-        await openChat(floorId, agentId, {})
+        await openChat(floorId, agentId, {}, undefined, undefined, APP)
         return null
       } catch (e) {
         return message(e)
@@ -4560,6 +4782,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         lines.push(`${fresh.length} floor change${fresh.length === 1 ? ' was' : 's were'} made but NOT written to the floors' record (the file could not be written): ${fresh.map(e => describeFloorEvent(e)).join('; ')}.`)
         unrecordedFloorEventTold = unrecordedFloorEventCount
       }
+      // Who was present at a chat: a line that could not be written is told once, with who did what (chat-presence.ts).
+      const lostPresence = presence.news()
+      if (lostPresence.length) lines.push(`${lostPresence.length} presence line${lostPresence.length === 1 ? ' was' : 's were'} NOT written to the chats' presence record (the file could not be written): ${lostPresence.map(e => describePresence(e)).join('; ')}.`)
       if (prepared.size) lines.push(`${prepared.size} card${prepared.size === 1 ? ' is' : 's are'} prepared for you in the Send tab.`)
       const replies = orders.list().filter(x => x.pending).length
       if (replies) lines.push(`${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.`)
@@ -4880,7 +5105,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     interrupt: async () => {
       const sid = assistantAt()?.a.sessionId
       if (!sid || !chats.info(sid)) return false
-      chats.input(sid, String.fromCharCode(27))
+      chats.input(sid, String.fromCharCode(27), APP)
       return true
     },
   })
@@ -5115,6 +5340,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     void oldHost?.tick()
     // F-221 (ob98a): cards past their 10 minutes go. (The spoken latch has no clock: its orders decide.)
     talkCards.sweep()
+    // F-294: the ignores of chats that are no longer at a question go (contained: it only ever lets a hide go, and must never skip the housekeeping below).
+    try { sweepIgnores() } catch { /* the records stay until the next second */ }
     // V2 is optional. Contain ONLY its call, after all existing V1 housekeeping:
     // a future preview fault must neither skip card expiry nor shut down the app.
     try { fastPreview?.tick() } catch { /* The coordinator also fails closed at every entry. */ }
@@ -5205,6 +5432,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** Live talk's routes are his page's: a chat's key, or the fast Assistant's (both come as x-sad-chat-key), is refused before anything runs. */
   function talkPage(r: MountRequest) {
     if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, 'Only his own page may do this; not a chat tool.', 'not-yours')
+    appOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+  }
+  /**
+   * oc65c / F-051 S2 (Lead's ruling on Agent 7's F6): Quick and live talk are the APP OWNER's (one journal, one Orchestrator chat), not any administrator's. The open
+   * app and the PC's own program are the owner (access.ownerOf). The same 403 an administrator-only route gives a person who is not one.
+   */
+  function appOwnerOnly(c: Caller, where: string) {
+    if (access.ownerOf(c).id.toLowerCase() === SBSKRRT_OWNER.id) return
+    o.auth?.deny(c, 403, 'admin-only', where)
+    throw authError(403, 'This is for the owner of this app.', 'admin-only')
   }
 
   /**
@@ -5216,6 +5453,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function sendTalkCard(id: string, raw: unknown, r: MountRequest) {
     const caller = requireCrmHuman(o.auth, r, true)
     r.caller = caller
+    appOwnerOnly(caller, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
     if (mode() === 'member') throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null })
     if (!isObject(raw) || typeof raw.version !== 'number' || !Number.isInteger(raw.version)) throw apiError(400, 'Expected {version, text?}')
     if (raw.text !== undefined && typeof raw.text !== 'string') throw apiError(400, 'text is the words to send')
@@ -5255,6 +5493,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (typeof raw.text === 'string' && words.length > CARD_TEXT_MAX) throw apiError(413, `That is longer than ${CARD_TEXT_MAX} characters.`)
       let said: string
       try {
+        // memory-identity: W1 (a relay card's tool call, carried out on his tap as the chat that held it)
         said = await toolFor(relay.from, relay.tool, { sessionId: relay.sessionId, text: words }, undefined, { tapped: true })
       } catch (e) {
         // A delivery that may have gone (its receipt is not final) is never sent twice: the card is used up.
@@ -5351,6 +5590,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function talkLetGo(orderId: string, r: MountRequest) {
     const caller = requireCrmHuman(o.auth, r, true)
     r.caller = caller
+    appOwnerOnly(caller, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
     if (mode() === 'member') throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null })
     const od = orders.get(orderId)
     // T4 phase 2: a line that closed abnormally is gone from the orders, but the residual hold it left (or one made while it held) carries it.
@@ -5371,7 +5611,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function stopHeldTurn(sid: string): boolean {
     const st = chats.info(sid) ? whereAll()[sid]?.state : undefined
     if (st !== 'running' && st !== 'question') return false
-    chats.input(sid, String.fromCharCode(27))
+    chats.input(sid, String.fromCharCode(27), APP)
     log?.info(`live talk: Esc into chat ${sid.slice(0, 8)} before its residual hold went (his Let go)`)
     return true
   }
@@ -5420,8 +5660,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // The reads and task_add: run as an agent that belongs to the Orchestrator's floor (its memory, its floor's roster), under the Assistant's own name.
         const at = assistantAt()
         if (!at) throw apiError(409, 'There is no Orchestrator chat on this PC yet.')
-        const agent = { ...at.a, id: 'fast-assistant', name: names.fastName, role: 'Fast assistant', isBoss: false, sessionId: null } as unknown as FloorAgent
-        return toolFor('', name, rawArgs, { floor: at.f, agent })
+        const agent = { ...at.a, id: FAST_AGENT_ID, name: names.fastName, role: 'Fast assistant', isBoss: false, sessionId: null } as unknown as FloorAgent
+        // oc65c / F-051 S2 (Lead's rulings on Agent 7's F1/F6): Quick's tools run as a copy of the Orchestrator's agent, but WHO TALKS TO QUICK is not its owner (a phone
+        // records no person; a web talker is whoever is signed in). So the call carries the talker, and the LAYER (hits, memory_read) is offered only to the app owner
+        // on a web page (chatLayer / quickMayUseMemory); the floor notes and memory_recent stay as they were.
+        // memory-door: Q1
+        // memory-identity: W2 (Quick's reads: as a copy of the Orchestrator's agent)
+        return toolFor('', name, rawArgs, { floor: at.f, agent, quick: { talker: fastSession?.talker() ?? null } })
       }
     }
   }
@@ -5469,6 +5714,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
+    // memory-identity: W3 (the key of Quick's process: fastCall)
     if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
     // Order o5007: the old-app reader's process: its four read-only tools on the old app's folder, nothing else (old-reader.ts).
     if (oldHost?.keyOwns(key)) return oldCall(oldFiles, name, rawArgs)
@@ -5489,11 +5735,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       })
     }
     // S1, B3: this PC's own chat: the one check, judged here (no Server needed); staffGate asks it again inside the tool.
+    // memory-identity: W4 (a chat of this PC, by its own key: the agent that holds that session)
     return toolFor(me.sessionId, name, rawArgs)
   }
 
   /** A tool call from the chat `sid` (running here, or on a member that passed it on). F-221: `tapped` = his tap on a relay card carries it out. */
-  async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent }, opt: { tapped?: boolean } = {}): Promise<string> {
+  async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent; quick?: { talker: QuickTalker | null } }, opt: { tapped?: boolean } = {}): Promise<string> {
     // F-127: on a member this is a chat of a floor made here: what lives on the Server (the task list, the phone, WhatsApp, the screen, the memory layer) is not here.
     if (mode() === 'member' && NEEDS_SERVER.has(name)) {
       throw Object.assign(apiError(503, `That needs the Server (${team?.hub()?.name ?? 'the hub'}), which this chat's floor is not on yet. It joins the Server's list when the Server is back.`), { code: 'hub-offline' })
@@ -5638,7 +5885,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const opened =
           pc && !pc.here
             ? await openOnPeer(peerOf(pc.id), f, a)
-            : await openChat(f.id, a.id, { takeOver: args.takeOver === true })
+            : await openChat(f.id, a.id, { takeOver: args.takeOver === true }, undefined, undefined, { kind: 'chat', chat: presenceChat(sid) })
         return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
       }
       case 'prepare_send': {
@@ -5881,17 +6128,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-051: the floor's notes by keyword as before, and hits from all of the memory beside
         // them once the layer is switched on (until then, the answer is exactly as it was).
         if (args.mode === 'keyword' || !memoryOn || mode() === 'member' || !access.isAdmin(me)) return json({ entries })
-        const hits = query.trim() ? await (await memoryLayer()).search(query, { limit, excludeSession: sid }) : []
+        // S2: the hits are the chat's OWNER's memory, and only while the chat is not shared (the administrator test above stays: S2 only narrows).
+        // memory-door: T1
+        const layer = await chatLayer(agent, as?.quick)
+        if (!layer) return json({ entries })
+        const hits = query.trim() ? await layer.search(query, { limit, excludeSession: sid }) : []
         return json({ entries, hits })
       }
       case 'memory_recent':
         return json({ entries: memory.recent(floor.id, typeof args.limit === 'number' ? args.limit : 10) })
-      case 'memory_read':
+      case 'memory_read': {
         if (!memoryOn) throw apiError(409, "The app's memory (F-051) isn't switched on yet; memory_search finds the floor's notes.")
-        return (await memoryLayer()).read(typeof args.ref === 'string' ? args.ref : '')
+        // S2: the chat's OWNER's memory (ADMIN_TOOLS above already refused a non-administrator); another administrator's chat, or a shared one, is refused.
+        // memory-door: T2
+        const layer = await chatLayer(agent, as?.quick)
+        if (!layer) throw memoryDenied(agent, name, as?.quick)
+        return layer.read(typeof args.ref === 'string' ? args.ref : '')
+      }
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
-      case 'memory_recall':
-        return memoryOn && access.isAdmin(me) ? (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+      case 'memory_recall': {
+        // S2: the chat's OWNER's recall, and '' for a chat that is shared, whose owner has no memory yet, or whose owner is not an administrator. Never on a member PC:
+        // a chat of a floor made there would make and start a layer on that PC (the hub answers the chats it holds).
+        // memory-door: T3
+        const layer = memoryOn && mode() !== 'member' && access.isAdmin(me) ? await chatLayer(agent) : null
+        return layer ? layer.recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+      }
       // F-056: the app's one task list (the Tasks tab), for every chat.
       case 'task_add': {
         const body = taskText(args.text)
@@ -5976,14 +6237,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
           const why = goalsPageCall(name, args)
           if (why) throw apiError(409, why)
         }
-        const out = await ui.call(
-          name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
-          goalsApi ? { ...args, goalsApi: true } : args,
-          undefined,
-          as,
-          staff ? staffMayScreen : undefined,
-        )
-        return typeof out === 'string' ? out : json(out)
+        // Presence (chat-presence.ts): from here the call REACHES the screen bridge, so it is recorded: which Assistant, what kind of act, how it ended. A refusal above this
+        // line is told to the chat and is not recorded (an argument that climbs out of a path is the one somebody might want later: a second hook, not a widening of this).
+        // The only reading of `args` is the closed act (screenActOf): never a path, url, ref, text, key, handler or argument.
+        const tool = screenToolOf(name)
+        const by = screenActorOf(floor, agent, sid)
+        let failure: unknown = null
+        try {
+          const out = await ui.call(
+            name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
+            goalsApi ? { ...args, goalsApi: true } : args,
+            undefined,
+            as,
+            staff ? staffMayScreen : undefined,
+          )
+          return typeof out === 'string' ? out : json(out)
+        } catch (e) {
+          failure = e
+          throw e
+        } finally {
+          if (tool) presence.screen(by, tool, screenActOf(tool, args.action), screenOutcomeOf(failure))
+        }
       }
       // F-082: the overlay assistant's hands on the phone; F-084 H2: the Mobile agent's chat (floor Final) too, nobody else. The hub
       // (phone.ts) carries the phone's own answers. Who asked is taken from the chat's identity (phoneUser), never from an argument, and goes
@@ -6073,8 +6347,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function memoryChanged(floorId: string) {
     emit({ t: 'memory', floorId })
     for (const s of subs.values()) writeLine(s, { t: 'memory', floorId })
-    // F-051: searched at once (once the layer has started).
-    layer.notesChanged(floorId)
+    // F-051: searched at once (once the layer has started). Asking never makes the layer: one that was never made has nothing to update, and nothing comes back
+    // (the registry does the telling: no door holds a layer here). Only the app owner's layer is told (the only one that exists until S9); a floor's notes are
+    // the floor's, and no person's layer is made for them here.
+    // memory-door: E1
+    memoryPeople.notesChanged(SBSKRRT_OWNER.id, floorId)
   }
 
   // ---------------------------------------------------------------------------------------
@@ -6665,7 +6942,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!info || !at || !screen || info.floorId !== at.floor.id || info.agentId !== at.agent.id || (at.agent.homePc && at.agent.homePc !== self().id) || (isPcControl(at.floor) && at.floor.targetPcId !== self().id)) throw apiError(409, 'The native approval target changed.')
     sweepApprovalGrants()
     if (approvalGrants.size >= 4096) throw apiError(429, 'Too many approval snapshots; wait one minute and refresh.')
-    const p = promptOf(screen.join('\n'))
+    const p = promptOf(screen.join('\n'), menuOpts())
     if (hubToken && !approvalLinks.has(hubToken)) approvalLinks.set(hubToken, randomUUID())
     const proof: NativeApprovalProof = { version: 1, grantId: randomUUID(), pcId: self().id, sessionId: sid, floorId: at.floor.id, agentId: at.agent.id,
       generation: approvalGeneration(sid), targetEpoch: promptEpoch, hubEpoch: hubToken ? approvalLinks.get(hubToken)! : null, hubId: hubToken ? team!.hub()!.id : null, promptId: p.id, expiresAt: Date.now() + APPROVAL_GRANT_MS }
@@ -6685,12 +6962,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (proof.expiresAt < Date.now() || proof.targetEpoch !== promptEpoch || proof.pcId !== self().id || !at || !info || !screen ||
           at.floor.id !== proof.floorId || at.agent.id !== proof.agentId || info.floorId !== proof.floorId || info.agentId !== proof.agentId || (at.agent.homePc && at.agent.homePc !== self().id) || (isPcControl(at.floor) && at.floor.targetPcId !== self().id) ||
           info.state !== 'question' || approvalGeneration(proof.sessionId) !== proof.generation) throw apiError(409, 'The native approval target or grant changed before input.')
-      const p = promptOf(screen.join('\n'))
+      const p = promptOf(screen.join('\n'), menuOpts())
       if (p.id !== proof.promptId || (raw.action === 'cancel' ? !p.cancellable : !answerable(p.menu) || !p.menu!.options.some(x => x.n === raw.n))) throw apiError(409, 'The native prompt changed before input.')
+      // Order o5d4e: an unnumbered select takes no digit. The pointer is moved with the arrow keys, the screen is read again, and Enter is pressed
+      // only when the pointer is SEEN on the chosen option (arrow-select.ts). That takes a few looks, so the last word (the person's rights now, the
+      // grant, the same run, still a question) is asked again right before Enter, in the same turn, and the once-only claim is made there and only there.
+      if (raw.action === 'answer' && p.menu?.keys === 'arrows') {
+        await chooseByArrows(
+          { screen: () => chats.screen(proof.sessionId), typed: () => chats.typedScreen?.(proof.sessionId) ?? null, press: data => chats.input(proof.sessionId, data) },
+          { promptId: proof.promptId, n: raw.n! },
+          {
+            beforeEnter: () => {
+              const now = floors.bySession(proof.sessionId), live = chats.info(proof.sessionId)
+              if (proof.expiresAt < Date.now() || !now || !live || now.agent.id !== proof.agentId || now.floor.id !== proof.floorId || live.state !== 'question' || approvalGeneration(proof.sessionId) !== proof.generation) throw apiError(409, 'The native approval target or grant changed before input.')
+              validateLocal?.(now.agent)
+              markNativeAttempt()
+            },
+          },
+        )
+        return { version: 1, committed: true }
+      }
       // No await between the final target/human check and the receiving native write.
       validateLocal?.(at.agent)
       markNativeAttempt()
-      if (!chats.input(proof.sessionId, raw.action === 'cancel' ? ESC_KEY : String(raw.n))) throw apiError(409, 'Native approval was not confirmed; do not retry automatically.')
+      // The key is the app's, for an answer given in the Approvals tab: the presence record names the Approvals route (approvals.jsonl says who gave the answer).
+      if (!chats.input(proof.sessionId, raw.action === 'cancel' ? ESC_KEY : String(raw.n), { kind: 'approvals' })) throw apiError(409, 'Native approval was not confirmed; do not retry automatically.')
       return { version: 1, committed: true }
     })
   }
@@ -6837,6 +7133,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /**
+   * F-294: whether this person is shown this chat's prompt at all: the owner of the app, for a chat he may type into; anyone else, only for a floor whose decisions go to them NOW
+   * (decides()). Which floors the owner's LIST covers (scope) is the list's own business; Ignore asks this and no more, so it hides exactly what the list would show.
+   */
+  function seesPrompt(caller: Caller, admin: boolean, f: Floor, a: FloorAgent): boolean {
+    if (!admin) return decides(caller, { floor: f, agent: a })
+    const rights = access.rights(caller, a)
+    return !!rights?.can && rights.can !== 'view'
+  }
+  /** The list's own gate (o7e6d): someone who is not the owner and decides for no floor now is refused (403 admin-only), not shown an empty list. */
+  function requireDecider(caller: Caller, admin: boolean) {
+    if (!admin && !floors.list().some(f => caller.person && floorRoutable(f) && decidesOn(questionRouteOf(f.id), caller.person.id))) throw authError(403, 'This is for the owner of this app.', 'admin-only')
+  }
+
+  /**
    * Every chat waiting at a prompt, on every floor and PC, with what its screen says.
    * The owner of the app (o0c50): `scope` chooses which floors' prompts are listed, never who may answer them: 'mine' (the default) leaves
    * out the floors whose decisions go to people (nothing of theirs is pushed to him, ever: oa76b); 'all' is every floor, the old list;
@@ -6849,17 +7159,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const admin = access.isAdmin(caller)
     if (!admin && scope !== 'mine') throw authError(403, 'Only the owner of this app looks at other floors.', 'admin-only')
     // Someone who decides for no floor now: refused as before (o7e6d), not an empty list.
-    if (!admin && !floors.list().some(f => caller.person && floorRoutable(f) && decidesOn(questionRouteOf(f.id), caller.person.id))) throw authError(403, 'This is for the owner of this app.', 'admin-only')
+    requireDecider(caller, admin)
+    // F-294: the ignores of chats that have left their question go first, so an answered prompt's record is never read as hiding a later one.
+    sweepIgnores()
     const where = whereAll()
     const { mine, elsewhere } = ownerQuestions()
     const own = new Set(mine.map(q => q.sessionId))
-    const listed = (f: Floor, a: FloorAgent, sid: string) => {
-      if (!admin) return decides(caller, { floor: f, agent: a })
-      const rights = access.rights(caller, a)
-      return !!rights?.can && rights.can !== 'view' && (scope === 'all' ? true : scope === 'mine' ? own.has(sid) : scope === `floor:${f.id}`)
-    }
+    const listed = (f: Floor, a: FloorAgent, sid: string) => seesPrompt(caller, admin, f, a) && (!admin || (scope === 'all' ? true : scope === 'mine' ? own.has(sid) : scope === `floor:${f.id}`))
     const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' && listed(f, a, a.sessionId) ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
-    const items = await Promise.all(
+    const everything = await Promise.all(
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
         const p = await promptOfChat({ sessionId: sid, id: w.id })
         // On his list, a floor whose decisions go to people says whose they are.
@@ -6867,8 +7175,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable, ...(route.to === 'people' ? { routedTo: routeNames(route) } : {}) }
       }),
     )
+    // F-294 (his o8c55): this person's ignored prompts (exactly this prompt of this chat) are kept out of `items` and listed apart, so the cards and the badge leave them out and the page can show
+    // them under "Ignored (n)". Any other prompt of the same chat has another id and stays a new card. Nothing about the chat is touched.
+    const personId = caller.person!.id
+    const items = everything.filter(i => !ignores.has(personId, i.sessionId, i.id))
+    const ignored = everything.filter(i => ignores.has(personId, i.sessionId, i.id))
     return {
       items,
+      ...(ignored.length ? { ignored } : {}),
       prepared: admin ? [...prepared.values()].filter(card => { const a = allFloors().find(f => f.id === card.floorId)?.agents.find(a => a.id === card.agentId); const rights = a ? access.rights(caller, a) : null; return rights && rights.can !== 'view' }).sort((x, y) => y.at.localeCompare(x.at)) : [],
       ...(admin && elsewhere.length ? { elsewhere } : {}),
       // o66aa / o7e97: answers given whose record could not be written, for him to see (his overlay's cards).
@@ -6904,6 +7218,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const saved = questionRouting.set(floorId, r.body, id => people.find(p => p.id === id)?.name ?? null)
     log?.info(`question routing: ${describeHuman(by)} chose: ${f.name}'s decisions now go to ${saved.to === 'people' ? routeNames(saved) : 'the owner'}`)
     return questionRoutingView()
+  }
+
+  /** Order o5d4e: GET /approvals/arrow-prompts: whether claude's unnumbered selects get buttons (the old way, none, is the switch). Owner only. */
+  const arrowPromptsView = () => ({ on: arrowPrompts.on(), ...(arrowPrompts.unreadable() ? { unreadable: true } : {}) })
+  /** Order o5d4e: PUT /approvals/arrow-prompts {on}. By the person signed in through CRM on the Server's own page, as the other approval settings are. */
+  function setArrowPrompts(r: MountRequest) {
+    if (mode() === 'member') throw Object.assign(apiError(409, "Buttons for arrow-select prompts are switched on the Server's page."), { code: 'hub-sign-in-required', hubOrigin: null })
+    const by = requireCrmHuman(o.auth, r, true)
+    arrowPrompts.set(isObject(r.body) ? r.body.on : undefined)
+    log?.info(`arrow-select prompts: ${describeHuman(by)} switched the buttons ${arrowPrompts.on() ? 'on' : 'off'}`)
+    return arrowPromptsView()
   }
 
   /** His tap on option n of the prompt he was shown: typed into that chat exactly as pressing it there. Refused when the prompt has changed since. */
@@ -6963,6 +7288,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
     const req = raw as unknown as CancelRequest
     by = `${humanProof('cancel', [req.sessionId, req.id], undefined, r)} via ${by}`
+    // F-294a (Agent 14's R1, Lead's ruling): the list's own gate FIRST, before the chat is looked up, as in the list, Restore and Ignore: someone who is not the owner and decides for no floor now is refused 403
+    // admin-only for ANY session id, so the status never says which chats exist (before this, an id that is not there was 404 and a known one 403).
+    const human = requireCrmHuman(o.auth, r)
+    requireDecider(human, access.isAdmin(human))
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
@@ -6994,6 +7323,94 @@ export function createAgentic(o: AgenticOptions): Agentic {
       log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}${access.isAdmin(caller) ? '' : `, by ${describeHuman(caller)} for the floor`}`)
       return { ok: true, agent: at.agent.name, floor: at.floor.name }
     }, actor)
+  }
+
+  /**
+   * F-294: the record of an ignore or a restore, written FIRST: ids, names and a fixed sentence, never what the prompt said, how long it was or how many options it had. A record that
+   * cannot be written means nothing changes (no hide, no restore) and he is told. A row crediting a person for a call that was refused would be wrong, so a refused call never gets here.
+   */
+  function recordIgnore(kind: 'ignore' | 'restore', caller: Caller, by: string, rec: IgnoreRecord) {
+    try {
+      approvalLog.add({ kind, floor: rec.floor, agent: rec.agent, pc: rec.pc, sessionId: rec.sessionId, detail: kind === 'ignore' ? IGNORE_DETAIL : RESTORE_DETAIL, by: `${describeHuman(caller)} via ${by}`, ...promptRecord(caller, rec.floorId, rec.promptId, kind === 'ignore' ? 'Ignored' : 'Restored') })
+    } catch (err) {
+      log?.error(`approvals: the record of an ${kind} could not be written (${message(err)}); nothing was changed`)
+      throw apiError(503, `The record of this could not be written, so nothing was ${kind === 'ignore' ? 'hidden' : 'restored'}. Try again.`)
+    }
+  }
+
+  /**
+   * F-294 (his o8c55, "and give button ignroe pleae"): his tap on Ignore. This card is hidden from HIM, the signed-in person, until the chat's question is a new one. It NEVER answers anything:
+   * no key is typed, no option is chosen, nothing is sent, and the agent that asked keeps waiting (Cancel, or an answer, are what end that). The proof is Cancel's: a current CRM session
+   * (a chat's key is refused, an open app is 401) and rights on that chat's floor NOW (the owner, or one of its decision-makers). The prompt must be the chat's CURRENT one, the id GET
+   * /approvals listed. The record (who, when, which chat and prompt id) is written first.
+   */
+  async function ignoreApproval(raw: unknown, by: string, r?: ProofRequest) {
+    if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
+    const req = raw as unknown as IgnoreRequest
+    const caller = requireCrmHuman(o.auth, r)
+    // F-294a (Agent 14's R1, Lead's ruling): the list's own gate FIRST, before the chat is looked up (as in Restore and the list): someone who decides for no floor is refused 403 admin-only for ANY session id,
+    // so the status never says which chats exist (before this, an id that is not there was 404 and a known one 403). The owner and a person who decides for some floor are as they were.
+    requireDecider(caller, access.isAdmin(caller))
+    const at = floors.bySession(req.sessionId)
+    const w = whereAll()[req.sessionId]
+    if (!at || !w) throw apiError(404, "That chat isn't running any more")
+    humanTarget(r, at.agent, 'type', true)
+    if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
+    const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+    if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
+    // After the await: the same chat on the same PC, still at a question, and still this person's to see.
+    const latest = floors.bySession(req.sessionId)
+    const live = whereAll()[req.sessionId]
+    if (!latest || latest.agent.id !== at.agent.id || live?.id !== w.id || live.state !== 'question') throw apiError(409, 'That chat changed while this was checked; look again.')
+    humanTarget(r, latest.agent, 'type', true)
+    const personId = caller.person!.id
+    // Ignoring what is already ignored changes nothing, so it adds no record: one tap's worth of record however many taps or retries come.
+    if (!ignores.has(personId, req.sessionId, req.id)) {
+      const rec: IgnoreRecord = { personId, sessionId: req.sessionId, promptId: req.id, floorId: at.floor.id, agentId: at.agent.id, floor: at.floor.name, agent: at.agent.name, pc: w.name, at: new Date().toISOString() }
+      recordIgnore('ignore', caller, by, rec)
+      ignores.add(rec)
+      log?.info(`a card of ${at.agent.name} on ${at.floor.name} was hidden by ${describeHuman(caller)} (nothing was typed; the chat keeps waiting)`)
+    }
+    return { ok: true, agent: at.agent.name, floor: at.floor.name }
+  }
+
+  /** F-294: his tap on Restore in "Ignored (n)": the card comes back. Only this person's own record, found by exactly this chat and prompt; the record of it is written first. */
+  function restoreApproval(raw: unknown, by: string, r?: ProofRequest) {
+    if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
+    const req = raw as unknown as RestoreRequest
+    const caller = requireCrmHuman(o.auth, r)
+    // The list's own gate, as for every approvals route: someone who is not the owner and decides for no floor now is refused (403 admin-only) before anything is looked up.
+    requireDecider(caller, access.isAdmin(caller))
+    // A prompt that was answered, or whose chat is gone, has no record any more: so there is nothing to restore (404), however long ago it was.
+    sweepIgnores()
+    const rec = ignores.list(caller.person!.id).find(x => x.sessionId === req.sessionId && x.promptId === req.id)
+    if (!rec) throw apiError(404, 'That card is not ignored (any more).')
+    recordIgnore('restore', caller, by, rec)
+    ignores.remove(rec.personId, rec.sessionId, rec.promptId)
+    log?.info(`a card of ${rec.agent} on ${rec.floor} was brought back by ${describeHuman(caller)}`)
+    return { ok: true, agent: rec.agent, floor: rec.floor }
+  }
+
+  /**
+   * F-294: GET /approvals/ignored: which of THEIR ignored prompts are still their chat's current prompt (ids only), for the badge, which leaves exactly those out. The list's own gate
+   * (the owner, or a person who decides for some floor now); nothing is read of any other person's.
+   */
+  async function listIgnored(r?: ProofRequest): Promise<IgnoredAnswer> {
+    const caller = requireCrmHuman(o.auth, r)
+    const admin = access.isAdmin(caller)
+    requireDecider(caller, admin)
+    sweepIgnores()
+    const where = whereAll()
+    const found = await Promise.all(
+      ignores.list(caller.person!.id).map(async rec => {
+        const w = where[rec.sessionId]
+        const at = floors.bySession(rec.sessionId)
+        if (!w || w.state !== 'question' || !at || !seesPrompt(caller, admin, at.floor, at.agent)) return null
+        const p = await promptOfChat({ sessionId: rec.sessionId, id: w.id })
+        return p.id === rec.promptId ? { sessionId: rec.sessionId, id: rec.promptId } : null
+      }),
+    )
+    return { ignored: found.filter((x): x is { sessionId: string; id: string } => x !== null) }
   }
 
   /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
@@ -7525,6 +7942,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
     // oc58f follow-up: the answer says when the saved choice could not be read (the card is in force until he chooses again).
     // o0c50: where each floor's questions are pushed to the owner (owner only, access.ts POLICY); rights are unchanged.
+    ['GET', /^\/approvals\/arrow-prompts$/, (_, r) => (humanOnly(r), arrowPromptsView())],
+    ['PUT', /^\/approvals\/arrow-prompts$/, (_, r) => setArrowPrompts(r), 'local'],
     ['GET', /^\/question-routing$/, () => questionRoutingView()],
     ['PUT', /^\/question-routing\/([^/]+)$/, ([floorId], r) => setQuestionRoute(floorId, r), 'local'],
     ['GET', /^\/fast\/forwarding$/, () => quickForwarding.answer()],
@@ -7714,6 +8133,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }, 'local'],
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r)), 'local'],
+    // F-294 (his o8c55): Ignore and Restore on a card, and the read of what a person has ignored (the badge). Human-only exactly as Cancel is (humanOnly first: a chat's key is 403, the open app 401);
+    // nothing is ever typed into a chat. Left as they are, by Lead's ruling: the heartbeat line, Quick's snapshot and the Assistant's approvals_waiting still count an ignored prompt.
+    ['POST', /^\/approvals\/ignore$/, (_, r) => (humanOnly(r), ignoreApproval(r.body, byOf(r), r)), 'local'],
+    ['POST', /^\/approvals\/restore$/, (_, r) => (humanOnly(r), restoreApproval(r.body, byOf(r), r)), 'local'],
+    ['GET', /^\/approvals\/ignored$/, (_, r) => (humanOnly(r), listIgnored(r)), 'local'],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r)), 'local'],
     // F-221 (ob98a): live talk, the owner's page only (POLICY), never a chat's key nor the fast Assistant's. The cards wait for his tap, and Send
     // takes his signed-in CRM session as the approvals do; the direct line types his spoken words untapped, with the Orchestrator's tools held.
@@ -7739,8 +8163,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // o66aa / o7e97: with the answers given whose record could not be written (who, which prompt, what they chose), since this run.
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecorded.length ? { unrecorded } : {}) })],
     // The floors' structural history (floor-events.ts): newest first, with the changes whose line could not be written since this run started. The owner's only
-    // (POLICY; no ROUTES rule opens it to anyone else).
-    ['GET', /^\/floor-events$/, (_, r) => ({ events: floorEventLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecordedFloorEvents.length ? { unrecorded: unrecordedFloorEvents } : {}) })],
+    // (POLICY; no ROUTES rule opens it to anyone else) AND a signed-in human's (humanOnly: R6): a chat's key, the app token alone (a program on this PC, an Assistant's shell) and a member
+    // PC's pass-on (which carries no cookie) are refused, so what the record says cannot be read by a tool; it is read on the Server's own page.
+    ['GET', /^\/floor-events$/, (_, r) => (humanOnly(r), { events: floorEventLog.list(Math.min(500, Number(r.query.get('limit')) || 100)), ...(unrecordedFloorEvents.length ? { unrecorded: unrecordedFloorEvents } : {}) })],
+    // Who was present at a chat (chat-presence.ts): newest first, with the lines that could not be written since this run started, and WHAT THE RECORD DOES NOT COVER (`notRecorded`, a
+    // constant: an empty stretch is "nothing listed as recorded", never "nothing happened"). The owner's only (POLICY; no ROUTES rule) AND a signed-in human's (humanOnly: R6, as floor-events above).
+    ['GET', /^\/chat-presence$/, (_, r) => (humanOnly(r), { presence: presence.list(Math.min(500, Number(r.query.get('limit')) || 100)), notRecorded: NOT_RECORDED, ...(presence.unrecorded().length ? { unrecorded: presence.unrecorded() } : {}) })],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
@@ -7792,7 +8220,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       // Order o7e6d (plan A, Lead's GO): a never-run staff Assistant of the Server's, opened from this member PC's page, is opened BY the Server.
       if (mode() === 'member' && !isLocalFloor(id) && staffFreshHere(id, agentId)) return forwardFirstOpen(id, agentId, r)
-      return openChat(id, agentId, openRequest(r.body))
+      return openChat(id, agentId, openRequest(r.body), undefined, undefined, actorOfCaller(callerOf(r)))
     }, 'local'],
     [
       'POST',
@@ -7809,7 +8237,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         let opened: ChatOpened
         let name = self().name
         if (pc === self().id) {
-          opened = await openChat(id, agentId, { takeOver: true, here: true })
+          opened = await openChat(id, agentId, { takeOver: true, here: true }, undefined, undefined, actorOfCaller(callerOf(r)))
           if (say && opened.started) chats.typeWhenReady(opened.sessionId, say)
         } else {
           const link = mode() === 'hub' ? (team?.member(pc) ?? null) : null
@@ -7838,12 +8266,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/restart$/,
-      async ([id, agentId]) => {
+      async ([id, agentId], r) => {
         // Claude subscription failover: this agent's chat, running on the hub, stopped gently (told /exit) and started
         // again on the token in place now, its conversation resumed (restartChat above). A member's call goes to the hub.
+        // The start line names whoever made THIS call (a person's Restart is not "the app"); the failover and the other internal callers keep the default, the app.
         const a = agentOf(floorOf(id), agentId)
         if (!a.sessionId || !chats.info(a.sessionId)) return { sessionId: a.sessionId, restarted: false }
-        return { sessionId: a.sessionId, restarted: await restartChat(a.sessionId) }
+        return { sessionId: a.sessionId, restarted: await restartChat(a.sessionId, actorOfCaller(callerOf(r))) }
       },
     ],
     [
@@ -7932,11 +8361,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Whether the CRM is signed in on THIS PC (the session is per PC, as Devices signs in): never the session itself.
     ['GET', /^\/crm\/session$/, (): CrmSessionInfo => crmProxy.session(), 'local'],
     // order o57e2, o4d14: the email accounts for the Accounts page's Email tab, from the new Supabase project: address, note, switched off, where used. Never a password. The owner's (POLICY).
-    ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id), 'local'],
+    // Slice D (disable, never delete): `disabled=1` is the page's "Show disabled"; without it a disabled account is not in the list.
+    ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id, { disabled: r.query.get('disabled') === '1' }), 'local'],
     // Order ofd53: the email edit modal. The owner's only (POLICY); the database's rules check the owner again (accounts-email-write.ts).
     ['POST', /^\/accounts\/email$/, (_, r) => (humanOnly(r), accountsEmailWrite.create(access.ownerOf(callerOf(r)).id, r.body)), 'local'],
     ['PUT', /^\/accounts\/email\/([^/]+)$/, ([id], r) => (humanOnly(r), accountsEmailWrite.update(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
-    ['DELETE', /^\/accounts\/email\/([^/]+)$/, ([id], r) => (humanOnly(r), accountsEmailWrite.remove(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    // Slice D: there is no delete anywhere on the Accounts page; an account is disabled and enabled again (the same humanOnly rule the delete had).
+    ['POST', /^\/accounts\/email\/([^/]+)\/disable$/, ([id], r) => (humanOnly(r), accountsEmailWrite.disable(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/email\/([^/]+)\/enable$/, ([id], r) => (humanOnly(r), accountsEmailWrite.enable(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Order o8ebe: the password reveal (owner only; logged by the agent, never the password).
     // SLICE S (18 Nov): every email route that writes or returns a sealed password goes through humanOnly: "owner" says WHOSE data, not WHICH CALLER. A program holding only the app's token is a machine, a machine is an
     // administrator, and the owner of what a person-less caller makes is sbskrrt, so without humanOnly any process that could read the token was the owner. accounts-human-only.test.ts pins every such route.
@@ -7945,7 +8377,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Add account (order oc35dc): a platform account made in the app, with its codebases (the owner's only; nothing is written to the CRM).
     ['POST', /^\/accounts\/platforms$/, (_, r) => accountsPlatformWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
     ['PUT', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.remove(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/disable$/, ([id], r) => accountsPlatformWrite.disable(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/enable$/, ([id], r) => accountsPlatformWrite.enable(access.ownerOf(callerOf(r)).id, id), 'local'],
     // Codebase details slice: the codebase's details (owner only).
     ['PUT', /^\/accounts\/codebases\/([^/]+)$/, ([id], r) => accountsCodebaseWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     // Add codebase: a codebase made in the app (the owner's only; nothing is written to the CRM).
@@ -7957,24 +8390,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/accounts\/email\/import$/, (_, r) => (humanOnly(r), accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).
     // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; no password, only that one is stored. The owner's (POLICY).
-    ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id), 'local'],
+    ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id, { disabled: r.query.get('disabled') === '1' }), 'local'],
     ['GET', /^\/accounts\/codebases$/, (_, r) => accountsCodebases.list(access.ownerOf(callerOf(r)).id), 'local'],
     // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).
     ['POST', /^\/accounts\/codebases\/import$/, (_, r) => codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // Order ocf00: the codebase tabs. The owner's only (POLICY); every write is checked by the database's rules too (codebase-tabs.ts).
     // Order o94f3 (Shubham: values are never for agents, Assistants or chats): everything that reads or writes a VARIABLE (the tabs read, the sets, the variables, the reveal, the "+" and the paste box) is also
     // humanOnly: his own signed-in page session, never a chat's key and never a program that has only the app's token. A chat sees names and counts through the list; nothing here.
-    ['GET', /^\/accounts\/codebases\/([^/]+)\/tabs$/, ([id], r) => (humanOnly(r), codebaseTabs.read(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['GET', /^\/accounts\/codebases\/([^/]+)\/tabs$/, ([id], r) => (humanOnly(r), codebaseTabs.read(access.ownerOf(callerOf(r)).id, id, { disabled: r.query.get('disabled') === '1' })), 'local'],
     ['PUT', /^\/accounts\/codebases\/([^/]+)\/sections\/([^/]+)$/, ([id, section], r) => codebaseTabs.setSection(access.ownerOf(callerOf(r)).id, id, section, isObject(r.body) ? r.body.description : undefined), 'local'],
     ['POST', /^\/accounts\/codebases\/([^/]+)\/links$/, ([id], r) => codebaseTabs.addLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     ['PUT', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.updateLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['DELETE', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.deleteLink(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/links\/([^/]+)\/disable$/, ([id], r) => codebaseTabs.disableLink(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/links\/([^/]+)\/enable$/, ([id], r) => codebaseTabs.enableLink(access.ownerOf(callerOf(r)).id, id), 'local'],
     ['POST', /^\/accounts\/codebases\/([^/]+)\/subsets$/, ([id], r) => (humanOnly(r), codebaseTabs.addSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined)), 'local'],
     ['PUT', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.renameSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined)), 'local'],
-    ['DELETE', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.deleteSubset(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/subsets\/([^/]+)\/disable$/, ([id], r) => (humanOnly(r), codebaseTabs.disableSubset(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/subsets\/([^/]+)\/enable$/, ([id], r) => (humanOnly(r), codebaseTabs.enableSubset(access.ownerOf(callerOf(r)).id, id)), 'local'],
     ['POST', /^\/accounts\/subsets\/([^/]+)\/vars$/, ([id], r) => (humanOnly(r), codebaseTabs.addVar(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
     ['PUT', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.updateVar(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
-    ['DELETE', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => (humanOnly(r), codebaseTabs.deleteVar(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/vars\/([^/]+)\/disable$/, ([id], r) => (humanOnly(r), codebaseTabs.disableVar(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/vars\/([^/]+)\/enable$/, ([id], r) => (humanOnly(r), codebaseTabs.enableVar(access.ownerOf(callerOf(r)).id, id)), 'local'],
     ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), codebaseTabs.reveal(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Order o94f3 "show all": every value of one set in one call, for his own tap (or his device setting); humanOnly like reveal, logged as a count only.
     ['POST', /^\/accounts\/subsets\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), codebaseTabs.revealSet(access.ownerOf(callerOf(r)).id, id)), 'local'],
@@ -8132,6 +8568,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const key = r.headers['x-sad-chat-key']
         if (typeof key !== 'string' || !key) throw apiError(401, 'Missing x-sad-chat-key')
         if (!isObject(r.body) || typeof r.body.name !== 'string') throw apiError(400, 'Expected {name, arguments}')
+        // memory-identity: W5 (POST /mcp/call: the chat's own key)
         return { text: await callTool(key, r.body.name, r.body.arguments) }
       },
       'local',
@@ -8190,42 +8627,53 @@ export function createAgentic(o: AgenticOptions): Agentic {
           }
           chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, typeof r.body.sessionId === 'string' ? r.body.sessionId : null)
         }
+        // memory-identity: W6 (POST /mcp/recall, the hook: the chat's own key)
         return { text: await callTool(key, 'memory_recall', { prompt: r.body.prompt.slice(0, 20_000) }) }
       },
       'local',
     ],
     // F-051: the memory layer for the page (the Memory tab); a member's go to the hub, which keeps it.
-    ['GET', /^\/memory\/status$/, async () => (await memoryLayer()).status()],
+    // S2: each of the eight answers from the CALLER'S OWN person's layer (routeLayer: the app owner, or 409 memory-others-not-built for anyone else, a second
+    // administrator included); none takes a person from its path, query or body. Each has its marker, so a ninth route is a red test until it is in the matrix.
+    // memory-door: R1
+    ['GET', /^\/memory\/status$/, async (_, r) => (await routeLayer(r)).status()],
     [
       'GET',
       /^\/memory\/search$/,
       async (_, r) => {
         const kinds = (r.query.get('kinds') ?? '').split(',').filter((k): k is MemoryKind => k === 'wiki' || k === 'note' || k === 'turn')
         const limit = Number(r.query.get('limit')) || 20
-        return { hits: await (await memoryLayer()).search(r.query.get('q') ?? '', { limit, kinds }) }
+        // memory-door: R2
+        return { hits: await (await routeLayer(r)).search(r.query.get('q') ?? '', { limit, kinds }) }
       },
     ],
-    ['GET', /^\/memory\/wiki$/, async () => ({ pages: (await memoryLayer()).pages() })],
+    // memory-door: R3
+    ['GET', /^\/memory\/wiki$/, async (_, r) => ({ pages: (await routeLayer(r)).pages() })],
     [
       'GET',
       /^\/memory\/page$/,
       async (_, r) => {
-        const page = (await memoryLayer()).page(r.query.get('path') ?? '')
+        // memory-door: R4
+        const page = (await routeLayer(r)).page(r.query.get('path') ?? '')
         if (!page) throw apiError(404, 'No such page in the wiki')
         return { page }
       },
     ],
-    ['GET', /^\/memory\/read$/, async (_, r) => ({ text: (await memoryLayer()).read(r.query.get('ref') ?? '') })],
-    ['GET', /^\/memory\/brief$/, async () => ({ text: (await memoryLayer()).brief() })],
+    // memory-door: R5
+    ['GET', /^\/memory\/read$/, async (_, r) => ({ text: (await routeLayer(r)).read(r.query.get('ref') ?? '') })],
+    // memory-door: R6
+    ['GET', /^\/memory\/brief$/, async (_, r) => ({ text: (await routeLayer(r)).brief() })],
     [
       'POST',
       /^\/memory\/compile$/,
       async (_, r) => {
         const b = isObject(r.body) ? r.body : {}
-        return { run: (await memoryLayer()).compile(b.mode === 'tidy' ? 'tidy' : 'ingest', 'now') }
+        // memory-door: R7
+        return { run: (await routeLayer(r)).compile(b.mode === 'tidy' ? 'tidy' : 'ingest', 'now') }
       },
     ],
-    ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await memoryLayer()).setSettings(r.body) })],
+    // memory-door: R8
+    ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await routeLayer(r)).setSettings(r.body) })],
   ]
 
   const callerOf = (r: MountRequest): Caller => r.caller ?? OPEN
@@ -8618,6 +9066,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.name !== 'string') throw apiError(400, 'Expected {sessionId, name, arguments}')
             // Only for a chat that PC holds: a member speaks for its own chats.
             if (held.get(raw.sessionId)?.holder !== from.id && remote.get(from.id)?.live[raw.sessionId] === undefined) throw apiError(403, `${from.name} isn't running that chat`)
+            // memory-identity: W7 (link kind tool: a member passes a chat's call; the hub trusts that PC's own report of the sessions it holds: boundary B7)
             return toolFor(raw.sessionId, raw.name, raw.arguments)
           })
         case 'sessions':
@@ -8642,7 +9091,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
             const target = floorOf(raw.floorId)
             if (isPcControl(target)) { assertPcControlTarget(target, self().id, {}); if (raw.expectedEngine === undefined) throw pcControlError('pc-control-update-required', 'PC Control requires explicit engine proof.') }
-            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }).then(opened => {
+            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }, undefined, undefined, { kind: 'pc', pc: { id: from.id, name: from.name } }).then(opened => {
               if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
               return opened
             })
@@ -8795,7 +9244,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
             const target = floorOf(raw.floorId)
             if (isPcControl(target)) { assertPcControlTarget(target, self().id, {}); if (raw.expectedEngine === undefined) throw pcControlError('pc-control-update-required', 'PC Control requires explicit engine proof.') }
-            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }).then(opened => {
+            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }, undefined, undefined, { kind: 'pc', pc: { id: from.id, name: from.name } }).then(opened => {
               if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
               return opened
             })
@@ -8812,6 +9261,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   function terminal(query: URLSearchParams, caller: Caller) {
     const sid = query.get('session') ?? ''
+    // Who is at this page's terminal, for the presence record (chat-presence.ts): the person signed in on it, or the open app; the keys are noted where they reach the chat.
+    const by = actorOfCaller(caller)
     // F-118: a person who may only view gets the screen and nothing they send reaches the chat (not keys, not a resize).
     // It is asked again at every key: a share changed to 'view' while the socket is open takes typing away at once.
     const typing = () => {
@@ -8834,7 +9285,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (query.get('mode') === 'draft') return draftSocket(sid, ws, typing)
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
       // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
-      if (!detach && remoteTerminal(sid, ws, typing)) return
+      if (!detach && remoteTerminal(sid, ws, typing, undefined, by)) return
       if (!detach) {
         ws.sendText(JSON.stringify({ t: 'exit', code: null }))
         return ws.close(1000, "That chat isn't running")
@@ -8847,7 +9298,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         } catch {
           return
         }
-        if (m.t === 'in' && typeof m.d === 'string') chats.input(sid, m.d)
+        if (m.t === 'in' && typeof m.d === 'string') chats.input(sid, m.d, by)
         else if (m.t === 'size' && typeof m.cols === 'number' && typeof m.rows === 'number') chats.resize(sid, m.cols, m.rows)
       })
       ws.onClose(detach)
@@ -8892,7 +9343,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * carries the same messages the page's socket does, one JSON line each; it keeps running
    * there, and what is typed here goes to it. False when it isn't running on a PC within reach.
    */
-  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true, as?: 'draft'): boolean {
+  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true, as?: 'draft', by?: ChatActor): boolean {
     const w = whereAll()[sid]
     if (!w || w.id === self().id) return false
     let link: LinkPeer
@@ -8908,6 +9359,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const early: string[] = []
     ws.onText(raw => {
       if (!typing()) return
+      // The keys of a chat on another PC never reach chats.input here: noted as they are handed to the link, toward the PC the chat runs on (presence record, chat-presence.ts).
+      if (by) {
+        try {
+          noteRelayedFrame(sid, JSON.parse(raw), by, { id: w.id, name: w.name })
+        } catch {
+          // Not a message: relayLine drops it too.
+        }
+      }
       if (stream) relayLine(stream, raw)
       else early.push(raw)
     })
@@ -8957,11 +9416,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * and relays it, line for line, both ways (a member reaches only its hub). Never back to the PC that asked.
    */
   function serveTerminal(stream: Duplex, from?: { id: string; name: string }) {
+    // Who sent these keys, for the presence record: the PC that asked. The PERSON on that PC is not carried over the link, so a line may name a PC rather than a person
+    // (chat-presence.ts says so); with no `from` the keys are `unattributed`, never filed as somebody.
+    const by: ChatActor = from ? { kind: 'pc', pc: { id: from.id, name: from.name } } : UNATTRIBUTED
     let sid: string | null = null
     let detach: (() => void) | null = null
     let draft: { set(seq: number, text: string, base: number, seal?: boolean): void } | null = null
     let relay: Duplex | null = null
     let early: Record<string, unknown>[] | null = null
+    /** The PC the chat runs on, when this PC is only the go-between: what the `keys-relayed` line says the keys were handed toward. */
+    let toPc: { id: string; name: string } | undefined
     const ended = () => {
       writeLine(stream, { t: 'exit', code: null })
       stream.end()
@@ -8991,6 +9455,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const w = from && mode() === 'hub' ? whereAll()[sid] : undefined
         const link = w && w.id !== self().id && w.id !== from!.id ? (team?.member(w.id) ?? null) : null
         if (!link) return ended()
+        toPc = { id: w!.id, name: w!.name }
         early = []
         const asked = sid
         const expectedEngine = current ? engineFor(current.agent) : undefined
@@ -9012,6 +9477,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (early !== null) {
         if (!legacySidAllowed(sid)) return ended()
+        // This PC is only the go-between (a member's keys to a chat on another member): they never reach chats.input here, so they are noted as they are handed to the link.
+        noteRelayedFrame(sid, raw, by, toPc)
         if (relay) writeLine(relay, raw)
         else early.push(raw)
         return
@@ -9021,7 +9488,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (d && !switchFences.blocked(sid)) draft.set(d.seq, d.text, d.base, d.seal)
         return
       }
-      if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d)
+      if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d, by)
       else if (raw.t === 'size' && typeof raw.cols === 'number' && typeof raw.rows === 'number') chats.resize(sid, raw.cols, raw.rows)
     })
     stream.on('close', () => {
@@ -9052,17 +9519,32 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (rest.startsWith('/crm-proxy/')) {
         return (req, res, caller) => {
-          const c = caller ?? OPEN
           const sub = rest.slice('/crm-proxy/'.length)
-          // The built-in CRM runs on this PC's own CRM session: the owner's.
-          if (access.isAdmin(c)) return crmProxy.handle(req, res, sub, url.search)
+          // S3 (HIGH, security; Agent 14's desk note of 18 Nov; Shubham's answer o5f0a: no tool of his calls this route with the app's token alone): this route
+          // acts as a CRM session, and for an administrator that is THIS PC's, the owner's. A program holding the app's token is a "machine", and a machine IS
+          // an administrator (auth/index.ts), so before this the token alone, or any chat that could read it, was handed the owner's CRM: every email account with its
+          // password in one GET, and the writes (a member's password, roles, bank, ledger, deletes), with no audit line. So the route serves a signed-in PERSON
+          // only, never a chat key, asked BEFORE any choice of session (requireCrmHuman: a chat key is 403 not-yours, no live sign-in is 401), and every refusal is a
+          // log line (auth.deny). This REVERSES F-118's 5 Nov intent (machine-caller.test.ts: the Server's own tool acts as the owner on any route) FOR THIS ROUTE.
+          // It is asked HERE, at the raw branch, and NOT inside crmProxy.handle(): the drive host's loopback bridge (crm-files/index.ts) calls handle in-process with
+          // no cookie and must keep working. No setting re-allows a machine: he has no such tool.
+          let human: Caller
+          try {
+            human = requireCrmHuman(o.auth, { headers: req.headers })
+          } catch (e) {
+            const refusal = e as Partial<ReturnType<typeof authError>>
+            if (refusal.status !== undefined && refusal.code !== undefined) o.auth?.deny(caller ?? OPEN, refusal.status, refusal.code, `${req.method ?? 'GET'} ${url.pathname}`)
+            throw e
+          }
+          // The built-in CRM runs on this PC's own CRM session: the owner's (an administrator, signed in as a person).
+          if (access.isAdmin(human)) return crmProxy.handle(req, res, sub, url.search)
           // Order o9465: Goals (its own CRM paths only) or the CRM page, opened to this person in Settings › Access: on THEIR OWN CRM sign-in
           // (their sign-in to this app), never this PC's; the CRM decides what they may see and do.
           const fa = o.featureAccess
-          const open = !!c.person && !!fa && (fa.allows(c, 'crm') || (fa.allows(c, 'goals') && GOALS_CRM_PATH.test(sub)))
+          const open = !!human.person && !!fa && (fa.allows(human, 'crm') || (fa.allows(human, 'goals') && GOALS_CRM_PATH.test(sub)))
           if (!open) throw authError(403, 'The CRM page is for the owner of this app.', 'admin-only')
           const session = o.auth?.viewerCrm(req.headers)
-          if (!session || session.user.id.toLowerCase() !== c.person!.id.toLowerCase()) throw authError(401, 'Your CRM sign-in here has ended: sign in again.', 'sign-in')
+          if (!session || session.user.id.toLowerCase() !== human.person!.id.toLowerCase()) throw authError(401, 'Your CRM sign-in here has ended: sign in again.', 'sign-in')
           return crmProxy.handleAs({ url: session.url, cookie: session.cookie }, req, res, sub, url.search)
         }
       }
@@ -9135,6 +9617,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
           o.auth?.deny(caller, 403, 'admin-only', where)
           throw authError(403, 'This is for the owner of this app.', 'admin-only')
         }
+        // oc65c / F-051 S2 (Lead's ruling on Agent 7's F6): Quick is ONE conversation with ONE journal (the app owner's: createQuickHistory), so /fast is the app
+        // owner's and not any administrator's. The old-app reader's socket keeps the administrator rule.
+        if (rest === '/fast') appOwnerOnly(caller, where)
       }
     },
     ws(rest, query) {
@@ -9163,7 +9648,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (n > 0) fastPeople.set(id, n)
             else fastPeople.delete(id)
           })
-          h(ws)
+          // oc65c / F-051 S2: the connection knows who is signed in on it (never a client's word): Quick's memory tools are decided on that person.
+          h(ws, id)
         }
       }
       // Order o5007: the old-app reader's stream (the same frames); switched off, its folder not here, or a member PC: no such socket.
@@ -9204,6 +9690,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     floors,
     chats,
     memory,
+    // memory-identity: W8 (the exported callTool: the same funnel, handed to whoever holds the Agentic object: main.ts uses none of it today)
     callTool,
     routeKeys: () => routes.map(([m, p]) => policyKey(m, p)),
     executionRouteKeys: () => executionRoutes.map(([m, p]) => policyKey(m, p)),
@@ -9267,7 +9754,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       chatFeeds.close()
       turns?.close()
       clearInterval(memberBriefTimer)
-      layer.close()
+      memoryPeople.close()
       chats.closeAll()
       // F-075: let go of the chat host (its chats go on).
       o.chatHost?.close()

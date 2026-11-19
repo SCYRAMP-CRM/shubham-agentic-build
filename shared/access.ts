@@ -194,6 +194,9 @@ export const ROUTES: readonly RouteRule[] = [
   // floor, now). Send as me stays closed to everyone but him.
   r('GET', `${A}\\/approvals`, [], true),
   r('POST', `${A}\\/approvals\\/(answer|cancel)`, [], true),
+  // F-294 (his o8c55): Ignore and Restore on a card, and the read of what a person has ignored (the badge): the same people as the list, by a share, and the routes decide who.
+  r('POST', `${A}\\/approvals\\/(ignore|restore)`, [], true),
+  r('GET', `${A}\\/approvals\\/ignored`, [], true),
   r('WS', `${A}\\/(terminal|chat)`, ['agents', 'pc-chats'], true),
   r('WS', `${A}\\/events`, ['agents', 'pc-control'], true),
   // The Assistant's hands on this person's own pages (order o355e made the bridge per person: their pages join only their own scope).

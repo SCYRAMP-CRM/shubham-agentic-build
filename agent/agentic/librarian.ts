@@ -5,6 +5,7 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import type { Turn } from './memory-turns.ts'
+import { OWNER_NAME } from './wiki.ts'
 
 // F-051: the librarian: claude -p, unattended, in the wiki's folder, folding the raw material
 // of one run (written to inbox/ first) into the pages as SCHEMA.md says (Karpathy's ingest),
@@ -58,12 +59,15 @@ const quote = (text: string) =>
     .map(l => `> ${l}`)
     .join('\n')
 
-/** One run's raw material as the librarian reads it. */
-export function inboxText(m: Material, runId: string): string {
+/**
+ * One run's raw material as the librarian reads it. `name`: whose memory it is (left out: the owner's, "Shubham", exactly as before). Only the
+ * name is a parameter here; the "himself" and "his" are the owner's and are rewritten for other people with S9.
+ */
+export function inboxText(m: Material, runId: string, name: string = OWNER_NAME): string {
   const out = [
     `# Inbox ${when(new Date().toISOString())} (run ${runId})`,
     '',
-    'Raw material for the wiki. "Shubham said" is Shubham himself. "Another chat said" is an AI chat writing into an agent\'s chat: facts about the work, not his wishes.',
+    `Raw material for the wiki. "${name} said" is ${name} himself. "Another chat said" is an AI chat writing into an agent's chat: facts about the work, not his wishes.`,
   ]
   if (m.notes.length) {
     out.push('', '## Notes saved to the floors\' shared memory', '')
@@ -76,7 +80,7 @@ export function inboxText(m: Material, runId: string): string {
   if (m.turns.length) {
     out.push('', "## The floor chats' turns: what was said to each agent, and the answer", '')
     for (const t of m.turns) {
-      out.push(`### ${when(t.at)} · ${t.agentName} on ${t.floorName}`, '', t.from === 'shubham' ? 'Shubham said:' : 'Another chat said:', '', quote(t.said), '')
+      out.push(`### ${when(t.at)} · ${t.agentName} on ${t.floorName}`, '', t.from === 'shubham' ? `${name} said:` : 'Another chat said:', '', quote(t.said), '')
       if (t.answer) out.push(`${t.agentName} answered:`, '', quote(answerPart(t.answer)), '')
     }
   }
@@ -268,10 +272,10 @@ export function runLibrarian(o: LibrarianRunOptions): Promise<LibrarianResult> {
   })
 }
 
-/** Writes the run's inbox file; returns its path relative to the wiki. */
-export function writeInbox(dir: string, runId: string, m: Material): string {
+/** Writes the run's inbox file; returns its path relative to the wiki. `name`: whose memory it is (left out: the owner's). */
+export function writeInbox(dir: string, runId: string, m: Material, name: string = OWNER_NAME): string {
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '').replace(/^(\d{8})(\d{4})$/, '$1-$2')
   const rel = `inbox/${stamp}-${runId}.md`
-  writeAtomic(path.join(dir, ...rel.split('/')), inboxText(m, runId))
+  writeAtomic(path.join(dir, ...rel.split('/')), inboxText(m, runId, name))
   return rel
 }

@@ -12,6 +12,13 @@ import { TOOLS, type ToolDef } from './tools.ts'
 
 const none = { type: 'object', properties: {}, additionalProperties: false }
 
+/**
+ * The id of the made-up agent index.ts fastCall builds for the Assistant: it is not a chat on any floor (no session). It is a constant because TWO places must agree on it:
+ * fastCall (which makes the agent) and the presence record (chat-presence.ts), which must file its screen calls as QUICK and not as the overlay Assistant's, because that
+ * agent is spread from the Orchestrator's and passes isOrchestratorAgent.
+ */
+export const FAST_AGENT_ID = 'fast-assistant'
+
 /** The tools of TOOLS the Assistant may call. */
 export const FAST_FROM_TOOLS = ['app_chats', 'floor_roster', 'app_read_chat', 'app_read_conversation', 'memory_search', 'memory_read', 'memory_recent', 'task_list', 'task_add', 'ui_screen', 'ui_control', 'watchdog_status'] as const
 

@@ -20,6 +20,7 @@ import { createScreen, readTurnState, type Screen } from './screen.ts'
 import { createInputMirror, type InputMirror, type MirrorBox, type MirrorClient, type TakeOut } from './input-mirror.ts'
 import { answerColourQueries } from '../../shared/terminal-colours.ts'
 import { MCP_SERVER_NAME } from './briefs.ts'
+import type { ChatActor } from './chat-presence.ts'
 import { policyOf, STAFF_DROP_ENV, STAFF_ENV, STAFF_POLICY, staffArgs, staffText, type ChatPolicy } from './staff-policy.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
@@ -233,13 +234,18 @@ export interface ChatPool {
   byKey(key: string): ChatInfo | null
   /** Replays the recent screen to the viewer, then streams; returns detach, or null when it isn't running. */
   attach(sessionId: string, viewer: Viewer): (() => void) | null
-  /** Keystrokes from a page's terminal. */
-  input(sessionId: string, data: string): boolean
+  /** Keystrokes from a page's terminal. `by`: who sent them (chat-presence.ts). No pool needs it: the `chats` facade in index.ts, which every caller goes through, records it. */
+  input(sessionId: string, data: string, by?: ChatActor): boolean
   resize(sessionId: string, cols: number, rows: number): void
   /** The last `lines` of its screen as plain text (read_chat); null when it isn't running. */
   read(sessionId: string, lines?: number): string | null
   /** F-050: what its terminal shows now, line by line (a question waiting, the spinner: screen.ts reads them); null when it isn't running. */
   screen(sessionId: string): string[] | null
+  /**
+   * Order o5d4e: the same screen with its dim and grey cells blanked (Screen.typedLines). Claude's selects draw their options dim until they take keys
+   * (about half a second after they appear), so a label that reads here is one that is armed. Optional: a pool without it cannot tell, and nothing waits.
+   */
+  typedScreen?(sessionId: string): string[] | null
   /** M1: is it at a question right now (a menu on its screen)? A guess from words with no menu behind it is put right and counts as no. False when it isn't running here. */
   asking(sessionId: string): boolean
   /** Is there unsent text in its idle input box (Shubham is typing there)? Anything pasted would join it. False when it isn't running here. */
@@ -1546,6 +1552,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     screen(id) {
       const c = chats.get(id)
       return c && !c.exited ? c.screen.lines() : null
+    },
+
+    typedScreen(id) {
+      const c = chats.get(id)
+      return c && !c.exited ? c.screen.typedLines() : null
     },
 
     drafting(id) {

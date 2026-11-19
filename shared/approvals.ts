@@ -55,6 +55,11 @@ export interface PreparedCard {
 export interface ApprovalsAnswer {
   items: ApprovalItem[]
   prepared: PreparedCard[]
+  /**
+   * F-294 (his order o8c55, "give button ignroe pleae"): the prompts THIS person has ignored that are still their chat's current prompt. They are left out of `items`
+   * (and so out of the badge) and shown apart, under "Ignored (n)", with a Restore on each. Left out when none; an older Server never sends it (none).
+   */
+  ignored?: ApprovalItem[]
   /** o0c50: the routed floors' questions still with someone else, counted (not listed) in this view. */
   elsewhere?: RoutedElsewhere[]
   /** o0c50: which prompts were listed (GET /approvals?scope=). */
@@ -74,6 +79,23 @@ export interface AnswerRequest {
 export interface CancelRequest {
   sessionId: string
   id: string
+}
+
+/**
+ * POST /agentic/approvals/ignore (F-294): hide the card for prompt `id` of that chat from the person who taps. It NEVER answers anything: no key is typed, no
+ * option chosen, nothing sent, and the agent that asked keeps waiting. Same proof as Cancel (the current CRM session and rights on that chat's floor).
+ */
+export interface IgnoreRequest {
+  sessionId: string
+  id: string
+}
+
+/** POST /agentic/approvals/restore (F-294): bring back a card this person ignored (the same two names as Ignore). */
+export type RestoreRequest = IgnoreRequest
+
+/** GET /agentic/approvals/ignored (F-294): the prompts this person has ignored that are still their chat's current prompt. Ids only: the badge subtracts them. */
+export interface IgnoredAnswer {
+  ignored: { sessionId: string; id: string }[]
 }
 
 /** POST /agentic/send-as-me: his words, typed into the chat as plain input. */
@@ -135,8 +157,11 @@ export interface AutoUpdateRun {
 
 export interface ApprovalLogEntry {
   at: string
-  /** answer: a prompt answered; send: his words sent; device: an approval device registered or removed, or the old way switched. */
-  kind: 'answer' | 'send' | 'device'
+  /**
+   * answer: a prompt answered; send: his words sent; device: an approval device registered or removed, or the old way switched; ignore / restore (F-294): a
+   * card hidden from, or brought back for, the person who tapped. Nothing was answered or typed. Their `detail` is a fixed sentence: never what the prompt said.
+   */
+  kind: 'answer' | 'send' | 'device' | 'ignore' | 'restore'
   floor: string
   agent: string
   pc: string
@@ -146,7 +171,7 @@ export interface ApprovalLogEntry {
   /** Who asked: the app and the device it was opened on. */
   by: string
   /**
-   * Orders o66aa / o7e97 (Lead: an approval must name the human who gave it, durably): on an answer or a cancel, the person's CRM id, whether
+   * Orders o66aa / o7e97 (Lead: an approval must name the human who gave it, durably): on an answer, a cancel (and, F-294, an ignore or a restore), the person's CRM id, whether
    * they answered as the owner of the app or as one of the floor's decision-makers, the floor's id, the prompt's id and what they chose. Older
    * rows have none of these.
    */

@@ -69,11 +69,22 @@ export interface Origin {
    * "Quick sends without asking" says. Left out for every other connection.
    */
   page?: 'quick'
+  /**
+   * oc65c / F-051 S2 (Agent 3's read): the person who ASKED (the CRM id signed in on the asking connection), taken at ask time, so a hand-off whose asker lost Quick before
+   * handedOff() ran still has its asker on record. Left out when the asker has no person (the open app, the PC's own program, a phone) and by an older caller: handedOff()
+   * then falls back to the connection it finds.
+   */
+  person?: string
 }
 
 export interface FastSession {
-  /** The page's socket (kind web) or Chris's (kind phone); null when the Assistant is off. */
-  socket(kind: 'web' | 'phone'): ((ws: WsSocket) => void) | null
+  /**
+   * The page's socket (kind web) or Chris's (kind phone); null when the Assistant is off. The second argument is what the mount's socket handler is handed: api.ts calls
+   * EVERY one as handler(ws, caller) with a Caller object, so it is typed `unknown` and only the index.ts `/fast` wrapper passes a person on purpose: the CRM id (a string)
+   * of whoever is signed in on a web connection, as the agent's socket gate saw them; null/absent: nobody (the open app, the PC's own program). A phone never has one
+   * (talker below), and anything that is not a string is taken as none.
+   */
+  socket(kind: 'web' | 'phone'): ((ws: WsSocket, person?: unknown) => void) | null
   /** The host changed state (starting / ready / paused / unavailable): every connection is told. */
   hostState(status: HostStatus): void
   /**
@@ -81,6 +92,12 @@ export interface FastSession {
    * owner is with the process now: it was cut off (cancel), it still waits for the snapshot or the process, or the turn running is the hub's own o:.
    */
   currentOrigin(): Origin | null
+  /**
+   * oc65c / F-051 S2 (Lead's ruling on Agent 7's F1): who is talking to the Assistant now: the connection that holds it, its kind and the person signed
+   * in there (null: nobody). Null when nobody holds it. The app's memory tools for Quick are decided on this (index.ts fastCall, quickMayUseMemory),
+   * never on the owner of the Orchestrator agent whose copy Quick's tools run as.
+   */
+  talker(): { kind: 'web' | 'phone'; person: string | null } | null
   /** A hand-off was made (the hand_off tool, or his tap on a card): tells the origin's client. */
   handedOff(orderId: string, origin: Origin, line: string): void
   /** F-221 (ob98a): a frame to one connection by its id (a card shown or gone); false when it is closed or unknown. */
@@ -111,6 +128,11 @@ interface Conn {
   talk: boolean
   /** F-267 (order o088b): its last start said it is the Quick page (`page: 'quick'`); see Origin.page. */
   page: 'quick' | null
+  /**
+   * oc65c / F-051 S2: the CRM id of whoever is signed in on this connection, as the agent's own socket gate saw them (never a client's word); null: nobody
+   * (the open app, the PC's own program), and always null for a phone (a paired device: pairing records no person). Never sent to a client.
+   */
+  person: string | null
   ahead: boolean
   prepared: Set<string>
   finals: Set<string>
@@ -144,6 +166,13 @@ export function createFastSession(deps: FastDeps): FastSession {
   let active: Active | null = null
   let model: FastModel = 'haiku'
   const origins = new Map<string, { conn: Conn; origin: Origin }>()
+  /**
+   * oc65c / F-051 S2 (Agent 7's F5, second round): WHO asked each hand-off (the person on the asking connection; null: none), kept beyond that connection's close (its
+   * origin goes with it, above) so that the reply, built from his memory, is never told to a DIFFERENT person when the asker has gone: answered() compares it with
+   * whoever owns the Assistant then. Kept until the reply is told (a retry still has it); the newest 64 are kept, like the holds below.
+   */
+  const askers = new Map<string, string | null>()
+  const ASKERS_KEPT = 64
   let seq = 0
   /**
    * F-221 (ob98a, review of T2): the hold of each client id (web:<tab> / phone:<device>), kept across its connections. A reconnect (`start
@@ -415,8 +444,11 @@ export function createFastSession(deps: FastDeps): FastSession {
   return {
     socket(kind) {
       if (!deps.host) return null
-      return ws => {
-        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, page: null, ahead: false, prepared: new Set(), finals: new Set(), previewAt: -Infinity, told: new Set() }
+      return (ws, person) => {
+        // oc65c / F-051 S2: the person is a CRM id (a string) on a WEB connection only. api.ts calls every mount socket handler as handler(ws, caller), so a keyed
+        // socket (the phone's, whose caller is the default open object) and the old-app reader's socket arrive with a Caller OBJECT here: never kept as a person.
+        // Only the index.ts `/fast` wrapper passes a person on purpose (the one it read off the signed-in caller).
+        const c: Conn = { id: `k${++seq}`, ws, kind, clientId: null, asks: [], closed: false, opening: null, hold: false, talk: false, page: null, person: kind === 'web' && typeof person === 'string' ? person : null, ahead: false, prepared: new Set(), finals: new Set(), previewAt: -Infinity, told: new Set() }
         conns.add(c)
         send(c, stateFor(c))
         ws.onText(raw => onFrame(c, raw))
@@ -437,10 +469,22 @@ export function createFastSession(deps: FastDeps): FastSession {
       // F-221 (ob98a): fail closed. Only an ask that is with the process now: not one a cancel cut off, not one still waiting for the snapshot or
       // the process (the turn before it may still be running, and its late tool call would be credited here), never the hub's own o: turn.
       if (!owner || !owner.clientId || !active || active.conn !== owner || active.cancelled || !active.sent) return null
-      return { kind: owner.kind, clientId: owner.clientId, askId: active.id, conn: owner.id, hold: owner.hold, via: active.via, ...(owner.page ? { page: owner.page } : {}) }
+      return { kind: owner.kind, clientId: owner.clientId, askId: active.id, conn: owner.id, hold: owner.hold, via: active.via, ...(owner.page ? { page: owner.page } : {}), ...(owner.person ? { person: owner.person } : {}) }
+    },
+    talker() {
+      return owner ? { kind: owner.kind, person: owner.person } : null
     },
     handedOff(orderId, origin, line) {
       const c = owner && owner.clientId === origin.clientId ? owner : null
+      // The asker is put on record FIRST (the person taken at ask time, else the connection found), so a hand-off whose asker lost Quick in between still has one.
+      const asker = origin.person !== undefined ? origin.person : c ? c.person : undefined
+      if (asker !== undefined) {
+        askers.set(orderId, asker)
+        for (const old of askers.keys()) {
+          if (askers.size <= ASKERS_KEPT) break
+          askers.delete(old)
+        }
+      }
       if (!c) return
       origins.set(orderId, { conn: c, origin })
       send(c, { t: 'handoff', id: origin.askId, orderId, line })
@@ -460,11 +504,19 @@ export function createFastSession(deps: FastDeps): FastSession {
     answered(orderId, request, reply, cancelled) {
       const o = origins.get(orderId)
       const host = deps.host
-      // The origin first; else whoever owns the Assistant now (a reconnect after a restart); else nobody.
-      const c = o && !o.conn.closed && owner === o.conn ? o.conn : owner && !owner.closed ? owner : null
+      // The origin first; else whoever owns the Assistant now (a reconnect, on the same person's page); else nobody. oc65c / F-051 S2 (Agent 7's F5, Agent 3's read, Lead's
+      // ruling: FAIL CLOSED): never a DIFFERENT person than the one who asked, and never when the asker is UNKNOWN: the reply is built from his memory, so when the asker's
+      // connection was taken over by someone else, or closed, it is told here only to a holder who is the same person. An order with no asker on record (an app restart, a
+      // hand-off recorded by an older caller, the 65th order's eviction) is answered 'no-listener', never told to the live holder. index.ts' onReturn then returns false and orders.ts
+      // KEEPS the reply and offers it again at every tick (up to GIVE_UP_MS + KEEP_REPLY_MS after the order), so it is told when the asker's own person holds Quick again; nothing is
+      // typed anywhere (memory-answered-kept.test.ts). The compare is strict: the owner who asked on the web page and then takes Quick over on his phone (his person against
+      // none) is not told on the phone; the reply waits for his page. Behind /fast being the app owner's and the guard this is a SEATBELT, not a wall.
+      const asker = askers.get(orderId)
+      const c = o && !o.conn.closed && owner === o.conn ? o.conn : owner && !owner.closed && asker !== undefined && asker === owner.person ? owner : null
       if (c) deps.preview?.clear(c.id)
       if (!c || !host || host.state() !== 'ready') return 'no-listener'
       origins.delete(orderId)
+      askers.delete(orderId)
       send(c, { t: 'handoff-answer', orderId, text: reply, ...(cancelled ? { cancelled: true } : {}) })
       // The text is on his screen now; if the Assistant cannot tell it too (it is restarting), that is logged and the screen has it.
       // F-221 (ob98a): this connection may cut the telling off (cancel o:<orderId>) while it runs.
@@ -491,6 +543,7 @@ export function createFastSession(deps: FastDeps): FastSession {
       owner = null
       active = null
       origins.clear()
+      askers.clear()
     },
   }
 }

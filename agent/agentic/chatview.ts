@@ -506,6 +506,8 @@ export interface ChatFeedsOptions {
    * file has neither (claude writes a tool call and its answer together, once it has one).
    */
   screen?: (sessionId: string) => string[] | null
+  /** Order o5d4e: whether claude's unnumbered selects are read as menus (the setting "Buttons for arrow-select prompts"); on when left out. */
+  arrowMenus?: () => boolean
   /** F-134: a chat's conversation file when it is not found by Claude's rules (a Codex chat's rollout), or null. */
   fileOf?: (sessionId: string) => string | null
   /** F-134: the format of a chat's file (Claude's when left out). */
@@ -602,7 +604,8 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   /** What the chat's screen says now: a waiting question, and what claude is doing. */
   function onScreen(sessionId: string) {
     const lines = o.screen?.(sessionId) ?? null
-    return { menu: lines ? readMenu(lines) : null, status: lines ? readStatus(lines) : null }
+    // Order o5d4e: an unnumbered select is a menu here too, unless the setting is off (the old way).
+    return { menu: lines ? readMenu(lines, { arrows: o.arrowMenus?.() !== false }) : null, status: lines ? readStatus(lines) : null }
   }
 
   /** The screen looked at: a change in the waiting question or in the spinner line is sent, once. */

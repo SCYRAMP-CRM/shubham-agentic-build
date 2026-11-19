@@ -61,16 +61,19 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/accounts\/codebases$/, OWNER],
   // Codebase details slice: the codebase's details (the owner's only).
   ['PUT', /^\/accounts\/codebases\/([^/]+)$/, OWNER],
-  // Accounts edit slice: the platform accounts edit and soft delete (the owner's only).
+  // Accounts edit slice: the platform accounts edit, disable and enable (the owner's only).
   ['POST', /^\/accounts\/platforms$/, OWNER],
   ['PUT', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
-  ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
+  ['POST', /^\/accounts\/platforms\/([^/]+)\/disable$/, OWNER],
+  ['POST', /^\/accounts\/platforms\/([^/]+)\/enable$/, OWNER],
   // Order o8ebe: the password reveal (the owner's only).
   ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, OWNER],
   // Order ofd53: the email edit modal (the owner's only).
   ['POST', /^\/accounts\/email$/, OWNER],
   ['PUT', /^\/accounts\/email\/([^/]+)$/, OWNER],
-  ['DELETE', /^\/accounts\/email\/([^/]+)$/, OWNER],
+  // Slice D (disable, never delete): the five DELETE routes of the Accounts page are gone; each kind is disabled and enabled again.
+  ['POST', /^\/accounts\/email\/([^/]+)\/disable$/, OWNER],
+  ['POST', /^\/accounts\/email\/([^/]+)\/enable$/, OWNER],
   ['POST', /^\/accounts\/email\/import$/, OWNER],
   ['GET', /^\/accounts\/platforms$/, OWNER],
   ['GET', /^\/accounts\/codebases$/, OWNER],
@@ -80,13 +83,16 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PUT', /^\/accounts\/codebases\/([^/]+)\/sections\/([^/]+)$/, OWNER],
   ['POST', /^\/accounts\/codebases\/([^/]+)\/links$/, OWNER],
   ['PUT', /^\/accounts\/links\/([^/]+)$/, OWNER],
-  ['DELETE', /^\/accounts\/links\/([^/]+)$/, OWNER],
+  ['POST', /^\/accounts\/links\/([^/]+)\/disable$/, OWNER],
+  ['POST', /^\/accounts\/links\/([^/]+)\/enable$/, OWNER],
   ['POST', /^\/accounts\/codebases\/([^/]+)\/subsets$/, OWNER],
   ['PUT', /^\/accounts\/subsets\/([^/]+)$/, OWNER],
-  ['DELETE', /^\/accounts\/subsets\/([^/]+)$/, OWNER],
+  ['POST', /^\/accounts\/subsets\/([^/]+)\/disable$/, OWNER],
+  ['POST', /^\/accounts\/subsets\/([^/]+)\/enable$/, OWNER],
   ['POST', /^\/accounts\/subsets\/([^/]+)\/vars$/, OWNER],
   ['PUT', /^\/accounts\/vars\/([^/]+)$/, OWNER],
-  ['DELETE', /^\/accounts\/vars\/([^/]+)$/, OWNER],
+  ['POST', /^\/accounts\/vars\/([^/]+)\/disable$/, OWNER],
+  ['POST', /^\/accounts\/vars\/([^/]+)\/enable$/, OWNER],
   ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, OWNER],
   // Order o94f3: the Env tab's "+" and its ".env" paste box, and "show all" (the owner's only; the routes are humanOnly as well).
   ['POST', /^\/accounts\/codebases\/([^/]+)\/env$/, OWNER],
@@ -150,6 +156,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/approvals$/, SIGNED],
   ['POST', /^\/approvals\/answer$/, SIGNED],
   ['POST', /^\/approvals\/cancel$/, SIGNED],
+  // F-294 (his o8c55, "give button ignroe pleae"): hide a card from the person who taps (Ignore), bring it back (Restore), and read which prompts they have ignored (the badge).
+  // The same people as the list and with Cancel's proof (requireCrmHuman, then rights on that chat's floor: the owner, or a decision-maker now). Nothing is ever typed.
+  ['POST', /^\/approvals\/ignore$/, SIGNED],
+  ['POST', /^\/approvals\/restore$/, SIGNED],
+  ['GET', /^\/approvals\/ignored$/, SIGNED],
   ['POST', /^\/send-as-me$/, OWNER],
   // o0c50 / o66aa: where each floor's decisions go ("Decisions go to…"). The owner's only (and a change takes his CRM session on the Server's page).
   ['GET', /^\/question-routing$/, OWNER],
@@ -178,8 +189,14 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/approvals\/devices\/remove$/, OWNER],
   ['POST', /^\/approvals\/devices\/unsigned$/, OWNER],
   ['GET', /^\/approvals\/log$/, OWNER],
-  // The floors' structural history (floor-events.ts): who made, removed, adopted, filled, moved or shared what. The owner's only; no ROUTES rule opens it.
+  // The floors' structural history (floor-events.ts): who made, removed, adopted, filled, moved or shared what. The owner's only; no ROUTES rule opens it; the route is humanOnly as well (R6).
   ['GET', /^\/floor-events$/, OWNER],
+  // Order o5d4e: the switch for buttons on claude's unnumbered selects: the owner's.
+  ['GET', /^\/approvals\/arrow-prompts$/, OWNER],
+  ['PUT', /^\/approvals\/arrow-prompts$/, OWNER],
+  // Who was present at a chat (chat-presence.ts): keys that reached a terminal (their class, never the keys) and the screen an Assistant drove (the kind of act, never what).
+  // The owner's only; no ROUTES rule opens it, so no feature or share does either; the route is humanOnly as well (R6).
+  ['GET', /^\/chat-presence$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents$/, floor('manage')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
   // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).

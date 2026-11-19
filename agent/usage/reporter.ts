@@ -102,14 +102,20 @@ export function createReporter(o: ReporterOptions): Reporter {
           rows: part.map(r => ({ hour: r.hour, costUsd: r.costUsd, sessions: r.sessions, subscriptionKey: r.subscriptionKey })),
         }
         let answer: CrmAnswer
+        o.ledger.beginSend(part) // saved before the post: a process killed after the CRM took the rows must not send them again under a new build (F-288)
         try {
           answer = await o.post(login, 'v1/org/christopher-usage', body)
         } catch (e) {
+          o.ledger.abortSend(part)
           o.log?.warn(`claude usage: a report did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
           return
         }
-        if (answer.status === 404 || answer.status === 503) return pause(`status ${answer.status}`)
+        if (answer.status === 404 || answer.status === 503) {
+          o.ledger.abortSend(part)
+          return pause(`status ${answer.status}`)
+        }
         if (answer.status < 200 || answer.status >= 300) {
+          o.ledger.abortSend(part)
           o.log?.warn(`claude usage: the CRM refused a report (status ${answer.status}); it is tried again later`)
           return
         }

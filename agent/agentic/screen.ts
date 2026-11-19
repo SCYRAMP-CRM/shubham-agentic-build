@@ -358,8 +358,13 @@ const CHIP_RE = /^\s*[☐☑✔☒]\s*(.+?)\s*$/
  * or "Enter to confirm") with the numbered options above it (claude's own AskUserQuestion, a
  * permission prompt, the trust menu). A number typed answers it. Null when none is up.
  */
-export function readMenu(lines: string[]): ChatMenu | null {
-  return findMenu(lines)?.menu ?? null
+export function readMenu(lines: string[], opts: MenuOptions = {}): ChatMenu | null {
+  return findMenu(lines, opts)?.menu ?? null
+}
+
+/** Order o5d4e: `arrows: false` reads only numbered menus that have a footer, as before (the setting that keeps the old way, "Buttons for arrow-select prompts"). */
+export interface MenuOptions {
+  arrows?: boolean
 }
 
 /** A menu and where it sits in the lines: the line of its first option and of its footer. */
@@ -376,7 +381,7 @@ export interface MenuAt {
  * dialog drawn under an older menu) means these options are not what the footer belongs to, so there is no menu to answer.
  * Options from an older screen, left above a newer footer, are therefore never picked up.
  */
-export function findMenu(lines: string[]): MenuAt | null {
+function findNumberedMenu(lines: string[]): MenuAt | null {
   let f = -1
   for (let i = lines.length - 1; i >= 0; i--) {
     if (FOOTER_RE.test(lines[i])) {
@@ -432,6 +437,182 @@ export function findMenu(lines: string[]): MenuAt | null {
   }
   const multi = options.some(o => /^\[[ xX✔]\]/.test(o.label))
   return { menu: { header, question, options, hint: lines[f].trim(), multi }, first, footer: f }
+}
+
+/**
+ * Order o5d4e (Shubham: "give ability to select on phone"): claude's arrow-select prompts draw no numbers, only a pointer, e.g. the trust prompt
+ * ("Is this a directory you trust?": "❯ No, exit" and "  Yes, add it"), with the footer of any menu under them. A digit does nothing there
+ * (they are drawn with hideIndexes and disablePrintableKeybindings): an option is chosen by moving the pointer with the arrow keys and pressing Enter.
+ * It is read only when no numbered menu is, and as strictly: the newest footer must say "Enter to select" or "Enter to confirm" (a dialog with another
+ * footer, such as the auto-mode setup screen's "Enter to continue", is not read), the options must END at the footer (rules and blank lines between are skipped, nothing
+ * else), run in one block with no gap, hold exactly one "❯" line, and sit in one column (a deeper-indented line is the description of the option above
+ * it); 2 to 12 of them. A RULE line ends the block, above and below (the chat's input box is rule, "❯ text", rule: it must never be joined to a footer
+ * under it and read as a menu); a recording of the real screens may show that claude draws one inside its dialogs, and then this is widened on
+ * that evidence, not before. Anything else is not read as a menu, as before. `n` is the option's place (1 is the first one drawn): there is no number
+ * on the screen to type. The answer re-reads the screen after the arrows and presses Enter only when the pointer stands on the chosen option
+ * (agent/agentic/arrow-select.ts).
+ */
+const POINTER_RE = /^\s*❯\s+\S/
+const ARROW_FOOTER_RE = /Enter to (?:select|confirm)/i
+const MAX_ARROW_OPTIONS = 12
+
+function findArrowMenu(lines: string[]): MenuAt | null {
+  let f = -1
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (FOOTER_RE.test(lines[i])) {
+      f = i
+      break
+    }
+  }
+  if (f < 0) return null
+  // The NEWEST dialog's footer must be a select's own words. Another dialog's footer is not an arrow-select's, even with a pointer and rows above it:
+  // the auto-mode setup screen ("←/→ to change · Enter to continue · Esc to cancel") has toggles and a Continue, and was never offered as buttons.
+  if (!ARROW_FOOTER_RE.test(lines[f])) return null
+  let end = f - 1
+  while (end >= 0 && !lines[end].trim()) end--
+  if (end < 0) return null
+  // The pointer: the nearest "❯ label" going up from the last line before the footer, with no blank line or rule in between.
+  let ptr = -1
+  for (let i = end; i >= Math.max(0, end - MAX_ARROW_OPTIONS * 4); i--) {
+    if (!lines[i].trim() || RULE_RE.test(lines[i])) break
+    if (POINTER_RE.test(lines[i])) {
+      ptr = i
+      break
+    }
+  }
+  if (ptr < 0) return null
+  const col = (l: string) => l.search(/\S/)
+  const labelCol = lines[ptr].indexOf('❯') + 1 + lines[ptr].slice(lines[ptr].indexOf('❯') + 1).search(/\S/)
+  const isOption = (l: string) => col(l) === labelCol && !l.trimStart().startsWith('❯')
+  const isMore = (l: string) => col(l) > labelCol
+  // Down from the pointer to the end of the block: only options and their descriptions.
+  for (let i = ptr + 1; i <= end; i++) if (!isOption(lines[i]) && !isMore(lines[i])) return null
+  // Up from the pointer: options and descriptions, until a gap, a rule or anything else (the question's own lines).
+  let first = ptr
+  for (let i = ptr - 1; i >= 0; i--) {
+    const l = lines[i]
+    if (!l.trim() || RULE_RE.test(l)) break
+    if (isOption(l) || isMore(l)) first = i
+    else break
+  }
+  // A description line right at the top belongs to no option: the block starts at its first option row.
+  while (first < ptr && !isOption(lines[first]) && !POINTER_RE.test(lines[first])) first++
+  const options: ChatMenu['options'] = []
+  for (let i = first; i <= end; i++) {
+    const l = lines[i]
+    if (i === ptr || isOption(l)) options.push({ n: options.length + 1, label: i === ptr ? l.slice(l.indexOf('❯') + 1).trim() : l.trim(), description: '', selected: i === ptr })
+    else if (options.length) {
+      const last = options[options.length - 1]
+      last.description = last.description ? `${last.description} ${l.trim()}` : l.trim()
+    }
+  }
+  if (options.length < 2 || options.length > MAX_ARROW_OPTIONS || options.filter(o => o.selected).length !== 1 || options.some(o => !o.label)) return null
+  // A label that starts with a number ("2. B") is a NUMBERED menu the numbered reader refused (a number skipped, or it does not start at 1): never re-read here as an unnumbered select.
+  if (options.some(o => /^\d{1,2}\.\s/.test(o.label))) return null
+  let header = ''
+  let question = ''
+  for (let i = first - 1; i >= Math.max(0, f - 40); i--) {
+    const l = lines[i]
+    if (!l.trim() || RULE_RE.test(l)) continue
+    const chip = CHIP_RE.exec(l)
+    if (chip) {
+      header = chip[1]
+      break
+    }
+    if (!question) question = l.trim()
+  }
+  return { menu: { header, question, options, hint: lines[f].trim(), multi: false, keys: 'arrows' }, first, footer: f }
+}
+
+
+/**
+ * Order o5d4e: a NUMBERED menu with no footer. The AskUserQuestion form's Review step ("Ready to submit your answers?", "❯ 1. Submit answers", "2. Cancel")
+ * is a confirm select drawn WITH numbers, and by the installed Claude Code 2.1.326's own source the Review component draws no footer line (every question
+ * step does). The app already counts such a screen as a question (chats.ts menuSeen takes a "❯ 1." line alone), so Approvals listed it, but this reader
+ * wanted a footer and gave no menu: "not a numbered choice", and nothing in the chat view. Read only when no menu with a footer is, and as strictly: the
+ * pointer's "❯ N." line, the numbers running on below it and down to 1 above it (notes and blank lines between), and NOTHING but blank lines after the
+ * last option, to the end of the screen: an input box under it (the idle chat) or any other text means it is not a menu that is waiting. Not recorded yet
+ * (a fixture constructed from that source, arrow-menu.fixture.ts); where it reads wrongly nothing changes from before, where it reads rightly a tap types
+ * the digit, as for any numbered menu.
+ */
+const BARE_POINTER_RE = /^\s*❯\s*(\d{1,2})\.\s+(\S.*?)\s*$/
+
+function findBareNumberedMenu(lines: string[]): MenuAt | null {
+  let end = lines.length - 1
+  while (end >= 0 && !lines[end].trim()) end--
+  if (end < 0) return null
+  // From the last line up to the pointer's numbered line: only options below it (numbers in order) and their notes.
+  let p = -1
+  for (let i = end; i >= Math.max(0, end - 40); i--) {
+    const l = lines[i]
+    if (BARE_POINTER_RE.test(l)) {
+      p = i
+      break
+    }
+    if (!l.trim() || OPTION_RE.test(l) || /^\s{3,}\S/.test(l)) continue
+    return null
+  }
+  if (p < 0) return null
+  let next = Number(BARE_POINTER_RE.exec(lines[p])![1]) + 1
+  for (let i = p + 1; i <= end; i++) {
+    const m = OPTION_RE.exec(lines[i])
+    if (m) {
+      if (Number(m[1]) !== next) return null
+      next++
+    }
+  }
+  // Up from the pointer to option 1, the way the footer reader walks (blank lines, rules and notes allowed).
+  let want = Number(BARE_POINTER_RE.exec(lines[p])![1]) - 1
+  let first = p
+  for (let i = p - 1; i >= 0 && want > 0; i--) {
+    const l = lines[i]
+    const m = OPTION_RE.exec(l)
+    if (m) {
+      if (Number(m[1]) !== want) return null
+      first = i
+      want--
+      continue
+    }
+    if (!l.trim() || RULE_RE.test(l) || /^\s{3,}\S/.test(l)) continue
+    return null
+  }
+  if (want !== 0) return null
+  const options: ChatMenu['options'] = []
+  for (let i = first; i <= end; i++) {
+    const l = lines[i]
+    const m = OPTION_RE.exec(l)
+    if (i === p) {
+      const q = BARE_POINTER_RE.exec(l)!
+      options.push({ n: Number(q[1]), label: q[2], description: '', selected: true })
+    } else if (m) options.push({ n: Number(m[1]), label: m[2], description: '', selected: false })
+    else if (l.trim() && !RULE_RE.test(l) && options.length && /^\s{3,}\S/.test(l)) {
+      const last = options[options.length - 1]
+      last.description = last.description ? `${last.description} ${l.trim()}` : l.trim()
+    }
+  }
+  if (options.length < 2 || options.length > 20) return null
+  let header = ''
+  let question = ''
+  for (let i = first - 1; i >= Math.max(0, end - 40); i--) {
+    const l = lines[i]
+    if (!l.trim() || RULE_RE.test(l)) continue
+    const chip = CHIP_RE.exec(l)
+    if (chip) {
+      header = chip[1]
+      break
+    }
+    if (!question) question = l.trim()
+  }
+  const multi = options.some(o => /^\[[ xX✔]\]/.test(o.label))
+  return { menu: { header, question, options, hint: '', multi }, first, footer: -1 }
+}
+
+/**
+ * A menu claude waits on and where it sits: its numbered options with a footer (screen.ts, as it always was), else, unless `arrows: false` (the old way,
+ * the setting "Buttons for arrow-select prompts"), a numbered one with no footer (the form's Review step), else its unnumbered ones (order o5d4e).
+ */
+export function findMenu(lines: string[], opts: MenuOptions = {}): MenuAt | null {
+  return findNumberedMenu(lines) ?? (opts.arrows === false ? null : (findBareNumberedMenu(lines) ?? findArrowMenu(lines)))
 }
 
 const SPINNER_RE = /^\s*[✻✽✶✢✳·*⏺]\s+(\S.*?…)\s*(?:\(([^)]*)\))?\s*$/

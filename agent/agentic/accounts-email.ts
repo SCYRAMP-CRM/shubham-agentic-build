@@ -21,8 +21,11 @@ const notConnected = (reason: NotConnected, detail?: string): EmailAccountsAnswe
 export function createAccountsEmail(o: AccountsEmailOptions) {
   const open = o.open ?? openAccountsDb
   return {
-    /** The email accounts `person` may see. */
-    async list(person: string): Promise<EmailAccountsAnswer> {
+    /**
+     * The email accounts `person` may see. Slice D (disable, never delete): a switched-off (disabled) account is not in the list unless `disabled` is asked for (the page's "Show disabled"); with it every account comes back, a disabled one marked
+     * `isDisabled` and carrying `disabledAt`. An account an older version soft-deleted (deleted_at) is a disabled one too: nothing is converted, it simply reads as disabled.
+     */
+    async list(person: string, opts: { disabled?: boolean } = {}): Promise<EmailAccountsAnswer> {
       const read = readAccountsDb(o.dir)
       if (!read.ok) return read.bad === null ? notConnected('not-set-up') : notConnected('not-set-up', BAD_WORDS[read.bad])
       // The person is the app's own id of the signed-in owner; anything odd is refused rather than passed on.
@@ -32,7 +35,9 @@ export function createAccountsEmail(o: AccountsEmailOptions) {
         sql = await open(read)
         const { mails, uses } = await sql.begin(async tx => {
           await tx`select set_config('app.person_id', ${person}, true)`
-          const mails: Row[] = await tx`select id, address, recovery_email, phone, description, has_password, is_disabled, source_updated_at, authenticator_email, authenticator_app, authenticator_note from sad.account_email where deleted_at is null order by is_disabled, address limit 501`
+          const mails: Row[] = opts.disabled === true
+            ? await tx`select id, address, recovery_email, phone, description, has_password, is_disabled, source_updated_at, authenticator_email, authenticator_app, authenticator_note, deleted_at, updated_at from sad.account_email order by (is_disabled or deleted_at is not null), address limit 501`
+            : await tx`select id, address, recovery_email, phone, description, has_password, is_disabled, source_updated_at, authenticator_email, authenticator_app, authenticator_note, deleted_at, updated_at from sad.account_email where deleted_at is null and is_disabled = false order by address limit 501`
           const uses: Row[] = await tx`select email_id, used_for from sad.account_email_use where gone_from_source = false order by email_id, sort_order limit 6000`
           return { mails, uses }
         })
@@ -42,7 +47,7 @@ export function createAccountsEmail(o: AccountsEmailOptions) {
           byEmail.set(key, [...(byEmail.get(key) ?? []), { usedFor: u.used_for }])
         }
         const accounts = safeEmailRows(
-          mails.map(m => ({ id: String(m.id), address: m.address, recoveryEmail: m.recovery_email, phone: m.phone, description: m.description, hasPassword: m.has_password === true, isDisabled: m.is_disabled === true, updatedAt: m.source_updated_at, uses: byEmail.get(String(m.id)) ?? [], authenticatorEmail: m.authenticator_email, authenticatorApp: m.authenticator_app, authenticatorNote: m.authenticator_note })),
+          mails.map(m => ({ id: String(m.id), address: m.address, recoveryEmail: m.recovery_email, phone: m.phone, description: m.description, hasPassword: m.has_password === true, isDisabled: m.is_disabled === true || m.deleted_at != null, disabledAt: m.deleted_at ?? m.updated_at, updatedAt: m.source_updated_at, uses: byEmail.get(String(m.id)) ?? [], authenticatorEmail: m.authenticator_email, authenticatorApp: m.authenticator_app, authenticatorNote: m.authenticator_note })),
         )
         return { connected: true, accounts: accounts ?? [] }
       } catch (e) {

@@ -114,6 +114,16 @@ export interface UiBridge {
   close(): void
 }
 
+/**
+ * WHERE a refusal came from, stamped on the error as `stage` (chat-presence.ts reads it; nothing else does): 'not-sent' = stopped before any page was asked, so nothing ran;
+ * 'asked' = a page was sent the command, so it may STILL run (a 504, or a page that went away, says nothing about whether it did). A status number cannot say this: a 409 is
+ * "no screen" from here and "the page went away" from there, and a 504 is not "it did not happen". Never overwrites a stage already set.
+ */
+function staged<E>(e: E, stage: 'not-sent' | 'asked'): E {
+  if (typeof e === 'object' && e !== null && !('stage' in e)) Object.assign(e, { stage })
+  return e
+}
+
 /** o1e3c: what the answer of a read that had to be tried on another page begins with, so the Assistant can tell it moved (and tell him). */
 function answeredByAnother(result: unknown, skipped: number, ms: number): string {
   const who = skipped === 1 ? 'the window he was last using did' : `${skipped} windows did`
@@ -239,7 +249,8 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
       } catch {
         clearTimeout(timer)
         waiting.delete(id)
-        reject(apiError(409, 'The screen went away'))
+        // The command could not even be handed to the socket: nothing was asked.
+        reject(staged(apiError(409, 'The screen went away'), 'not-sent'))
       }
     })
   }
@@ -250,6 +261,8 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
     const tried = new Set<Client>()
     let budget = timeoutMs
     let lost = 0
+    // Once ANY attempt got past the send, a page was ASKED and may still answer, whatever a later attempt on another page says (Agent 6's review of the presence record, R7).
+    let asked = false
     let c = first
     for (;;) {
       tried.add(c)
@@ -261,13 +274,19 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
         return tried.size > 1 ? answeredByAnother(result, tried.size - 1, lost) : result
       } catch (e) {
         const status = (e as { status?: unknown } | null)?.status
+        // An attempt that did not stop at the send (no answer in time, the page went away, the page said no) was a page ASKED; only 'not-sent' means nothing was handed over.
+        if ((e as { stage?: unknown } | null)?.stage !== 'not-sent') asked = true
         // Whatever the call was, the page that did not answer is passed over by the next pick: the call that follows a read lands on the page that was read.
         if (status === 504) c.suspectUntil = now() + UI_SUSPECT_MS
         const spent = Date.now() - began
         lost += spent
         budget -= spent
         const next = read && (status === 504 || status === 409) ? alternatives(c, tried, guard)[0] : undefined
-        if (!next || budget <= 0) throw e
+        if (!next || budget <= 0) {
+          // The LAST attempt may be a 'not-sent' (the second page's socket could not take the command) although the FIRST page was asked: the call was asked. staged() never overwrites, so say it outright.
+          if (asked && typeof e === 'object' && e !== null) Object.assign(e, { stage: 'asked' })
+          throw e
+        }
         c = next
       }
     }
@@ -332,21 +351,25 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
     },
 
     call(cmd, args, timeoutMs = UI_CALL_TIMEOUT_MS, as = UI_OWNER, guard?: (route: string) => boolean) {
+      // Every refusal in this function is made BEFORE any page is asked (staged 'not-sent'); what run() throws came after one was (staged 'asked').
+      const notSent = (e: unknown) => Promise.reject(staged(e, 'not-sent'))
       let scope: string
       try {
         scope = scopeOf(as)
       } catch (e) {
-        return Promise.reject(e)
+        return notSent(e)
       }
       if (ambiguous(scope)) {
-        return Promise.reject(apiError(409, 'The overlay is open on two of his devices (his phone and his PC) and he has not chosen which one the Assistant should drive. Ask him which one to use, and do not guess.'))
+        return notSent(apiError(409, 'The overlay is open on two of his devices (his phone and his PC) and he has not chosen which one the Assistant should drive. Ask him which one to use, and do not guess.'))
       }
       const c = driving(scope)
-      if (!c) return Promise.reject(apiError(409, 'No screen of the app is open: nobody is looking at the app right now. Ask him to open it (on any of his PCs, localhost or the tailnet address) and sign in.'))
-      if (!c.visible) return Promise.reject(apiError(409, "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
+      if (!c) return notSent(apiError(409, 'No screen of the app is open: nobody is looking at the app right now. Ask him to open it (on any of his PCs, localhost or the tailnet address) and sign in.'))
+      if (!c.visible) return notSent(apiError(409, "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
       // F-162 o7e6d: a guard (a staff chat's page rule) is checked against the page that will be driven, in the same step as the pick. Refused, fail closed.
-      if (guard && !guard(c.route)) return Promise.reject(apiError(403, 'That page is not open to your Assistant; it can look at the app\'s main pages only.'))
-      return run(c, cmd, args, timeoutMs, guard)
+      if (guard && !guard(c.route)) return notSent(apiError(403, 'That page is not open to your Assistant; it can look at the app\'s main pages only.'))
+      return run(c, cmd, args, timeoutMs, guard).catch(e => {
+        throw staged(e, 'asked')
+      })
     },
 
     onPhone(as = UI_OWNER) {

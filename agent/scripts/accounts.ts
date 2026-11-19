@@ -48,10 +48,11 @@ try {
     sqlDir: path.resolve(import.meta.dirname, '..', '..', 'db', 'accounts'),
     runSql,
     importer: args => createAccountsImport({ proxy, dir: paths.agent }).run(args),
-    lister: person => createAccountsEmail({ dir: paths.agent }).list(person),
+    // slice D (disable, never delete): the page hides disabled rows unless "Show disabled" asks; this counts-only script counts EVERYTHING in the new database (its "N disabled" would read 0 otherwise)
+    lister: person => createAccountsEmail({ dir: paths.agent }).list(person, { disabled: true }),
     codebaseImporter: args => createCodebaseImport({ proxy, dir: paths.agent }).run(args),
     codebaseLister: person => createAccountsCodebases({ dir: paths.agent }).list(person),
-    platformLister: person => createAccountsPlatforms({ dir: paths.agent }).list(person),
+    platformLister: person => createAccountsPlatforms({ dir: paths.agent }).list(person, { disabled: true }),
     crmSignedIn: () => proxy.session().signedIn,
     packageThere: () => loadPackage().then(() => true, () => false),
   })

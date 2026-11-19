@@ -13,6 +13,8 @@ export interface EmailAccountRow {
   noteHidden: boolean
   /** Switched off (kept in the list, last). These are a list of logins: nothing is connected from here, so there is no "connected" or "needs sign-in" state to show. */
   disabled: boolean
+  /** Slice D (disable, never delete): when it was disabled (an ISO time), for "disabled <date>"; absent when it is not disabled or the time is not known. */
+  disabledAt?: string
   /** What each is used for ("Spotify", "LinkedIn"): the names only. */
   usedFor: string[]
   /** The CRM's Emails page shows these two beside the address: kept (this page is the owner's), and searched like the CRM's. */
@@ -100,7 +102,9 @@ export function safeEmailRows(raw: unknown): EmailAccountRow[] | null {
       .filter(Boolean)
       .slice(0, MAX_USES)
     const contact = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, MAX_CONTACT) : null)
-    rows.push({ id, address, provider: providerOf(address), note, noteHidden: hidden, disabled: r.isDisabled === true, usedFor, recoveryEmail: contact(r.recoveryEmail), phone: contact(r.phone), hasPassword: r.hasPassword === true, updatedAt: isoOrNull(r.updatedAt), authenticatorEmail: contact(r.authenticatorEmail), authenticatorApp: contact(r.authenticatorApp), authenticatorNote: contact(r.authenticatorNote) })
+    // Slice D: the time it was disabled, only for a disabled row and only when the time is known (computed once, so the type is string, never string | null).
+    const disabledAt = r.isDisabled === true ? isoOrNull(r.disabledAt) : null
+    rows.push({ id, address, provider: providerOf(address), note, noteHidden: hidden, disabled: r.isDisabled === true, ...(disabledAt === null ? {} : { disabledAt }), usedFor, recoveryEmail: contact(r.recoveryEmail), phone: contact(r.phone), hasPassword: r.hasPassword === true, updatedAt: isoOrNull(r.updatedAt), authenticatorEmail: contact(r.authenticatorEmail), authenticatorApp: contact(r.authenticatorApp), authenticatorNote: contact(r.authenticatorNote) })
   }
   // Switched on first, then by address (the query sorts them so; kept here so the page never depends on it).
   return rows.sort((a, b) => Number(a.disabled) - Number(b.disabled) || a.address.localeCompare(b.address))

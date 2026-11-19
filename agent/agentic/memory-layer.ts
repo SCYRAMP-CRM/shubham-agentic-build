@@ -21,7 +21,7 @@ import { createEmbedder, type Embedder } from './embedder.ts'
 import { librarianEnv, runLibrarian, takeMaterial, writeInbox, type Material, type NoteMaterial, type SeedMaterial } from './librarian.ts'
 import { fuse, nearest, sections, snippet, terms, WordIndex, type FusedHit, type WordHit } from './memory-search.ts'
 import { cleanSaid, createTurnLog, type SessionRef, type Turn } from './memory-turns.ts'
-import { CORE, createWiki, pagePath } from './wiki.ts'
+import { CORE, createWiki, OWNER_NAME, pagePath } from './wiki.ts'
 
 // F-051: the memory layer (agent/SPEC.md › F-051), run on the hub (or a PC on its own); the
 // other PCs' chats reach it through the hub as their tool calls do.
@@ -103,6 +103,19 @@ export interface MemoryLayerOptions {
   active?: () => boolean
   /** The chats get it (recall, the brief's section): the layer is switched on, not only there to search. */
   live?: boolean
+  /**
+   * oc65c/F-051 S1: whose memory this is. Only the name is used, in every text the layer makes ("Shubham on Final", "Shubham said:", what
+   * the brief says wins). Left out: the owner's, so every text is as it has always been. The key itself is memory-people.ts's.
+   */
+  person?: { name: string }
+  /** Where the layer keeps its state (default <dir>/memory-layer) and its wiki (default <dir>/wiki): a person's own folders (memory-people.ts). */
+  home?: string
+  wikiDir?: string
+  /**
+   * The settings a NEW state starts with (a state already saved keeps its own, and a field it lacks takes this): how a person's memory is
+   * told what to learn from before they have chosen. Left out: DEFAULT_MEMORY_SETTINGS.
+   */
+  settings?: Partial<MemorySettings>
 }
 
 export interface MemoryLayer {
@@ -156,16 +169,17 @@ function hitLine(h: MemoryHit): string {
   return `- ${h.title}${h.at ? `, ${day(h.at)}` : ''} [${h.id}]: ${cut}`
 }
 
-export function formatRecall(hits: MemoryHit[]): string {
+/** `name`: whose memory it is (left out: the owner's, as it has always been). */
+export function formatRecall(hits: MemoryHit[], name: string = OWNER_NAME): string {
   if (!hits.length) return ''
   return [
-    "From Shubham Agentic's memory, found for this message (memory_read opens one in full, memory_search finds more; it may be out of date, and what Shubham says now wins):",
+    `From Shubham Agentic's memory, found for this message (memory_read opens one in full, memory_search finds more; it may be out of date, and what ${name} says now wins):`,
     ...hits.map(hitLine),
   ].join('\n')
 }
 
-function loadState(file: string): State {
-  const fresh: State = { settings: { ...DEFAULT_MEMORY_SETTINGS }, compiled: { notes: {}, seeds: {}, turns: 0, history: 0 }, baseline: null, runs: [], lastAutoAt: null }
+function loadState(file: string, defaults: Partial<MemorySettings> = {}): State {
+  const fresh: State = { settings: cleanSettings(defaults, DEFAULT_MEMORY_SETTINGS), compiled: { notes: {}, seeds: {}, turns: 0, history: 0 }, baseline: null, runs: [], lastAutoAt: null }
   try {
     const raw: unknown = JSON.parse(readFileSync(file, 'utf8'))
     if (!isObject(raw)) return fresh
@@ -201,12 +215,14 @@ export function cleanSettings(v: unknown, base: MemorySettings): MemorySettings 
 }
 
 export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
-  const home = path.join(o.dir, 'memory-layer')
+  const home = o.home ?? path.join(o.dir, 'memory-layer')
   mkdirSync(home, { recursive: true })
   const stateFile = path.join(home, 'state.json')
-  const state = loadState(stateFile)
+  const state = loadState(stateFile, o.settings)
   const save = () => writeAtomic(stateFile, `${JSON.stringify(state, null, 2)}\n`)
-  const wiki = createWiki(path.join(o.dir, 'wiki'))
+  /** Whose memory this is: the name the texts below use. */
+  const name = o.person?.name ?? OWNER_NAME
+  const wiki = createWiki(o.wikiDir ?? path.join(o.dir, 'wiki'), name)
   const turns = createTurnLog(home)
   const embedder = o.embedder ?? createEmbedder({ dir: o.modelsDir, model: o.env?.SAD_MEMORY_MODEL ?? process.env.SAD_MEMORY_MODEL, log: o.log })
   const log = o.log
@@ -308,7 +324,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       put({
         id,
         kind: 'note',
-        title: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (a chat) on ${fname}` : `Shubham on ${fname}`,
+        title: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (a chat) on ${fname}` : `${name} on ${fname}`,
         heading: null,
         text: e.tags.length ? `${e.text}\n[${e.tags.join(', ')}]` : e.text,
         path: null,
@@ -362,7 +378,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     put({
       id: `turn:${t.id}`,
       kind: 'turn',
-      title: t.from === 'shubham' ? `Shubham to ${t.agentName} on ${t.floorName}` : `Another chat to ${t.agentName} on ${t.floorName}`,
+      title: t.from === 'shubham' ? `${name} to ${t.agentName} on ${t.floorName}` : `Another chat to ${t.agentName} on ${t.floorName}`,
       heading: null,
       text: t.answer ? `${t.said}\n\nAnswer: ${t.answer}` : t.said,
       path: null,
@@ -526,7 +542,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         const key = `${f.id}/${e.id}`
         const version = e.editedAt ?? e.ts
         if (state.compiled.notes[key] === version) continue
-        notes.push({ key, floorName: f.name, author: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (an AI chat)` : 'Shubham', at: version, text: e.text, version })
+        notes.push({ key, floorName: f.name, author: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (an AI chat)` : name, at: version, text: e.text, version })
       }
     }
     notes.sort((a, b) => a.at.localeCompare(b.at))
@@ -567,7 +583,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       take = t.take
       chars = t.chars
       if (!take.notes.length && !take.turns.length && !take.seeds.length) throw apiError(409, 'Nothing new to compile: every note and turn is in the wiki')
-      inbox = writeInbox(wiki.dir, id, take)
+      inbox = writeInbox(wiki.dir, id, take, name)
     }
     const run: LibrarianRun = {
       id,
@@ -656,7 +672,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     const pages = wiki.pages().filter(p => p.path !== CORE)
     const out = [
       '## What you remember',
-      "Shubham Agentic keeps a memory for every chat: a wiki its librarian compiles from the floors' notes and conversations, with every note and turn, searched by words and by meaning. What it holds about each message you get is shown with that message, under \"From Shubham Agentic's memory\". Open a page or a hit with `memory_read`, search with `memory_search`, and keep what should outlast this chat with `memory_save`. What Shubham says now wins over what the memory says.",
+      "Shubham Agentic keeps a memory for every chat: a wiki its librarian compiles from the floors' notes and conversations, with every note and turn, searched by words and by meaning. What it holds about each message you get is shown with that message, under \"From Shubham Agentic's memory\". Open a page or a hit with `memory_read`, search with `memory_search`, and keep what should outlast this chat with `memory_save`. What " + name + " says now wins over what the memory says.",
     ]
     const coreText = core && !/^_Nothing here yet/.test(core) ? core : ''
     if (coreText) out.push('### Core (core.md)', coreText.length > CORE_MAX ? `${coreText.slice(0, CORE_MAX)}\n\n[...cut: memory_read core for the rest]` : coreText)
@@ -683,7 +699,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       if (r.startsWith('turn:')) {
         const t = turns.get(r.slice(5))
         if (!t) throw apiError(404, `No turn ${r}`)
-        return [`${t.from === 'shubham' ? 'Shubham' : 'Another chat'} to ${t.agentName} on ${t.floorName}, ${t.at}:`, t.said, '', `${t.agentName} answered:`, t.answer || '(no answer kept)'].join('\n')
+        return [`${t.from === 'shubham' ? name : 'Another chat'} to ${t.agentName} on ${t.floorName}, ${t.at}:`, t.said, '', `${t.agentName} answered:`, t.answer || '(no answer kept)'].join('\n')
       }
       const d = docs.get(r)
       if (!d) throw apiError(404, `No note ${r}`)
@@ -714,7 +730,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       if (out.length >= RECALL_MAX) break
     }
     for (const h of out) s.at.set(h.id, s.n)
-    return formatRecall(out)
+    return formatRecall(out, name)
   }
 
   return {

@@ -45,6 +45,8 @@ export interface PlatformAccountRow {
   contactDisabled: boolean
   hasPassword: boolean
   disabled: boolean
+  /** Slice D (disable, never delete): when it was disabled (an ISO time), for "disabled <date>"; absent when it is not disabled or the time is not known. */
+  disabledAt?: string
   updatedAt: string | null
   codebases: PlatformCodebaseLink[]
   /** Order o2881: the email account whose authenticator app holds this account's 2FA codes (its address), the app's name, and the device note. Never a code or a secret. */
@@ -86,6 +88,8 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
       codebases.push({ codebaseId: str(c.codebaseId, 80), name, parts: (Array.isArray(c.parts) ? c.parts : []).filter((p): p is 'be' | 'fe' => p === 'be' || p === 'fe') })
     }
     codebases.sort((a, b) => a.name.localeCompare(b.name))
+    // Slice D: the time it was disabled, only for a disabled row and only when the time is known (computed once, so the type is string, never string | null).
+    const disabledAt = r.disabled === true ? isoOf(r.disabledAt) : null
     rows.push({
       id,
       platform,
@@ -103,6 +107,7 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
       contactDisabled: r.contactDisabled === true,
       hasPassword: r.hasPassword === true,
       disabled: r.disabled === true,
+      ...(disabledAt === null ? {} : { disabledAt }),
       updatedAt: isoOf(r.updatedAt),
       codebases,
       authenticatorEmail: clean(r.authenticatorEmail, 200),

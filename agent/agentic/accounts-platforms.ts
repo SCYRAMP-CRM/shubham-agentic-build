@@ -20,8 +20,11 @@ const notConnected = (reason: NotConnected, detail?: string): PlatformsAnswer =>
 export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
   const open = o.open ?? openAccountsDb
   return {
-    /** The platform accounts `person` may see, each with the codebases it is connected to. */
-    async list(person: string): Promise<PlatformsAnswer> {
+    /**
+     * The platform accounts `person` may see, each with the codebases it is connected to. Slice D (disable, never delete): a switched-off (disabled) account is not in the list unless `disabled` is asked for (the page's "Show disabled"); with it
+     * every account comes back, a disabled one marked `disabled` and carrying `disabledAt`. An account an older version soft-deleted (deleted_at) is a disabled one too: nothing is converted, it simply reads as disabled.
+     */
+    async list(person: string, opts: { disabled?: boolean } = {}): Promise<PlatformsAnswer> {
       const read = readAccountsDb(o.dir)
       if (!read.ok) return read.bad === null ? notConnected('not-set-up') : notConnected('not-set-up', BAD_WORDS[read.bad])
       if (!PERSON.test(person)) throw apiError(400, 'The person asking is not a valid id.')
@@ -30,12 +33,18 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
         sql = await open(read)
         const got = await sql.begin(async tx => {
           await tx`select set_config('app.person_id', ${person}, true)`
-          const accounts: Row[] = await tx`
+          const accounts: Row[] = opts.disabled === true
+            ? await tx`
             select p.id, p.platform, p.account_type, p.account_type_disabled, p.name, p.sign_in_email, p.email_source_id, p.phone, p.contact_name, p.contact_linked, p.contact_disabled, p.has_password,
-              p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled, p.authenticator_email, p.authenticator_app, p.authenticator_note
+              p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled, p.authenticator_email, p.authenticator_app, p.authenticator_note, p.deleted_at, p.updated_at
             from sad.account_platform p left join sad.account_email e on e.source_id = p.email_source_id
-            where p.deleted_at is null
-            order by p.is_disabled, lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
+            order by (p.is_disabled or p.deleted_at is not null), lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
+            : await tx`
+            select p.id, p.platform, p.account_type, p.account_type_disabled, p.name, p.sign_in_email, p.email_source_id, p.phone, p.contact_name, p.contact_linked, p.contact_disabled, p.has_password,
+              p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled, p.authenticator_email, p.authenticator_app, p.authenticator_note, p.deleted_at, p.updated_at
+            from sad.account_platform p left join sad.account_email e on e.source_id = p.email_source_id
+            where p.deleted_at is null and p.is_disabled = false
+            order by lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
           const links: Row[] = await tx`
             select pc.platform_id, pc.parts, c.id as codebase_id, c.name as codebase_name
             from sad.account_platform_codebase pc left join sad.account_codebase c on coalesce(c.source_id, c.id) = pc.codebase_source_id
@@ -63,7 +72,8 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
             contactLinked: a.contact_linked === true,
             contactDisabled: a.contact_disabled === true,
             hasPassword: a.has_password === true,
-            disabled: a.is_disabled === true,
+            disabled: a.is_disabled === true || a.deleted_at != null,
+            disabledAt: a.deleted_at ?? a.updated_at,
             updatedAt: a.source_updated_at,
             codebases: linksBy.get(String(a.id)) ?? [],
             authenticatorEmail: a.authenticator_email,

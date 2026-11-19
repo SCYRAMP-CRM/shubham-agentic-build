@@ -1,0 +1,1 @@
+var e={talk:[`chat`],chat:[`talk`],bar:[`talk`]},t=new Map;function n(n){for(let r of e[n])for(let e of[...t.get(r)??[]])try{e(n)}catch{}}function r(e,n){let r=t.get(e);r||t.set(e,r=new Set);let i=r;return i.add(n),()=>void i.delete(n)}export{r as n,n as t};

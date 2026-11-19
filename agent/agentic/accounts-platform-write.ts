@@ -4,8 +4,8 @@ import { checkPlatformAdd, type PlatformAddInput } from '../../shared/platform-a
 import { checkAuthenticator, type AuthenticatorInput } from '../../shared/authenticator.ts'
 import { openAccountsDb, readAccountsDb, reasonOf, WORDS, type AccountsSql, type Row, type Tx } from './accounts-db.ts'
 
-// Accounts edit slice (Shubham's o45c0 rule): the platform accounts (the CRM's Accounts page) can be EDITED and soft-DELETED in the app, in the new database (sad) only.
-// Every app edit or delete sets app_touched_at; the copy job then leaves the row alone (accounts-codebase-import.ts). A copied row is editable here: the CRM is never written.
+// Accounts edit slice (Shubham's o45c0 rule): the platform accounts (the CRM's Accounts page) can be EDITED, DISABLED and enabled again in the app, in the new database (sad) only. DISABLE NEVER DELETE (slice D): there is no delete.
+// Every app edit, disable or enable sets app_touched_at; the copy job then leaves the row alone (accounts-codebase-import.ts). A copied row is editable here: the CRM is never written.
 // No password here: the app keeps only whether a platform account has one (has_password), never the password.
 
 export interface AccountsPlatformWriteOptions {
@@ -16,7 +16,7 @@ export interface AccountsPlatformWriteOptions {
 
 const PERSON = /^[A-Za-z0-9._:@-]{1,80}$/
 const UUID = /^[0-9a-f-]{36}$/i
-const NO_ROW = 'That account is not there any more (it may have been deleted).'
+const NO_ROW = 'That account is not there any more.'
 
 function need<T>(c: { ok: true; value: T } | { ok: false; message: string }): T {
   if (!c.ok) throw apiError(400, c.message)
@@ -91,12 +91,23 @@ export function createAccountsPlatformWrite(o: AccountsPlatformWriteOptions) {
       })
     },
 
-    /** Soft delete: deleted_at is set and the row leaves the list; nothing is removed. The copy job leaves it alone. */
-    async remove(person: string, id: string): Promise<{ ok: true }> {
+    /** Disable (slice D): the account is switched off with the marker this table already has (is_disabled: the editor's "Switched off" toggle is the same state) and leaves the list unless "Show disabled" asks. The copy job leaves it alone. */
+    async disable(person: string, id: string): Promise<{ ok: true }> {
       if (!UUID.test(id)) throw apiError(400, 'That account id is not valid.')
       return run(person, async tx => {
         await liveOrNotFound(tx, id)
-        await tx`update sad.account_platform set deleted_at = now(), app_touched_at = now(), updated_at = now() where id = ${id} and deleted_at is null`
+        await tx`update sad.account_platform set is_disabled = true, app_touched_at = now(), updated_at = now() where id = ${id} and deleted_at is null`
+        return { ok: true as const }
+      })
+    },
+
+    /** Enable: switched on again. An account an older version soft-deleted is a disabled one too: enabling it clears BOTH marks, so it is back exactly as it was. */
+    async enable(person: string, id: string): Promise<{ ok: true }> {
+      if (!UUID.test(id)) throw apiError(400, 'That account id is not valid.')
+      return run(person, async tx => {
+        const rows: Row[] = await tx`select id from sad.account_platform where id = ${id}`
+        if (rows.length === 0) throw apiError(404, NO_ROW)
+        await tx`update sad.account_platform set is_disabled = false, deleted_at = null, app_touched_at = now(), updated_at = now() where id = ${id}`
         return { ok: true as const }
       })
     },

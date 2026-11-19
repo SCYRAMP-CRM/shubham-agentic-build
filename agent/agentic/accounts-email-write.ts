@@ -5,8 +5,8 @@ import { decryptPassword, encryptPassword, passwordMac } from './accounts-crypto
 import { openAccountsDb, readAccountsDb, readAccountsKey, reasonOf, WORDS, type AccountsSql, type Row, type Tx } from './accounts-db.ts'
 
 // Order ofd53 (slice 1 of o45c0): the email edit modal's writes, through the app's own agent routes only, into the new Supabase project (schema sad,
-// db/accounts/0007_email_write.sql). Owner only: the person the agent says is asking, checked by the database's rules as well. SOFT DELETE: a delete sets
-// deleted_at; nothing is removed. A password is sealed here (the same code and key as the Accounts passwords) and is never read back: the login has no
+// db/accounts/0007_email_write.sql). Owner only: the person the agent says is asking, checked by the database's rules as well. DISABLE, NEVER DELETE (slice D): an account is
+// disabled (is_disabled) and enabled again; nothing is removed. A password is sealed here (the same code and key as the Accounts passwords) and is never read back: the login has no
 // right to read the sealed columns. 
 export interface AccountsEmailWriteOptions {
   dir: string
@@ -16,7 +16,7 @@ export interface AccountsEmailWriteOptions {
 
 const PERSON = /^[A-Za-z0-9._:@-]{1,80}$/
 const UUID = /^[0-9a-f-]{36}$/i
-const NO_ROW = 'That email account is not there any more (it may have been deleted).'
+const NO_ROW = 'That email account is not there any more.'
 const KEY_MISSING = 'The key file for the Accounts passwords is not on this PC, so a password cannot be saved. Nothing was changed.'
 
 function need<T>(c: Checked<T>): T {
@@ -102,7 +102,6 @@ export function createAccountsEmailWrite(o: AccountsEmailWriteOptions) {
       })
     },
 
-    /** Soft delete: deleted_at is set; the row stays in the database and leaves the list. */
     /**
    * Reveal: the stored password of one of the owner's rows, decrypted HERE (the browser gets it for this reveal only). The reveal is logged: who, which row, when.
    * The password itself is never logged.
@@ -126,11 +125,26 @@ export function createAccountsEmailWrite(o: AccountsEmailWriteOptions) {
     return out
   },
 
-  async remove(person: string, id: string): Promise<{ ok: true }> {
+  /**
+   * Disable (slice D, DISABLE NEVER DELETE): the account is switched off, with the one marker this table already has (is_disabled: the "Switched off" toggle of the edit window is the same state). It leaves the lists unless
+   * "Show disabled" asks for it. Nothing is removed and nothing is stamped deleted.
+   */
+  async disable(person: string, id: string): Promise<{ ok: true }> {
       if (!UUID.test(id)) throw apiError(400, 'That email account id is not valid.')
       return run(person, async tx => {
         await ownedLive(tx, id)
-        await tx`update sad.account_email set deleted_at = now(), app_touched_at = now(), updated_at = now() where id = ${id} and deleted_at is null`
+        await tx`update sad.account_email set is_disabled = true, app_touched_at = now(), updated_at = now() where id = ${id} and deleted_at is null`
+        return { ok: true as const }
+      })
+    },
+
+    /** Enable: switched on again. An account an older version soft-deleted is a disabled one too: enabling it clears BOTH marks, so it is back exactly as it was. */
+    async enable(person: string, id: string): Promise<{ ok: true }> {
+      if (!UUID.test(id)) throw apiError(400, 'That email account id is not valid.')
+      return run(person, async tx => {
+        const rows: Row[] = await tx`select source from sad.account_email where id = ${id}`
+        if (rows.length === 0) throw apiError(404, NO_ROW)
+        await tx`update sad.account_email set is_disabled = false, deleted_at = null, app_touched_at = now(), updated_at = now() where id = ${id}`
         return { ok: true as const }
       })
     },

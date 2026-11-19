@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs'
 import os from 'node:os'
 import { writeAtomic } from '../config.ts'
+import { cleanActor, type ChatActor } from './chat-presence.ts'
 
 // F-078: a small log of every chat that started or stopped, and why, so the pattern can be seen (and told
 // to Shubham in the morning): chat-events.jsonl in the agentic folder, one JSON line each, newest last.
@@ -24,6 +25,12 @@ export interface ChatEvent {
   ranMin?: number
   /** Free RAM on the PC at that moment, in MB: a pattern of low memory shows here. */
   freeMemMB: number
+  /**
+   * start: WHO asked for it, when the asker said (chat-presence.ts: a closed value built from an identity the app holds, never typed text): a person, the open app, a PC, a
+   * chat's own tool, or the app itself. Absent means "not said here", NOT "nobody": some internal restarts do not carry it, and a start on a member PC names the PC that
+   * asked. The `cause` still says why (heartbeat, watchdog); `by` says who.
+   */
+  by?: ChatActor
 }
 
 export const MAX_BYTES = 400_000
@@ -55,6 +62,8 @@ export function createChatLog(file: string, deps: { now?: () => number; freeMemM
     append(e) {
       try {
         const line: ChatEvent = { at: new Date(now()).toISOString(), ...e, freeMemMB: freeMemMB() }
+        // Only the closed shape of a `by` is stored: anything that does not fit is `unattributed`, never copied.
+        if (line.by !== undefined) line.by = cleanActor(line.by)
         appendFileSync(file, `${JSON.stringify(line)}\n`)
         trim()
       } catch {

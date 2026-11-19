@@ -96,6 +96,12 @@ export interface ChatMenu {
   hint: string
   /** Boxes to tick, not one to pick: answered in the terminal. */
   multi: boolean
+  /**
+   * Order o5d4e: how an option is chosen. Absent: by its number (a digit typed, as always). 'arrows': claude drew its options with no numbers
+   * (the "❯ No, exit / Yes, add it" selects), so `n` is the option's place (1 is the first one drawn) and it is chosen by moving the pointer
+   * with the arrow keys and pressing Enter, which only the guarded answer does (agent/agentic/arrow-select.ts), after checking where the pointer stands.
+   */
+  keys?: 'arrows'
 }
 
 /** What claude says it is doing while it works ("Pollinating… (5s · ↓ 167 tokens)"). */
