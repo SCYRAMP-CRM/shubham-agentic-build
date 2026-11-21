@@ -171,6 +171,13 @@ export interface AgentOwnership {
 export const SBSKRRT_ID = '019d2ff6-1b5c-7aed-a08c-474497789b8f'
 
 /**
+ * Whether this person is the FIRST owner, Shubham, by his id (no person: the open app, which is his). A second owner (agent/auth/owners.ts, Shubham's orders o4e4e and o2f32) is an administrator
+ * (`canSeeAll`) but some doors stay Shubham's BY HIS ID on the agent: Quick and live talk, his phone (pairing, phone control, the phone tools), his CRM sign-in, Update and Publish. The pages use this
+ * to stop OFFERING what the agent would refuse; the agent is the gate. An object with no id at all (a mock, a test's) is not a second owner.
+ */
+export const isFirstOwner = (person: { id?: string } | null | undefined): boolean => !person || person.id === undefined || person.id === SBSKRRT_ID
+
+/**
  * What `person` may do with a chat owned by `owner` and shared as `sharedWith`: null = may not even see it.
  * `person` null is the open app (nobody has to sign in): everything. `admins` are the CRM ids that see all.
  * The ONE place this is decided (the agent and a page's mock both call it).

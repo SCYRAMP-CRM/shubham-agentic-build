@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
   FEATURES,
@@ -19,6 +19,7 @@ import {
 import type { AuthUser } from '../../shared/auth.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
+import { appendAccessLog } from './access-log.ts'
 import { authError, type Caller } from './types.ts'
 
 // Order o9465: Settings › Access, the agent's side (shared/access.ts has the list of features and their routes). ONE check for every route and
@@ -72,7 +73,13 @@ export interface FeatureAccess {
 }
 
 const LOG_KEEP = 300
-const LOG_MAX_BYTES = 4 * 1024 * 1024
+
+/** A line of the log that is a change of a feature's choice (what Settings › Access shows), not one of the owners file's. */
+const isChange = (v: unknown): v is AccessChange => {
+  if (!v || typeof v !== 'object') return false
+  const r = v as Record<string, unknown>
+  return typeof r.feature === 'string' && !!r.from && typeof r.from === 'object' && !!r.to && typeof r.to === 'object' && typeof r.at === 'string' && !!r.by && typeof r.by === 'object'
+}
 
 export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
   const file = path.join(o.dir, 'access.json')
@@ -159,16 +166,21 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     } catch {
       return []
     }
+    // Newest first: from the end, the lines that are changes of a choice, until LOG_KEEP of them. The owners file writes its own lines into this log (agent/auth/owners.ts): they say who is an owner, not what a
+    // feature's choice was, and the page's history line reads a feature and two choices. They are left out BEFORE the count, so a flapping owners file cannot push real changes out of the window.
     const out: AccessChange[] = []
-    for (const line of text.split('\n').slice(-LOG_KEEP)) {
+    const lines = text.split('\n')
+    for (let i = lines.length - 1; i >= 0 && out.length < LOG_KEEP; i--) {
+      const line = lines[i]!
       if (!line.trim()) continue
       try {
-        out.push(JSON.parse(line) as AccessChange)
+        const row: unknown = JSON.parse(line)
+        if (isChange(row)) out.push(row)
       } catch {
         // A half-written last line (a crash while writing): left out.
       }
     }
-    return out.reverse()
+    return out
   }
 
   function view(c: Caller): AccessView {
@@ -211,21 +223,7 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
 
   /** One change into access-log.jsonl (a log grown past its size starts again beside the old one). A failure to log is said, never thrown: the change itself already stands. */
   function logChange(change: AccessChange) {
-    try {
-      mkdirSync(o.dir, { recursive: true })
-      // A log grown past its size starts again beside the old one (kept as access-log.old.jsonl).
-      try {
-        if (statSync(logFile).size > LOG_MAX_BYTES) {
-          writeAtomic(path.join(o.dir, 'access-log.old.jsonl'), readFileSync(logFile, 'utf8'))
-          writeAtomic(logFile, '')
-        }
-      } catch {
-        // No log yet.
-      }
-      appendFileSync(logFile, `${JSON.stringify(change)}\n`, { mode: 0o600 })
-    } catch (e) {
-      o.log?.warn(`the access change could not be logged: ${e instanceof Error ? e.message : String(e)}`)
-    }
+    appendAccessLog(o.dir, change, message => o.log?.warn(message))
   }
 
   function seed(feature: string, choice: unknown, by: { id: string; name: string }): 'seeded' | 'exists' | 'refused' {

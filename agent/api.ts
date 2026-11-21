@@ -367,6 +367,12 @@ function screenPassword(body: unknown): ScreenPasswordRequest {
 }
 
 // A login and password, used once for the CRM's sign-in and never kept or logged here.
+/**
+ * The routes that write or delete the PC's CRM session (crm-session.json) and switch the Claude subscription its chats run on (main.ts claudeSignIn, claudeSignOut, claudeCheck with `replace`, claudeSwitch*): the
+ * first owner's BY HIS ID, even when a second owner is an administrator (Shubham's orders o4e4e and o2f32). Asked in gate(), POST only.
+ */
+const FIRST_OWNER_CORE_ROUTES = /^\/claude\/(sign-in|sign-out|check|switch|switch\/(preview|refresh|auto))$/
+
 function claudeSignIn(body: unknown): ClaudeSignInRequest {
   if (!isObject(body) || typeof body.login !== 'string' || typeof body.password !== 'string') throw apiError(400, 'Expected {login, password}')
   if (body.login.length > 320 || body.password.length > 1024) throw apiError(400, 'That login or password is too long')
@@ -652,6 +658,12 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (ownerOnly && c.person && !auth.isAdmin(c)) {
       auth.deny(c, 403, 'admin-only', route)
       throw authError(403, 'This is for the owner of this app.', 'admin-only')
+    }
+    // A second owner (the owners file, Shubham's orders o4e4e and o2f32) is an administrator and passes the wall above, but the PC's CRM sign-in and the Claude subscription of its chats stay the FIRST owner's
+    // BY HIS ID: signing the PC in as himself, or out, would turn every CRM call of Shubham's into the second owner's and move the subscription. The machine and the open app are the owner (auth.isFirstOwner).
+    if (c.person && req.method === 'POST' && FIRST_OWNER_CORE_ROUTES.test(path.slice(AGENT_API_PREFIX.length)) && !auth.isFirstOwner(c)) {
+      auth.deny(c, 403, 'admin-only', route)
+      throw authError(403, "This is for the first owner of this app only: it is the PC's CRM sign-in and the Claude subscription its chats run on.", 'admin-only')
     }
   }
 

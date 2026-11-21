@@ -1,6 +1,7 @@
 ﻿import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
+import { SBSKRRT_ID } from '../../shared/auth.ts'
 import type { Caller } from '../auth/types.ts'
 import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmRemovedProject, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
@@ -202,7 +203,8 @@ export function crmFilesMount(pcSvc: CrmFilesService, uploads?: CrmUploads, sync
           if (!allowed.includes(method)) return send(res, 405, { error: `${method} is not allowed on ${name}`, code: 'failed' satisfies CrmFilesErrorCode })
           // Order oc186: the owner (and the PC's own program) is the PC's files; another signed-in person is their own CRM's, and only for the names in STAFF_NAMES.
           let svc = pcSvc
-          if (caller?.person && caller.person.canSeeAll !== true) {
+          // A second owner (the owners file, order o2f32) is an administrator but the PC's CRM files run on SHUBHAM'S CRM sign-in: by his id, so a second owner goes the other person's way, on his OWN CRM session.
+          if (caller?.person && (caller.person.canSeeAll !== true || caller.person.id !== SBSKRRT_ID)) {
             if (!STAFF_NAMES.has(name)) return send(res, 403, { error: 'This is for the owner of this app.', code: 'admin-only' })
             const own = staff?.serviceFor(caller, req.headers) ?? null
             if (!own) return send(res, 401, { error: CRM_FILES_REASONS.signedOut, code: 'crm-signin' satisfies CrmFilesErrorCode })

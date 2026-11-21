@@ -1411,7 +1411,7 @@ if (import.meta.main) {
       supervised: process.env.SAD_SUPERVISED === '1',
       // F-173a: F-119's rule (mayPublish), which Publish no longer follows (obcbd narrowed Publish to the owner): from a page, only a signed-in administrator; a program on this PC with the machine token and no page headers is as before.
       authorizeUpdate: r => {
-        if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only an administrator, signed in, presses Update from a page.', 'admin-only')
+        if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only the first owner of this app, signed in, presses Update from a page.', 'admin-only')
       },
       onUpdateCancel: () => updateCoordinator.current?.cancel(),
     })

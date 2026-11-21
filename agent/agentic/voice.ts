@@ -93,6 +93,8 @@ export interface VoiceDeps {
    * nobody signed in on. Throws otherwise; says who, for the log. Without it the switch cannot be turned on (off always can).
    */
   controlProof?(body: unknown, r?: { caller?: Caller; headers: IncomingHttpHeaders }): string
+  /** Unpairing a phone (POST /devices/revoke) is the first owner's by id: throws for anyone else (a second owner is an administrator). Left out: the owner wall alone, as before. */
+  revokeGate?(r: MountRequest): void
   /** Order oae15: the switch changed (the approvals log says so). */
   controlSwitched?(on: boolean, by: string): void
   /** Order oae15: this PC's place in the team. The phone is reached through the hub, so a member PC neither switches nor stops it. */
@@ -514,6 +516,8 @@ export function createVoice(deps: VoiceDeps): Voice {
       }
       if (method === 'GET' && rest === '/devices') return { devices: voice.devices() }
       if (method === 'POST' && rest === '/devices/revoke') {
+        // Unpairing Shubham's phone is the first owner's by id (his orders o4e4e and o2f32): a second owner is an administrator and passes the owner wall, so this asks (index.ts passes it).
+        deps.revokeGate?.(r)
         const id = (r.body as { id?: unknown } | null)?.id
         if (typeof id !== 'string') throw apiError(400, 'Expected {id}')
         const before = devices.length

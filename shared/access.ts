@@ -84,7 +84,7 @@ export const FEATURES: readonly Feature[] = [
   { key: 'goals', group: 'pages', label: 'Goals', blurb: 'Their own CRM goals and today’s tasks, on their own CRM sign-in (the CRM decides what they see).', pages: ['/goals'] },
   { key: 'crm', group: 'pages', label: 'CRM', blurb: 'The CRM in the app, full window, on their own CRM sign-in (the CRM decides what they see).', pages: ['/crm'] },
   { key: 'accounts', group: 'pages', label: 'Accounts', blurb: 'Email accounts, platforms and codebases.', pages: ['/accounts'], locked: 'It holds your passwords and keys.' },
-  { key: 'build', group: 'pages', label: 'Build', blurb: 'Which build runs, updates and publishing.', pages: ['/build'], locked: 'Publishing and updating the app is yours.' },
+  { key: 'build', group: 'pages', label: 'Build', blurb: 'Which build runs, updates and publishing.', pages: ['/build'], locked: 'Publishing and updating the app is Shubham\'s alone, by his own id.' },
   { key: 'dependencies', group: 'pages', label: 'Dependencies', blurb: 'What Codex in Claude needs on each PC.', pages: ['/dependencies'], locked: 'It changes what is installed on your PCs.' },
   { key: 'mcps', group: 'pages', label: 'MCPs', blurb: 'The chats’ tools, across engines.', pages: ['/mcps'], locked: 'It installs tools for the chats on your PCs.' },
   { key: 'setup', group: 'pages', label: 'Setup', blurb: 'A new PC, step by step.', pages: ['/setup'], locked: 'It joins PCs to your app.' },
@@ -101,7 +101,7 @@ export const FEATURES: readonly Feature[] = [
   { key: 'pc-screen', group: 'pc-control', label: 'Screen', blurb: 'Controlling a PC’s screen.', needs: 'pc-control', locked: 'It controls your PCs’ screens and keyboards.' },
   // Order o226e: a PC's own Linux desktop (noVNC), its own row, locked like Screen.
   { key: 'pc-desktop', group: 'pc-control', label: 'XFCE', blurb: 'A Linux PC’s own desktop (XFCE through noVNC), where it has one.', needs: 'pc-control', locked: 'It controls your PCs’ desktops and keyboards.' },
-  { key: 'pc-updates', group: 'pc-control', label: 'Updates', blurb: 'Updating each PC.', needs: 'pc-control', locked: 'It updates and restarts your PCs.' },
+  { key: 'pc-updates', group: 'pc-control', label: 'Updates', blurb: 'Updating each PC.', needs: 'pc-control', locked: 'It updates and restarts Shubham\'s PCs, and is his alone, by his own id.' },
   { key: 'pc-ports', group: 'pc-control', label: 'Ports', blurb: 'Each PC’s ports and Tailscale addresses, read only.', needs: 'pc-control' },
   // Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): chosen per PC.
   {
@@ -122,7 +122,7 @@ export const FEATURES: readonly Feature[] = [
   { key: 'assistant-send', group: 'assistant', label: 'Their Assistant can talk to chats', blurb: `Their own Assistant may send a message, without a tap, to a chat they own or that you shared with them as "Can type". Not a chat on the Server while "Not chats on the Server" is on (Settings > Access > Pages > Agentic Platform > Who may type in chats). It never starts or stops chats.\n\n${STAFF_SEND_LIMIT}`, needs: 'assistant' },
   { key: 'voice', group: 'assistant', label: 'Voice typing', blurb: 'Speaking into a chat’s message box (the PC’s speech engine).' },
   // F-267 (order o088b): the Quick page is live talk on a page of its own, so it is this feature's page: locked, the owner's only.
-  { key: 'talk', group: 'assistant', pages: [QUICK_ROUTE], label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to your own Assistant and its orders.' },
+  { key: 'talk', group: 'assistant', pages: [QUICK_ROUTE], label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to Shubham\'s own Assistant and its orders, and is his alone, by his own id.' },
   // Settings.
   { key: 'settings', group: 'settings', label: 'Settings › Look and Chats', blurb: 'Their own light or dark, palette, page picker and chat choices (kept in their browser).', pages: ['/settings'] },
   { key: 'settings-admin', group: 'settings', label: 'Settings › Devices, Ports, Security', blurb: 'This PC’s devices, ports, sign-in level and updates.', pages: ['/devices', '/ports'], locked: 'They are this PC’s own settings.' },

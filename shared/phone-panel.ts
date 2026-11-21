@@ -80,6 +80,13 @@ export const HELLO_GRACE_MS = 3000
 /** How much of the grace is left `sinceLoadMs` after the page loaded (0 when it is over). */
 export const graceLeft = (sinceLoadMs: number): number => Math.max(0, HELLO_GRACE_MS - Math.max(0, sinceLoadMs))
 
+/**
+ * F-305 (Agent 14's review of the route, D): whether Talk may start by itself on load. `talk=1` is only an address, and a same-origin link can open it in the app's MAIN WebView, where the microphone is already granted and no
+ * panel was opened: Talk then would start listening without anyone having asked. The page the app's panel opened is the only one the app gives window.SadApp.panel (mobile PageBridge: the panel has its own start script with the
+ * panel channel, the app's own has none), so Talk starts on load only when the address asked for it AND that channel is there. Read again at each look (the app's hello comes a moment after the page loads).
+ */
+export const talkMayStart = (wanted: boolean, app: unknown): boolean => wanted && panelChannel(app) !== null
+
 /** Sends one message over the channel; false when there is none or it threw (the caller then does its fallback). */
 export function sendPanel(app: unknown, m: PanelMessage): boolean {
   const c = panelChannel(app)

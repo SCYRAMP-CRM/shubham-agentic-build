@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
+import path from 'node:path'
 import {
   AUTH_COOKIE,
   AUTH_IDLE_HOURS,
@@ -21,6 +22,7 @@ import { apiError } from '../api.ts'
 import { CrmError, listMembers, signIn as crmSignIn, type CrmMember, type CrmSession } from '../claude/crm.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
+import { createOwners, ownersFileBeside } from './owners.ts'
 import { authError, type Caller } from './types.ts'
 
 // F-118: who is using the app (agent/SPEC.md › Signing in). Each person signs in in the page with
@@ -119,6 +121,8 @@ export interface AuthOptions {
   file: string
   /** Break-glass: while this file exists the sign-in level is 'off' (someone at the PC made it). */
   breakGlassFile: string
+  /** owners.json, the extra owners (read only, never written by this program). Left out: beside `file`. */
+  ownersFile?: string
   crmUrl: string
   env?: NodeJS.ProcessEnv
   now?: () => number
@@ -153,6 +157,11 @@ export interface Auth {
   /** Whether the person may see everything and use the PC's own pages. A caller with no person in an open app is. */
   isAdmin(c: Caller): boolean
   admins(): readonly string[]
+  /**
+   * Shubham's orders o4e4e and o2f32: whether this caller is the FIRST owner by id (the CRM user sbskrrt), or acts as the owner with no person (the PC's own program, the open app). A second owner (owners.json) is
+   * an administrator (`isAdmin`) and is NOT this. The one copy of the test for the core API (api.ts gate); the agentic mount's isFirstOwner is the same rule through access.ownerOf (pinned).
+   */
+  isFirstOwner(c: Caller): boolean
   /** The paired phone app keeps its device key instead of a sign-in. */
   phoneExempt(): boolean
   status(c: Caller): AuthStatus
@@ -258,7 +267,22 @@ export function createAuth(o: AuthOptions): Auth {
     return null
   }
 
-  const isAdminId = (id: string) => f.admins.includes(id)
+  // A second owner (Shubham's order o4e4e): the extra owners owners.json lists, which this program only READS (agent/auth/owners.ts). They are owners wherever auth.json's
+  // admins are: isAdminId (so canSeeAll, isAdmin, the feature gate, the chat rights through admins()). What stays the owner's own BY ID is not decided here: canPublish below,
+  // publish-policy.ts, pc-build.ts, the phone's pairing. A person removed from the file has their open sockets ended, so they come back as who they are now.
+  const owners = createOwners({
+    file: o.ownersFile ?? ownersFileBeside(o.file),
+    logDir: path.dirname(o.file),
+    now,
+    ...(log ? { log } : {}),
+    onChange: change => {
+      const gone = new Set(change.removed.map(x => x.id))
+      if (gone.size) endWatchers(w => w.c.person !== null && gone.has(w.c.person.id), 'revoked')
+    },
+  })
+  const isAdminId = (id: string) => f.admins.includes(id) || owners.has(id)
+  /** The owners: auth.json's admins, then the extra ones owners.json lists (never twice). */
+  const adminIds = (): readonly string[] => [...f.admins, ...owners.list().map(x => x.id).filter(id => !f.admins.includes(id))]
   const personOf = (u: AuthUser): AuthPerson => ({ id: u.id, username: u.username, name: u.name, canSeeAll: isAdminId(u.id) })
 
   /** Ends the rows that have passed their time, telling their sockets. */
@@ -524,7 +548,8 @@ export function createAuth(o: AuthOptions): Auth {
     require,
     needsSignIn,
     isAdmin: admin,
-    admins: () => f.admins,
+    admins: adminIds,
+    isFirstOwner: c => !c.person || c.person.id.toLowerCase() === SBSKRRT_ID,
     phoneExempt: () => f.phoneExempt,
     status,
     signIn,

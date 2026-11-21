@@ -1,6 +1,6 @@
 import { pageFeature } from './access.ts'
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
-import type { AuthPerson, ChatAccess, ChatCan, ChatOwner } from './auth.ts'
+import { isFirstOwner, type AuthPerson, type ChatAccess, type ChatCan, type ChatOwner } from './auth.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 import { QUICK_ROUTE } from './quick-page.ts'
 
@@ -114,12 +114,23 @@ export function adminOnlyPath(pathname: string): boolean {
 }
 
 /**
+ * Shubham's orders o4e4e and o2f32: the pages whose routes the agent keeps for the FIRST owner BY HIS ID, even when a second owner (owners.json) is an administrator: Quick (live talk: appOwnerOnly).
+ * A second owner is not offered them (the menu, the page picker, the search bar and a link all go through mayOpen); everything else of an administrator's is as it was.
+ */
+const FIRST_OWNER_PATHS = [QUICK_ROUTE]
+export function firstOwnerPath(pathname: string): boolean {
+  return FIRST_OWNER_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
+}
+
+/**
  * Whether this page may be shown to this person: everyone while the app is open or signed out of nothing, else the admin's pages only to the admin.
  * Order o9465: when the agent says which features are open to this person (Settings › Access; AuthStatus.features), a page shows only when its
  * feature is one of them, and a page that is no feature's is the owner's (fail closed).
  */
-export function mayOpen(pathname: string, person: Pick<AuthPerson, 'canSeeAll'> | null, features?: readonly string[] | null): boolean {
-  if (!person || person.canSeeAll) return true
+export function mayOpen(pathname: string, person: (Pick<AuthPerson, 'canSeeAll'> & { id?: string }) | null, features?: readonly string[] | null): boolean {
+  if (!person) return true
+  // Shubham's order o2f32: a second owner (an administrator) is not offered the pages whose routes stay Shubham's BY HIS ID (Quick: live talk).
+  if (person.canSeeAll) return !(firstOwnerPath(pathname) && !isFirstOwner(person))
   if (features) {
     const f = pageFeature(pathname)
     return f !== null && features.includes(f.key)

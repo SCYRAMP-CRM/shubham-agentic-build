@@ -1,4 +1,4 @@
-import type { AuthErrorCode, AuthPerson } from '../../shared/auth.ts'
+import { SBSKRRT_ID, type AuthErrorCode, type AuthPerson } from '../../shared/auth.ts'
 
 // F-118: the two things api.ts and the modules share without importing each other as values.
 
@@ -38,12 +38,13 @@ export function isPageRequest(headers: Record<string, string | string[] | undefi
  * F-119: whether this request may press Update (F-173a: main.ts wires it for POST /update and /update-cancel). It was Publish's
  * rule too until obcbd narrowed Publish to the owner signed in or the machine-token channel (publish-policy.ts publishActor); the
  * name is older than that. A PAGE (a browser: it sends an Origin or fetch metadata, or the page server tagged it as from the
- * tailnet) may only when it is signed in as an admin (sbskrrt): "unsigned, so the open app" does not count, since every tailnet
+ * tailnet) may only when it is signed in as Shubham, the first owner, BY HIS ID (a second owner does not: order o2f32): "unsigned, so the open app" does not count, since every tailnet
  * device can open the Server's page. A program on the Server calling with the machine token and no page headers (build-api.mjs)
  * is not a page and keeps working.
  */
 export function mayPublish(headers: Record<string, string | string[] | undefined>, caller: Caller | undefined): boolean {
-  return !isPageRequest(headers) || caller?.person?.canSeeAll === true
+  // Shubham's order o2f32: Update is the first owner's BY HIS ID (a second owner listed in the owners file, or any other administrator, does not press it from a page: canSeeAll is no longer the test).
+  return !isPageRequest(headers) || caller?.person?.id === SBSKRRT_ID
 }
 
 /** An error the API answers with this status, message and the contract's code. */

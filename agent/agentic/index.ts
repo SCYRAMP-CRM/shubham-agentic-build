@@ -368,6 +368,29 @@ const ADMIN_TOOLS = new Set([
   'browser_read',
 ])
 
+/**
+ * A second owner (the owners file, Shubham's orders o4e4e and o2f32) is an administrator: he gets what ADMIN_TOOLS holds, EXCEPT these, which stay SHUBHAM'S BY HIS ID (a chat whose owner is anyone else is refused, before
+ * anything runs): his phone (phone_screen, phone_control, phone_update: it is tied to HIS paired phone) and his CRM sign-in (the crm_* tools, crm_files, show_crm_file: they run on this PC's crm-session.json, so they would
+ * be Shubham acting in the CRM). A second owner's own CRM work is his own sign-in's, as for any person.
+ */
+const FIRST_OWNER_TOOLS = new Set([
+  'phone_screen',
+  'phone_control',
+  'phone_update',
+  'crm_whoami',
+  'crm_members',
+  'crm_goals',
+  'crm_goal_add',
+  'crm_goal_update',
+  'crm_scopes',
+  'crm_board',
+  'crm_catalog',
+  'crm_query',
+  'crm_write',
+  'crm_files',
+  'show_crm_file',
+])
+
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
 /**
  * Order oae15 (review): the first string, at any depth, that would climb out of a URL path where page code puts it: a ".." segment between
@@ -5185,7 +5208,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return by
     },
     // Order oae15: phone control's own switch: ON needs a signed-in CRM administrator (never a chat's key, never a page nobody signed in on).
-    controlProof: (_body, r) => describeHuman(requireCrmHuman(o.auth, r, true)),
+    controlProof: (_body, r) => {
+      const human = requireCrmHuman(o.auth, r, true)
+      // His phone: a second owner may not switch its control ON (the switch off and Stop always work, for any owner).
+      firstOwnerOnly(human, 'POST /voice/control-switch', 'Switching phone control on is for the first owner of this app only: it is tied to his paired phone.')
+      return describeHuman(human)
+    },
+    // Unpairing a phone is Shubham's by id: a second owner is an administrator and would pass the owner wall alone.
+    revokeGate: r => firstOwnerOnly(callerOf(r), 'POST /voice/devices/revoke', "Unpairing the phone is for the first owner of this app only: it is his paired phone."),
     controlSwitched: (on, by) => deviceLog(on ? 'Phone control switched ON (the Assistant and the Mobile chat may use the phone through Chris)' : 'Phone control switched off', by),
     mode: () => mode(),
     feed: send => {
@@ -5626,9 +5656,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * app and the PC's own program are the owner (access.ownerOf). The same 403 an administrator-only route gives a person who is not one.
    */
   function appOwnerOnly(c: Caller, where: string) {
-    if (access.ownerOf(c).id.toLowerCase() === SBSKRRT_OWNER.id) return
+    firstOwnerOnly(c, where)
+  }
+  /**
+   * A second owner (the owners file, Shubham's orders o4e4e and o2f32) is an administrator, but these stay SHUBHAM'S BY HIS ID: Quick and live talk, his phone (its pair code and its control switch ON, and the phone
+   * tools), his CRM sign-in (the crm_* tools, the CRM page's proxy, the CRM files on this PC's session), Update and Publish. This is the one test for all of them (the app owner by id; the open app and the PC's own
+   * program are the owner, access.ownerOf), and the same 403 an administrator-only route gives a person who is not one.
+   */
+  function isFirstOwner(c: Caller): boolean {
+    return access.ownerOf(c).id.toLowerCase() === SBSKRRT_OWNER.id
+  }
+  function firstOwnerOnly(c: Caller, where: string, words = 'This is for the owner of this app.') {
+    if (isFirstOwner(c)) return
     o.auth?.deny(c, 403, 'admin-only', where)
-    throw authError(403, 'This is for the owner of this app.', 'admin-only')
+    throw authError(403, words, 'admin-only')
   }
 
   /**
@@ -6086,6 +6127,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (ADMIN_TOOLS.has(name) && !access.isAdmin(me)) {
       o.auth?.deny(me, 403, 'admin-only', toolWhere, sid)
       throw authError(403, 'That tool is for the owner of this app.', 'admin-only')
+    }
+    // A second owner is an administrator but not Shubham: his phone and his CRM sign-in are tools of Shubham's own chats only (by id, as Quick is).
+    if (FIRST_OWNER_TOOLS.has(name) && !isFirstOwner(me)) {
+      o.auth?.deny(me, 403, 'admin-only', toolWhere, sid)
+      throw authError(403, "That tool is for the first owner of this app only: it uses his phone and his CRM sign-in.", 'admin-only')
     }
     /** The agent that holds chat `sessionId`, and whether `me` has this much on it (a chat on no floor is the owner of the app's). */
     const mayOn = (sessionId: unknown, need: Need) => {
@@ -7328,7 +7374,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   function humanProof(kind: SignedKind, _fields: (string | number | boolean)[], _legacySignature: unknown, r?: ProofRequest): string {
     // F158: never inspect old device keys, settings, signatures or unsigned flags.
-    return describeHuman(requireCrmHuman(o.auth, r, ['autoupdate', 'pair', 'wa-send'].includes(kind)))
+    const caller = requireCrmHuman(o.auth, r, ['autoupdate', 'pair', 'wa-send'].includes(kind))
+    // A second owner may not pair a phone or switch the app's updates: the phone is tied to Shubham's own paired phone, and Update is his (his orders o4e4e, o2f32).
+    if (kind === 'pair' || kind === 'autoupdate') firstOwnerOnly(caller, `proof ${kind}`, "Pairing the phone and the app's updates are for the first owner of this app only.")
+    return describeHuman(caller)
   }
   function humanTarget(r: ProofRequest | undefined, agent: FloorAgent, need: 'type' | 'owner' = 'type', decisions = false) {
     const caller = requireCrmHuman(o.auth, r)
@@ -7351,6 +7400,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on}')
     // F-173a: the choice is recorded with WHO made it (an administrator's current CRM session, never a chat or a machine) and when.
     const caller = requireCrmHuman(o.auth, r, true)
+    // Update is Shubham's by his id (his order o2f32): a second owner does not switch the automatic update either.
+    firstOwnerOnly(caller, 'POST /auto-update', "The app's updates are for the first owner of this app only.")
     const who = describeHuman(caller)
     const st = autoUpdate.set(raw.on, `${who} via ${by}`, caller.person?.id ?? null)
     deviceLog(`Automatic updates when quiet switched ${raw.on ? 'ON' : 'off'}`, `${who} via ${by}`)
@@ -8713,7 +8764,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
     ],
     // Whether the CRM is signed in on THIS PC (the session is per PC, as Devices signs in): never the session itself.
-    ['GET', /^\/crm\/session$/, (): CrmSessionInfo => crmProxy.session(), 'local'],
+    // Shubham's order o2f32: it names who is signed in to the CRM on this PC (his login), so a second owner does not read it (the first owner by id; the machine and the open app are the owner).
+    ['GET', /^\/crm\/session$/, (_, r): CrmSessionInfo => (firstOwnerOnly(callerOf(r), 'GET /crm/session', "This is for the first owner of this app only: it is the PC's CRM sign-in."), crmProxy.session()), 'local'],
     // order o57e2, o4d14: the email accounts for the Accounts page's Email tab, from the new Supabase project: address, note, switched off, where used. Never a password. The owner's (POLICY).
     // Slice D (disable, never delete): `disabled=1` is the page's "Show disabled"; without it a disabled account is not in the list.
     ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id, { disabled: r.query.get('disabled') === '1' }), 'local'],
@@ -8741,13 +8793,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/accounts\/databases$/, (_, r) => accountsDatabases.list(access.ownerOf(callerOf(r)).id), 'local'],
     ['POST', /^\/accounts\/databases\/([^/]+)\/ping$/, ([key], r) => accountsDatabases.ping(access.ownerOf(callerOf(r)).id, key), 'local'],
     // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
-    ['POST', /^\/accounts\/email\/import$/, (_, r) => (humanOnly(r), accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
+    // The two imports read the CRM on THIS PC's saved sign-in (Shubham's): the first owner's by id, a second owner does not (his order o2f32).
+    ['POST', /^\/accounts\/email\/import$/, (_, r) => (humanOnly(r), firstOwnerOnly(callerOf(r), 'POST /accounts/email/import', "This is for the first owner of this app only: it reads the CRM on the PC's sign-in."), accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).
     // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; no password, only that one is stored. The owner's (POLICY).
     ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id, { disabled: r.query.get('disabled') === '1' }), 'local'],
     ['GET', /^\/accounts\/codebases$/, (_, r) => accountsCodebases.list(access.ownerOf(callerOf(r)).id), 'local'],
     // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).
-    ['POST', /^\/accounts\/codebases\/import$/, (_, r) => codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
+    ['POST', /^\/accounts\/codebases\/import$/, (_, r) => (firstOwnerOnly(callerOf(r), 'POST /accounts/codebases/import', "This is for the first owner of this app only: it reads the CRM on the PC's sign-in."), codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
     // Order ocf00: the codebase tabs. The owner's only (POLICY); every write is checked by the database's rules too (codebase-tabs.ts).
     // Order o94f3 (Shubham: values are never for agents, Assistants or chats): everything that reads or writes a VARIABLE (the tabs read, the sets, the variables, the reveal, the "+" and the paste box) is also
     // humanOnly: his own signed-in page session, never a chat's key and never a program that has only the app's token. A chat sees names and counts through the list; nothing here.
@@ -9893,6 +9946,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
             // The first look: the person must be able to see this chat (a chat on no floor is for administrators only); and from now on a floors change judges the stream again, as the hub's own sockets are: a share taken away stops the output too.
             if (!terminalRights(sid, claimed).view) return ended()
             watch(sid, claimed, { sendText: () => {}, onText: () => {}, onClose: cb => void stream.on('close', cb), close: () => ended() } as WsSocket)
+            // A person removed from the owners file ends here with the hub's own sockets ('revoked'), not only at the next floors event. Not for the owner's unsigned page (no person): auth.track would end it whenever a sign-in level is raised.
+            const untrack = claimed.person ? o.auth?.track(claimed, () => ended()) : undefined
+            if (untrack) stream.once('close', untrack)
           }
         }
         // F-193: a chat box's live mirror of the input line, asked over the link (an older PC ignores mode and the page falls back).
@@ -9995,8 +10051,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (refusal.status !== undefined && refusal.code !== undefined) o.auth?.deny(caller ?? OPEN, refusal.status, refusal.code, `${req.method ?? 'GET'} ${url.pathname}`)
             throw e
           }
-          // The built-in CRM runs on this PC's own CRM session: the owner's (an administrator, signed in as a person).
-          if (access.isAdmin(human)) return crmProxy.handle(req, res, sub, url.search)
+          // The built-in CRM runs on this PC's own CRM session: Shubham's (the owner BY HIS ID, signed in as a person). A second owner (the owners file) is an administrator but this is his CRM sign-in, not the
+          // second owner's (Shubham's order o2f32): he goes the person's way below, on his OWN CRM sign-in, and is told as any person is when he has none.
+          if (access.isAdmin(human) && isFirstOwner(human)) return crmProxy.handle(req, res, sub, url.search)
           // Order o9465: Goals (its own CRM paths only) or the CRM page, opened to this person in Settings › Access: on THEIR OWN CRM sign-in
           // (their sign-in to this app), never this PC's; the CRM decides what they may see and do.
           const fa = o.featureAccess
