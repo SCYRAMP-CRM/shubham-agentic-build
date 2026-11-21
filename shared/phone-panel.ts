@@ -87,6 +87,26 @@ export const graceLeft = (sinceLoadMs: number): number => Math.max(0, HELLO_GRAC
  */
 export const talkMayStart = (wanted: boolean, app: unknown): boolean => wanted && panelChannel(app) !== null
 
+/**
+ * F-308 (Agent 14's review, F308-1): whether a link the card drew would take the card's WebView AWAY FROM THE CARD. The app's panel lets a top-level navigation to its own server's origin load INSIDE its WebView
+ * (mobile core/Links.kt: the same origin is INSIDE, any other http(s) address goes to the phone's browser, the rest to the app that owns it or nowhere), so a plain `<a href="/crm">` in a notice or in the
+ * Assistant's words would load the whole app inside the card. `raw` is the link's href as written (a relative one is resolved against `here`, the page's own address, as the WebView resolves it). True for a
+ * link on the page's own origin (http or https) that is not this very page (the part after # aside: a link to an anchor, or to the card's own address, goes nowhere). Every other address is false: it is not
+ * the card that decides there (the app's own filter does), and a blob: address is a file the page made.
+ */
+export function leavesTheCard(raw: unknown, here: string): boolean {
+  if (typeof raw !== 'string') return false
+  try {
+    const page = new URL(here)
+    const to = new URL(raw, page)
+    if (to.protocol !== 'http:' && to.protocol !== 'https:') return false
+    if (to.origin !== page.origin) return false
+    return !(to.pathname === page.pathname && to.search === page.search)
+  } catch {
+    return false
+  }
+}
+
 /** Sends one message over the channel; false when there is none or it threw (the caller then does its fallback). */
 export function sendPanel(app: unknown, m: PanelMessage): boolean {
   const c = panelChannel(app)
