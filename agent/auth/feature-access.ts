@@ -58,6 +58,17 @@ export interface FeatureAccess {
   set(c: Caller, body: unknown): AccessView
   /** The agentic mount says who has shares. */
   useShares(fn: (c: Caller) => boolean): void
+  /**
+   * F-300 S0 (Agent 14's F1): `fn` is called after every saved change of a choice (set, and the system's seed), when the new choice already stands. The agentic mount judges its open sockets again by it, so closing 'assistant' ends a
+   * person's open terminal and chat stream at once, not at the next floors event. A listener that throws is logged and never undoes the change or stops the others.
+   */
+  onChange(fn: () => void): void
+  /**
+   * A one-time change made by the SYSTEM and not by a person (F-297, his order od8e2: "yes let ravis be on since start"): sets `feature` to `choice` ONLY when it has no choice yet, writes it, and logs it as a change by `by`
+   * (so the owner's history in Settings > Access says who made it and why). It never overwrites a choice: 'exists' when one is there, 'refused' for a feature that is locked, per PC or unknown, or a choice that is
+   * "Only me" or is not one. Nothing about it is the owner's: he changes or removes it like any other choice, with one tap.
+   */
+  seed(feature: string, choice: unknown, by: { id: string; name: string }): 'seeded' | 'exists' | 'refused'
 }
 
 const LOG_KEEP = 300
@@ -69,6 +80,17 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
   const now = o.now ?? Date.now
   let shares = o.shares ?? (() => false)
   let choices: Record<string, AccessChoice> = load()
+  const listeners: Array<() => void> = []
+  /** Everyone who asked to be told: called once the choice is saved and in force. */
+  const changed = () => {
+    for (const fn of listeners) {
+      try {
+        fn()
+      } catch (e) {
+        o.log?.warn(`an access change listener failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+  }
 
   function load(): Record<string, AccessChoice> {
     try {
@@ -181,6 +203,14 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     writeAtomic(file, `${JSON.stringify({ version: 1, choices: next }, null, 2)}\n`, 0o600)
     choices = next
     const change: AccessChange = { at: new Date(now()).toISOString(), by: { id: c.person!.id, name: c.person!.name || c.person!.username }, feature: f.key, ...(f.perPc ? { pcId: b.pcId as string } : {}), from, to }
+    logChange(change)
+    o.log?.info(`access: ${key} ${from.mode} -> ${to.mode}${to.mode === 'people' ? ` (${to.people.length} people)` : ''} by ${change.by.name}`)
+    changed()
+    return view(c)
+  }
+
+  /** One change into access-log.jsonl (a log grown past its size starts again beside the old one). A failure to log is said, never thrown: the change itself already stands. */
+  function logChange(change: AccessChange) {
     try {
       mkdirSync(o.dir, { recursive: true })
       // A log grown past its size starts again beside the old one (kept as access-log.old.jsonl).
@@ -196,8 +226,20 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     } catch (e) {
       o.log?.warn(`the access change could not be logged: ${e instanceof Error ? e.message : String(e)}`)
     }
-    o.log?.info(`access: ${key} ${from.mode} -> ${to.mode}${to.mode === 'people' ? ` (${to.people.length} people)` : ''} by ${change.by.name}`)
-    return view(c)
+  }
+
+  function seed(feature: string, choice: unknown, by: { id: string; name: string }): 'seeded' | 'exists' | 'refused' {
+    const f = featureOf(feature)
+    const to = cleanChoice(choice)
+    if (!f || f.locked || f.perPc || !to || to.mode === 'owner') return 'refused'
+    if (choices[f.key]) return 'exists'
+    const next = { ...choices, [f.key]: to }
+    writeAtomic(file, `${JSON.stringify({ version: 1, choices: next }, null, 2)}\n`, 0o600)
+    choices = next
+    logChange({ at: new Date(now()).toISOString(), by, feature: f.key, from: OWNER_ONLY, to })
+    o.log?.info(`access: ${f.key} ${OWNER_ONLY.mode} -> ${to.mode}${to.mode === 'people' ? ` (${to.people.length} people)` : ''} by ${by.name}`)
+    changed()
+    return 'seeded'
   }
 
   return {
@@ -206,8 +248,12 @@ export function createFeatureAccess(o: FeatureAccessOptions): FeatureAccess {
     features,
     view,
     set,
+    seed,
     useShares(fn) {
       shares = fn
+    },
+    onChange(fn) {
+      listeners.push(fn)
     },
   }
 }

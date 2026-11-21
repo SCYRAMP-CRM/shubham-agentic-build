@@ -1,6 +1,7 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { writeAtomic } from '../config.ts'
+import { privateRow } from './conversations.ts'
 
 // F-051: the floor chats' turns, the raw layer's conversations: each thing said to an agent's
 // chat (by Shubham, or by another chat), with the answer it got. Read from the chats' JSONL,
@@ -36,6 +37,8 @@ interface Open {
   from: 'shubham' | 'chat'
   said: string
   answer: string
+  /** S3: a row of the Browser, the phone or an SSH terminal came in this turn: it is dropped when it closes, never kept. */
+  private?: true
 }
 
 interface Cursor {
@@ -66,8 +69,19 @@ export function cleanSaid(raw: string): { text: string; from: 'shubham' | 'chat'
   t = t.replace(/<\/?(user-prompt-submit-hook|command-args)[^>]*>/g, '')
   t = redact(t).trim()
   if (!t) return null
-  const from = /^\[(message|broadcast) from /.test(t) ? 'chat' : 'shubham'
+  const from = isRelayText(t) ? 'chat' : 'shubham'
   return { text: t.length > SAID_MAX ? `${t.slice(0, SAID_MAX)}…` : t, from }
+}
+
+/**
+ * S4 (Agent 14's F3): the shapes of what the APP and the chats type into a chat that is not something its person said: `[message from <Agent> ...]`, `[broadcast from ...]`, the
+ * reply to an order (`[reply from <Agent> on <Floor> to order <id>] ...`) and the heartbeat's check-in (`[heartbeat hh:mm] ...`). One predicate, used when a turn is made (its `from`)
+ * and, on the `said` text, wherever the memory decides whether a turn feeds it (the legacy log was made with a regex that knew only the first two).
+ */
+export const isRelayText = (said: string): boolean => {
+  const t = said.trimStart()
+  // The shapes the app and the chats WRITE (orders.ts REPLY_PREFIX, heartbeat.ts NUDGE_PREFIX): a pasted "[reply from the customer] ..." or "[heartbeat] ..." is his words.
+  return /^\[(message from|broadcast from)\b/.test(t) || /^\[reply from [^\]]+ to order [^\]\s]+\]/.test(t) || /^\[heartbeat \d{1,2}:\d{2}\]/.test(t)
 }
 
 // What looks like a secret, kept out of the turns: they are recalled into other chats and given
@@ -78,9 +92,13 @@ const SECRETS: [RegExp, string][] = [
   [/\bsk-(proj-)?[A-Za-z0-9_-]{32,}/g, '[a key, removed]'],
   [/\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})/g, '[a GitHub token, removed]'],
   [/\bAKIA[0-9A-Z]{16}\b/g, '[an AWS key, removed]'],
+  [/\b[sr]k_(live|test)_[A-Za-z0-9]{16,}/g, '[a Stripe key, removed]'],
+  [/\bnpm_[A-Za-z0-9]{30,}/g, '[an npm token, removed]'],
   [/\bAIza[0-9A-Za-z_-]{35}\b/g, '[a Google key, removed]'],
   [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, '[a Slack token, removed]'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[a token, removed]'],
+  // An Authorization header's token (S3: notes and memory files are redacted too). After the JWT rule: a JWT keeps its own word.
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/g, 'Bearer [removed]'],
   // user:password@ in a link.
   [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]{3,}@/gi, '$1[removed]@'],
   // NAME=value, "password": "value", token: value: the name kept, the value gone. A value is 8
@@ -125,11 +143,17 @@ export function turnsFromLines(lines: string[], cursor: Cursor, ref: SessionRef,
   const close = () => {
     const o = cursor.open
     cursor.open = null
-    if (!o) return
+    if (!o || o.private) return
     done({ id: `${ref.sessionId}/${o.uuid}`, sessionId: ref.sessionId, floorId: ref.floorId, floorName: ref.floorName, agentName: ref.agentName, at: o.at, from: o.from, said: o.said, answer: o.answer })
   }
   for (const line of lines) {
     if (!line.trim()) continue
+    // S3 (F-211's rule, conversations.ts privateRow): a row of the Browser, the phone or an SSH terminal holds a page, a screen or what was typed there. The turn it is
+    // in is not kept at all (not its words, not its answer): a screen read aloud in an answer is as private as the call that read it.
+    if (privateRow(Buffer.from(line))) {
+      if (cursor.open) cursor.open.private = true
+      continue
+    }
     let row: unknown
     try {
       row = JSON.parse(line)
@@ -142,6 +166,8 @@ export function turnsFromLines(lines: string[], cursor: Cursor, ref: SessionRef,
     if (row.type === 'user') {
       const { text, toolResultOnly } = textOf(msg.content)
       if (toolResultOnly || !text.trim()) continue
+      // A compaction summary is Claude Code's own writing, not something said (and it can quote a screen word for word).
+      if (row.isCompactSummary === true || /^This session is being continued from a previous conversation/.test(text.trimStart())) continue
       const said = cleanSaid(text)
       if (!said) continue
       close()
@@ -163,8 +189,12 @@ export interface TurnLog {
   /** Every turn kept, oldest first. */
   all(): Turn[]
   get(id: string): Turn | null
-  /** Reads what the sessions' files gained since last time; the turns it found. */
-  collect(sessions: SessionRef[], now?: number): Turn[]
+  /**
+   * Reads what the sessions' files gained since last time; the turns it found. `skip`: the sessions that do NOT feed this memory (another person's chat, one shared for typing, a PC
+   * Control chat): they are not read, and their cursors are moved to the end of their files (and any turn open there is dropped), so that what is typed in them while they do not
+   * feed is never read as this person's words when they do (a share that ends, a chat that changes hands: the new owner does not inherit the old owner's backlog).
+   */
+  collect(sessions: SessionRef[], now?: number, skip?: SessionRef[]): Turn[]
 }
 
 export function createTurnLog(dir: string): TurnLog {
@@ -242,7 +272,7 @@ export function createTurnLog(dir: string): TurnLog {
   return {
     all: () => turns,
     get: id => byId.get(id) ?? null,
-    collect(sessions, now = Date.now()) {
+    collect(sessions, now = Date.now(), skip = []) {
       const found: Turn[] = []
       const keep = (t: Turn) => {
         if (byId.has(t.id) || uuids.has(uuidOf(t.id))) return
@@ -252,6 +282,21 @@ export function createTurnLog(dir: string): TurnLog {
         found.push(t)
       }
       let moved = false
+      const feeding = new Set(sessions.map(r => r.sessionId))
+      for (const ref of skip) {
+        if (feeding.has(ref.sessionId) || !existsSync(ref.file)) continue
+        let size: number
+        try {
+          size = statSync(ref.file).size
+        } catch {
+          continue
+        }
+        const c = cursors[ref.sessionId]
+        if (!c || c.bytes !== size || c.open) {
+          cursors[ref.sessionId] = { bytes: size, open: null, grewAt: now }
+          moved = true
+        }
+      }
       for (const ref of sessions) {
         if (!existsSync(ref.file)) continue
         const c = (cursors[ref.sessionId] ??= { bytes: 0, open: null, grewAt: now })
@@ -266,7 +311,7 @@ export function createTurnLog(dir: string): TurnLog {
         if (c.open && c.open.answer && now - c.grewAt > SETTLE_MS) {
           const o = c.open
           c.open = null
-          keep({ id: `${ref.sessionId}/${o.uuid}`, sessionId: ref.sessionId, floorId: ref.floorId, floorName: ref.floorName, agentName: ref.agentName, at: o.at, from: o.from, said: o.said, answer: o.answer })
+          if (!o.private) keep({ id: `${ref.sessionId}/${o.uuid}`, sessionId: ref.sessionId, floorId: ref.floorId, floorName: ref.floorName, agentName: ref.agentName, at: o.at, from: o.from, said: o.said, answer: o.answer })
           moved = true
         }
       }

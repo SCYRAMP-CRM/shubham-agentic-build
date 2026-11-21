@@ -85,6 +85,11 @@ export interface MemorySettings {
   /** The floor chats' turns are kept and searched (no model is run for that). */
   fromChats: boolean
   /**
+   * oc65c/F-051 S4: also what agents say to each other (a turn that begins "[message from ...]" or "[broadcast from ...]", a relay) is kept and searched. Off by default: the memory
+   * learns from what the person says, not from the work chatter between chats (his answer B of 18 Nov; answer C is this switch on).
+   */
+  fromAgents: boolean
+  /**
    * The turns from before the memory was first started (the past) are compiled too, oldest
    * first, a run at a time. Off by default: they are searched and recalled as they are, and
    * compiling them all is many runs (measured: 2,925 turns, 27 runs).
@@ -92,7 +97,7 @@ export interface MemorySettings {
   pastChats: boolean
 }
 
-export const DEFAULT_MEMORY_SETTINGS: MemorySettings = { auto: false, everyHours: 24, model: 'sonnet', recall: true, fromChats: true, pastChats: false }
+export const DEFAULT_MEMORY_SETTINGS: MemorySettings = { auto: false, everyHours: 24, model: 'sonnet', recall: true, fromChats: true, fromAgents: false, pastChats: false }
 
 export type MeaningState = 'off' | 'waiting' | 'downloading' | 'loading' | 'ready' | 'failed'
 

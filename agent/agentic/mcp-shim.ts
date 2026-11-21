@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline'
 import { retryWhileRefused } from './mcp-retry.ts'
 import { FAST_TOOLS } from './fast-tools-list.ts'
 import { OLD_TOOLS } from './old-reader-tools.ts'
-import { STAFF_TOOLS } from './staff-policy.ts'
+import { STAFF_TOOLS, STAFF_TOOLS_V2 } from './staff-policy.ts'
 import { TOOLS } from './tools.ts'
 
 // F-018: the MCP server each agent's chat runs (claude starts it from the --mcp-config file
@@ -22,11 +22,13 @@ const FAST = process.env.SAD_TOOLSET === 'fast'
 const OLD = process.env.SAD_TOOLSET === 'old'
 // Order o7e6d: a person's own Assistant (the staff policy) runs it with SAD_TOOLSET=staff: its four tools only (the hub decides every call by its key).
 const STAFF = process.env.SAD_TOOLSET === 'staff'
+// F-297 (stage A): a person's own Assistant under staff-v2 runs it with SAD_TOOLSET=staff2: the same four and send_to_chat (the hub decides every call by its key and its recorded policy, and re-asks the person's switch).
+const STAFF2 = process.env.SAD_TOOLSET === 'staff2'
 /** A fixed list (the fast Assistant's, the old-app reader's, a staff Assistant's): never asked again, never changed. */
-const FIXED = FAST || OLD || STAFF
+const FIXED = FAST || OLD || STAFF || STAFF2
 // What this process was built with. Not the last word for a full toolset: the agent's current list is (below), because this process
 // can outlive an Update (the chat host keeps the chat), and a tool added by then must still reach the chat.
-let LISTED: readonly { name: string }[] = FAST ? FAST_TOOLS : OLD ? OLD_TOOLS : STAFF ? STAFF_TOOLS : TOOLS
+let LISTED: readonly { name: string }[] = FAST ? FAST_TOOLS : OLD ? OLD_TOOLS : STAFF ? STAFF_TOOLS : STAFF2 ? STAFF_TOOLS_V2 : TOOLS
 /** The stamp of the list last given to claude (agent: GET /mcp/tools), null before the first. */
 let given: string | null = null
 /** claude has said hello (initialize): only then is a notification sent. */

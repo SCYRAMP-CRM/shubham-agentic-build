@@ -4,7 +4,8 @@
 // rule is kept as a choice (his standing rule). Who may SEE a chat, "Can view" shares, a person's Assistant (theirs alone), the app owner's
 // own rights and PC control are unchanged by either choice.
 //
-// Where the choice comes from (Lead's call, ocf0e): NO saved choice is his decision, A (DEFAULT_STAFF_TYPING); a saved choice that cannot be
+// Where the choice comes from (Lead's call, ocf0e; the scope changed by his order o2f56, 19 Nov: "I don't think anyone should be able to talk on
+// the server"): NO saved choice is A with the narrower scope, not on the Server (DEFAULT_STAFF_TYPING); "every PC" stays a choice he can make. A saved choice that cannot be
 // read is a failure and falls to the restrictive side, the 15 Nov rule (OLD_STAFF_TYPING). A member PC uses the Server's choice from the
 // Server's current state frame, and the 15 Nov rule while it has none.
 
@@ -17,9 +18,9 @@ export type StaffTypingRule =
 
 /** Where the rule above opens typing. Agent 3's narrower variant keeps the Server's own chats closed to staff. */
 export type StaffTypingScope =
-  /** Chats on any PC (ocf0e: what he chose). */
+  /** Chats on any PC (ocf0e: what he chose; since o2f56 a choice he makes, no longer the default). */
   | 'every-pc'
-  /** Not a chat whose home is the Server: a chat on the Server runs as the Server's Windows user with full tools. */
+  /** The default (o2f56): not a chat whose home is the Server: a chat on the Server runs as the Server's Windows user with full tools. */
   | 'not-on-server'
 
 export interface StaffTyping {
@@ -27,8 +28,8 @@ export interface StaffTyping {
   scope: StaffTypingScope
 }
 
-/** No saved choice: what he chose (o9ccb, ocf0e "A"). */
-export const DEFAULT_STAFF_TYPING: Readonly<StaffTyping> = Object.freeze({ rule: 'owned-and-type-shares', scope: 'every-pc' })
+/** No saved choice: what he chose (o9ccb, ocf0e "A"), with the scope of o2f56: chats they own or that were shared to them as Can type, and not a chat on the Server. */
+export const DEFAULT_STAFF_TYPING: Readonly<StaffTyping> = Object.freeze({ rule: 'owned-and-type-shares', scope: 'not-on-server' })
 
 /** The 15 Nov rule: what an unreadable saved choice falls back to (the restrictive side), and what code given no choice at all uses. */
 export const OLD_STAFF_TYPING: Readonly<StaffTyping> = Object.freeze({ rule: 'own-assistant-only', scope: 'every-pc' })

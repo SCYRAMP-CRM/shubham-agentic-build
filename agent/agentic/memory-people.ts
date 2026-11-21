@@ -79,6 +79,90 @@ export function floorsOwnedBy(floors: readonly Floor[], personId: string, appOwn
 }
 
 /**
+ * oc65c / F-051 S4 (feeding by owner): does the chat of this agent FEED the memory of this person? Only a chat they OWN (an agent with no owner on record is the app owner's), that
+ * nobody else can type into (a chat shared for typing holds other people's words, and `from: 'shubham'` only says "typed, not a relay", not who typed), and that is not a PC
+ * Control chat (a slot chat, or any chat of a PC Control floor: they act on a PC and read its screen). Another person's chat, and so another person's Assistant (a staff chat),
+ * never feeds this person. A view share is fine: everything said in it is still the owner's.
+ */
+export function feedsMemory(floor: Pick<Floor, 'workspace'>, agent: Pick<FloorAgent, 'owner' | 'sharedWith' | 'pcControlSlot'>, personId: string, appOwnerId: string): boolean {
+  if (floor.workspace === 'pc-control' || agent.pcControlSlot) return false
+  if (agent.sharedWith?.some(s => s.can === 'type')) return false
+  return ownerIdOfAgent(agent, appOwnerId) === memoryPersonId(personId)
+}
+
+/** The floors as a person's memory follows their chats: only the agents that feed it (feedsMemory), no floor left with none. Copies; the input is not touched. */
+export function feedFloors(floors: readonly Floor[], personId: string, appOwnerId: string): Floor[] {
+  const id = memoryPersonId(personId)
+  const out: Floor[] = []
+  for (const f of floors) {
+    const agents = f.agents.filter(a => feedsMemory(f, a, id, appOwnerId))
+    if (agents.length) out.push({ ...f, agents })
+  }
+  return out
+}
+
+/**
+ * The agents that do NOT feed a person's memory (everyone else's chats, and their own that are shared for typing or PC Control ones), by floor, no floor left with none; copies.
+ * Their transcripts are not read, and their read position is kept at the end of their files (turns.collect's `skip`), so words typed in them while they do not feed are never
+ * read as this person's when they do (Agent 14's F2); a chat that changes hands brings no backlog to its new owner (Lead's ruling).
+ */
+export function unfedFloors(floors: readonly Floor[], personId: string, appOwnerId: string): Floor[] {
+  const id = memoryPersonId(personId)
+  const out: Floor[] = []
+  for (const f of floors) {
+    const agents = f.agents.filter(a => !feedsMemory(f, a, id, appOwnerId))
+    if (agents.length) out.push({ ...f, agents })
+  }
+  return out
+}
+
+/**
+ * The floors whose NOTES a person's memory reads (settles the S1 open item): a floor's notes belong to the floor, and every agent on it writes there, so they are this person's
+ * only when EVERY agent of the floor is theirs (and it is not a PC Control floor). One chat of another person on the floor, and its notes are not read. Copies.
+ */
+export function noteFloors(floors: readonly Floor[], personId: string, appOwnerId: string): Floor[] {
+  const id = memoryPersonId(personId)
+  return floors.filter(f => f.workspace !== 'pc-control' && f.agents.length > 0 && f.agents.every(a => ownerIdOfAgent(a, appOwnerId) === id)).map(f => ({ ...f }))
+}
+
+/**
+ * oc65c / F-051 S3 (the end of the global memory-file sweep): the Claude Code project folders (names under the projects folder) a person's memory may read memory files
+ * from: the ones their OWN chats run in, and no chat of another person runs in. The folder of a chat is where its transcript is (`<projects>/<folder>/<session>.jsonl`), and a
+ * folder that holds the transcript of ANY other person's chat (or of an odd owner id) is left out: a Claude Code memory file there may have been written by theirs. An agent
+ * with no owner on record is the app owner's. A folder no known chat runs in is not anyone's (it is never swept). Sorted, without repeats.
+ */
+export function ownProjects(floors: readonly Floor[], personId: string, appOwnerId: string, transcript: (sessionId: string) => string | null, onThisPc: (agent: FloorAgent) => boolean = () => true): string[] {
+  const id = memoryPersonId(personId)
+  const mine = new Set<string>()
+  const others = new Set<string>()
+  // Agent 14's N2 (fail closed): a chat of ANOTHER person that started on this PC but whose transcript cannot be found says nothing about where it ran (the file was never
+  // written, was cleaned up by Claude Code while its memory files stayed, or the lookup failed): it may have used any folder, so nobody's folder can be told apart and the list
+  // is empty. A chat that lives on another PC (`onThisPc` false) has no folder on this one and is not in doubt.
+  let unknown = false
+  for (const f of floors) {
+    for (const a of f.agents) {
+      if (!a.sessionId) continue
+      const theirs = ownerIdOfAgent(a, appOwnerId) !== id
+      let file: string | null = null
+      try {
+        file = transcript(a.sessionId)
+      } catch {
+        file = null
+      }
+      const folder = file ? path.basename(path.dirname(file)) : ''
+      if (!file || !folder || folder === '.' || folder === '..') {
+        if (theirs && onThisPc(a)) unknown = true
+        continue
+      }
+      if (!theirs) mine.add(folder)
+      else others.add(folder)
+    }
+  }
+  if (unknown) return []
+  return [...mine].filter(p => !others.has(p)).sort()
+}
+
+/**
  * oc65c / F-051 S2 (the one door), ruling D-S2-1 (Lead, 18 Nov 2026: "privacy first"): a chat that is ACTUALLY SHARED with another person has no memory while it is
  * so. What the recall hook adds to a prompt goes into the chat's context and is kept in its transcript, and whoever the chat is shared with reads that transcript:
  * the owner's memory would be shown to them. The predicate is `sharedWith` not empty (a view share reads the chat, a type share writes in it; the owner is never in

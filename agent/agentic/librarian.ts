@@ -4,7 +4,7 @@ import type { LibrarianMode } from '../../shared/memory.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
-import type { Turn } from './memory-turns.ts'
+import { redact, type Turn } from './memory-turns.ts'
 import { OWNER_NAME } from './wiki.ts'
 
 // F-051: the librarian: claude -p, unattended, in the wiki's folder, folding the raw material
@@ -52,8 +52,10 @@ export interface Material {
 }
 
 const when = (iso: string) => (iso.length >= 16 ? iso.slice(0, 16).replace('T', ' ') : iso)
+// S3 (F2): the last gate before the disk: whatever the material was, the inbox is written redacted (a note, a memory file and a turn already are: redacting again changes
+// nothing). The inbox is never in git and is purged (wiki.ts), but what it holds goes to the librarian's model.
 const quote = (text: string) =>
-  text
+  redact(text)
     .trim()
     .split(/\r?\n/)
     .map(l => `> ${l}`)

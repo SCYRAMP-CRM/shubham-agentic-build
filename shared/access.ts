@@ -30,6 +30,13 @@ export const MODE_LABELS: Readonly<Record<AccessMode, string>> = { owner: 'Only 
 /** At most this many chosen people on one feature. */
 export const MAX_PEOPLE = 200
 
+/**
+ * F-297: THE HONEST LIMIT of letting a person's own Assistant send to their chats, in plain words. It is the blurb's second half in the Access row below and the same words in the commit text (a test pins that the
+ * row holds exactly this). It does not re-open his decision ("owned or shared, he can send"); it says what that means.
+ */
+export const STAFF_SEND_LIMIT =
+  "A chat on a floor that runs on the Server runs as the owner's Windows user, with full tools. A message from this person's Assistant into such a chat is an instruction to that agent; if it obeys, it can run programs and read files as the owner. The Assistant itself cannot; whoever can instruct that chat can. This person can already type into the same chats themselves, so what is new is not their reach: it is that a program that reads untrusted words (a page on their screen, a message) can now do the typing without their tap, so a trick in what it reads could make it send. A chat on this person's own PC reaches only that PC."
+
 export type FeatureGroup = 'pages' | 'pc-control' | 'assistant' | 'settings'
 export const FEATURE_GROUPS: readonly { group: FeatureGroup; title: string }[] = [
   { group: 'pages', title: 'Pages' },
@@ -109,6 +116,10 @@ export const FEATURES: readonly Feature[] = [
   { key: 'pc-deps', group: 'pc-control', label: 'Dependencies', blurb: 'What the app needs on each PC and the command that fixes a missing one, read only.', needs: 'pc-control' },
   // The Assistant, voice and talk.
   { key: 'assistant', group: 'assistant', pages: ['/assistant-history'], label: 'Their own Assistant', blurb: 'The Assistant overlay, with each person’s own Assistant (it comes with F-162).' },
+  // F-297 (orders o7712 and odbb7, Lead's approval of f297-design.md): the owner's per-person switch for what a person's own Assistant may SEND to the chats that person owns or that were shared with them as "Can
+  // type" (it never starts or stops chats). NOT `locked`, on purpose and said here: a locked row cannot be opened to anyone, and he decided "owned or shared, he can send". So the row's blurb carries the honest
+  // limit in plain words (STAFF_SEND_LIMIT, the same words as the commit text). Missing = "Only me" = off for everyone; the hub asks it again at every send.
+  { key: 'assistant-send', group: 'assistant', label: 'Their Assistant can talk to chats', blurb: `Their own Assistant may send a message, without a tap, to a chat they own or that you shared with them as "Can type". Not a chat on the Server while "Not chats on the Server" is on (Settings > Access > Pages > Agentic Platform > Who may type in chats). It never starts or stops chats.\n\n${STAFF_SEND_LIMIT}`, needs: 'assistant' },
   { key: 'voice', group: 'assistant', label: 'Voice typing', blurb: 'Speaking into a chat’s message box (the PC’s speech engine).' },
   // F-267 (order o088b): the Quick page is live talk on a page of its own, so it is this feature's page: locked, the owner's only.
   { key: 'talk', group: 'assistant', pages: [QUICK_ROUTE], label: 'Live talk', blurb: 'Talking with the Assistant out loud.', locked: 'Live talk goes to your own Assistant and its orders.' },

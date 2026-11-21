@@ -139,7 +139,9 @@ import type { AnswerRequest, ApprovalItem, ApprovalLogEntry, ApprovalsAnswer, Au
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, assertCodexThreadAvailable, MAX_FLOOR_BODY, type FloorStore } from './floors.ts'
 import { ownAssistantFloor, ownAssistantMayUse, OWN_ASSISTANT_FLOOR } from './own-assistant.ts'
-import { appCommand, STAFF_OWNER_RE, STAFF_POLICY, STAFF_TOOLS, STAFF_TOOLS_STAMP, staffBrief, staffMcpConfig, staffSettings, staffToolAllowed, staffUsageEnv } from './staff-policy.ts'
+import { appCommand, isStaffPolicy, STAFF_OWNER_RE, STAFF_POLICY, STAFF_POLICY_V2, staffBrief, staffMcpConfig, staffSettings, staffToolAllowed, staffToolsOf, staffToolsStampOf, staffUsageEnv, type StaffPolicy } from './staff-policy.ts'
+import { STAFF_SEND_FEATURE, STAFF_SEND_REVOKED_WORDS, createStaffRate, staffConvergeTimes, staffSendDone, staffSendPrefix, staffSendText, staffSendTextWords, staffSendWords, type StaffSendOutcome, type StaffSendRefusal } from './staff-send.ts'
+import { STAFF_SEND_NOT_RECORDED, createStaffSendRecord, describeStaffSend } from './staff-sends.ts'
 import { staffMayScreen } from '../../shared/staff-screen.ts'
 import { createFenceStore, type FenceReason } from './staff-fence.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
@@ -182,6 +184,8 @@ import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
 import { GOALS_CRM_PATH, routeRule } from '../../shared/access.ts'
 import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
+import { PERSON_DOOR_REFUSED, personChartTouches, personDoorOf, personSocketOf } from './person-assistant-doors.ts'
+import { createStaffAdmission, type StartAdmit } from './staff-admission.ts'
 import { createQuestionRouting } from './question-routing.ts'
 import { createArrowPrompts } from './arrow-prompts.ts'
 import { chooseByArrows } from './arrow-select.ts'
@@ -191,6 +195,9 @@ import {
   type QuestionRoutingAnswer, type WaitingQuestion,
 } from '../../shared/question-routing.ts'
 import { createStaffTyping } from './staff-typing.ts'
+import { isServerChat } from './server-chat.ts'
+import { terminalClaimLine, terminalClaimOf, terminalNotice } from './member-terminal.ts'
+import { createOwnerPcs } from './owner-pcs.ts'
 import { broadcastTargets } from './broadcast-targets.ts'
 import { OLD_STAFF_TYPING, staffTypingOf, type StaffTyping } from '../../shared/staff-typing.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
@@ -223,7 +230,7 @@ import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
-import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, floorsOwnedBy, quickMayUseMemory, type QuickTalker } from './memory-people.ts'
+import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, feedFloors, noteFloors, ownProjects, quickMayUseMemory, unfedFloors, type QuickTalker } from './memory-people.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
 import { answer, pullFrom as pullTranscriptFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
 import {
@@ -410,6 +417,11 @@ export interface AgenticOptions {
    * routes (Tasks) to the people it is open to, and runs Goals and the CRM page on a person's own CRM sign-in.
    */
   featureAccess?: FeatureAccess
+  /**
+   * F-300 S0: the SHARED start admission (F-290, start-admission.ts: reads the free memory and reserves in ONE synchronous step) that a person's own Assistant is asked before it is started. Left out: no memory gate
+   * (a person's start is as it was; the per-person start rate still applies). main.ts passes it once that function exists.
+   */
+  startAdmission?: StartAdmit
   /** Canonical self + registered devices, including offline devices. Never starts chats. */
   pcControlDevices?: () => Array<{ id: string; name: string; online: boolean }>
   /** Order o68f0: the Server's SSH terminals for the overlay Assistant (pc-ssh-term.ts SshAssist); null where there are none (a member, tests). */
@@ -527,6 +539,23 @@ export interface AgenticOptions {
   approvalIgnoreGraceMs?: number
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
   restartGraceMs?: number
+  /**
+   * F-297: TESTS ONLY, never set in production. Awaited by a staff send between its first checks and its last (the ones made right before anything is typed), so a test can take the person's right
+   * away (the switch, a share) in that gap and see that nothing is typed.
+   */
+  staffSendGap?: () => void | Promise<void>
+  /**
+   * F-297 stage B (his order od8e2: "yes let ravis be on since start"): on the Server, ONCE, Ravi's `assistant-send` switch is turned ON in Settings > Access (logged as a change by the app, never overwriting a choice).
+   * Set by main.ts only: a test that wants it says so, and every other test and tool is unaffected.
+   */
+  staffSendSeed?: boolean
+  /**
+   * F-297 stage B: how often a person's Assistant whose policy no longer matches its switch is looked at (every 20 s), how long it must have been QUIET (idle, nothing in flight) before it is restarted (60 s), and how long
+   * before it is tried again if that did not work (5 min). Tests shorten them.
+   */
+  staffConvergeEveryMs?: number
+  staffConvergeIdleMs?: number
+  staffConvergeRetryMs?: number
   /**
    * F-058: the chats that were open when the app last stopped come back by themselves (the guard sets
    * SAD_RESUME_CHATS=1, main.ts passes it): each is opened again, resumed, and told to carry on if it
@@ -896,9 +925,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-118: every events socket with its caller: what it is sent is what that person may see.
   const events = new Map<WsSocket, Caller>()
   // Orders of95c / o9ccb / ocf0e: which chats a non-owner may type into (shared/staff-typing.ts), the owner's choice kept on the Server: by
-  // default (no saved choice) a chat they own and one shared to them as "Can type", on every PC; an unreadable saved choice is the 15 Nov rule
+  // default (no saved choice) a chat they own and one shared to them as "Can type", not on the Server (his o2f56, 19 Nov; "every PC" is a choice); an unreadable saved choice is the 15 Nov rule
   // (their own Assistant only), which is also kept as a choice.
   const staffTyping = createStaffTyping(path.join(o.dir, 'staff-typing.json'))
+  // F-302 L4 (Agent 14's R2): the PCs the owner marked as HIS: an unsigned page on a member PC is the app's owner only when its PC is marked here (owner-pcs.ts). None marked = none trusted that way.
+  const ownerPcs = createOwnerPcs(path.join(o.dir, 'owner-pcs.json'))
+  if (ownerPcs.unreadable()) log?.warn('owner PCs: owner-pcs.json could not be read; no PC counts as the owner\'s until he marks them again')
   if (staffTyping.unreadable()) log?.warn('staff typing: the saved choice (staff-typing.json) could not be read; non-owners type only into their own Assistant (the 15 Nov rule) until he chooses again')
   /** The Server's own PC id: this PC on the hub (or alone), the hub on a member PC; null when it is not known. */
   const serverPcId = () => (mode() === 'member' ? (team?.hub()?.id ?? null) : self().id)
@@ -906,11 +938,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const typingNow = (): StaffTyping => (mode() === 'member' ? (replicaIsFresh() ? fresh?.typing : null) ?? OLD_STAFF_TYPING : staffTyping.get())
   const access = createAccess(o.auth, undefined, {
     typing: () => typingNow(),
-    // The 'not-on-server' scope: a chat with no home yet, or an unknown Server, counts as the Server's (it stays closed).
-    serverChat: a => {
-      const server = serverPcId()
-      return !server || !a.homePc || a.homePc === server
-    },
+    // The 'not-on-server' scope: a chat with no home yet, an unknown Server, a home that IS the Server, or a chat that RUNS on the Server counts as the Server's (it stays closed). A chat homed on another PC
+    // but opened or taken over here runs as the Server's Windows user whatever its home says (Agent 14's L1, server-chat.ts).
+    serverChat: a => isServerChat(a, { server: serverPcId(), runsOnServer }),
+    // F-300 S0: Settings > Access 'assistant', asked at every right on a person's own Assistant (access.ts rights()), so closing it closes every door of that chat, not only the page's button.
+    assistantOpen: c => !o.featureAccess || o.featureAccess.allows(c, 'assistant') === true,
   })
   // Order o9465 (order o929e: an existing share is his explicit choice): a person with an agent or a floor of their own or shared with them keeps
   // the Agents routes whatever Settings › Access says; this mount still shows them only those.
@@ -961,6 +993,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     }
   }
+  // F-300 S0 (Agent 14's F1): an Access change emits no floors event, so the sockets were judged again only when some floor changed: closing 'assistant' left a person's open terminal view and chat feed streaming. Now every saved change of Access
+  // (the owner's tap, and the system's seed) judges them again at once, by the rule that let them in (rights() asks 'assistant' at every right).
+  o.featureAccess?.onChange(() => recheckSockets())
   const emit = (e: AgenticEvent) => {
     if (e.t === 'floors') recheckSockets()
     // Callers with the same rights get the same text: made once.
@@ -1204,9 +1239,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
         settings: home.legacy ? undefined : { fromChats: false, pastChats: false },
         modelsDir: path.join(o.dir, '..', 'models'),
         notes: id => memory.all(id),
-        floors: () => (home.legacy ? floors.list() : floorsOwnedBy(floors.list(), person.id, SBSKRRT_OWNER.id)),
+        // S4 (feeding by owner): the chats that feed this memory are the ones the person OWNS (no owner on record: the app owner's), that nobody else can type into and that are not
+        // PC Control chats; the notes read are those of the floors that are wholly theirs. The owner's layer is no exception any more (it was every floor's).
+        floors: () => feedFloors(floors.list(), person.id, SBSKRRT_OWNER.id),
+        noteFloors: () => noteFloors(floors.list(), person.id, SBSKRRT_OWNER.id),
+        // Agent 14's F2: the chats that do not feed are not read, but their read position stays at the end of their files (no other person's words, no backlog of a chat that changed hands).
+        unfedFloors: () => unfedFloors(floors.list(), person.id, SBSKRRT_OWNER.id),
         transcript: sid => findTranscript(sid, projectsDir),
         projectsDir,
+        // S3: the Claude Code memory files are read only from the project folders that are his own and that no other person's chat runs in (no sweep of every project).
+        // A person's layer reads none until S9 says whose folders are theirs.
+        memoryProjects: home.legacy ? () => ownProjects(floors.list(), person.id, SBSKRRT_OWNER.id, sid => claudeTranscript(sid, projectsDir), a => engineFor(a) === 'claude' && (!a.homePc || a.homePc === self().id)) : undefined,
         token: o.token,
         claude: () => o.claude ?? findClaude(),
         log,
@@ -1336,6 +1379,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const remote = new Map<string, { name: string; live: Record<string, ChatState> }>()
   const subs = new Map<string, Duplex>()
   let replica: Replica = loadReplica()
+  /** F-302 L4: the Server's state frame says it judges the person a member's terminal stream names (terminalJudgesPerson: 1); a member sends the claim only to a Server that said so (an older Server ignores it anyway). */
+  let hubJudgesTerminal = false
   /** `gen`: this subscription's generation (one more at each new stream), so a judgement or a freshness of an older one never counts for it. */
   let sub: { token: object; stream: Duplex; gen: number } | null = null
   let subGen = 0
@@ -1649,7 +1694,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       } else if (action === 'stop') {
         if (a.sessionId) await stopAt(device, a.sessionId)
       } else if (action === 'open') {
-        const opened = device === self().id ? await openChat(f.id, a.id, {}, undefined, undefined, actorOfCaller(c)) : await openOnPeer(peerOf(device), f, a)
+        const opened = device === self().id ? await openChat(f.id, a.id, {}, undefined, undefined, actorOfCaller(c)) : await openOnPeer(peerOf(device), f, a, undefined, terminalClaimLine(c, access.isAdmin(c)))
         const workspace = (await controlAnswer(c)).workspaces.find(w => w.device.id === device)!
         emit({ t: 'pc-control', answer: controlRawAnswer() })
         if (mode() !== 'member') pushState()
@@ -2185,7 +2230,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function runFenced(sid: string, record = true): boolean {
     const run = nativeChats.info(sid)
     if (!run) { staffFenced.delete(sid); return false }
-    if (run.policy === STAFF_POLICY) return false
+    if (isStaffPolicy(run.policy)) return false
     const saved = staffFenced.get(sid)
     const remembered = saved && saved.startedAt === run.startedAt ? saved.why : staffFence.reason(sid, run.startedAt)
     let why: FenceReason | null = run.policy !== undefined ? 'unknown-policy' : remembered
@@ -2199,7 +2244,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   /** A live unsafe staff run with unsound evidence is related to this Update. An ordinary-only PC (even with corrupt/unclassified history) is not. */
   function staffUpdateBlockers(): string[] {
-    if (!nativeChats.live().some(run => run.policy !== STAFF_POLICY && runFenced(run.sessionId, false))) return []
+    if (!nativeChats.live().some(run => !isStaffPolicy(run.policy) && runFenced(run.sessionId, false))) return []
     return staffFence.problems().filter(p => p !== 'fence-unclassified').map(p => STAFF_FENCE_WORDS[p] ?? `the staff fence evidence has a problem (${p})`)
   }
   /** Current definite staff binding, policy, or typed runtime evidence, never an old generic record. */
@@ -2577,6 +2622,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // Order o7e6d (o4002): a person's own Assistant (F-162, duty 'person-assistant') runs under the staff policy (staff-policy.ts), or not at all
 
+  /**
+   * F-300 S0: a person's own Assistant is ADMITTED before it is started (staff-admission.ts): the shared start admission for memory (o.startAdmission, F-290) and a per-person start rate. A refusal is the same plain
+   * words for every cause, 409 'staff-resting', before anything is spawned; the owner's chats are never stopped to make room. The reservation is held until the start is over, thrown or not.
+   */
+  const staffAdmission = createStaffAdmission({ startAdmit: o.startAdmission })
+  function withStaffAdmission<T>(agent: FloorAgent, sid: string, start: () => T): T {
+    const admitted = staffAdmission.admit(agent.owner?.id ?? '', sid)
+    if (!admitted.ok) {
+      log?.warn(`staff start refused (${admitted.cause}): chat ${sid.slice(0, 8)} of ${agent.owner?.username || 'a person'}'s Assistant waits`)
+      throw Object.assign(apiError(409, admitted.words), { code: admitted.code })
+    }
+    try {
+      return start()
+    } finally {
+      admitted.release()
+    }
+  }
+
   function staffError(words: string) {
     return Object.assign(apiError(409, words), { code: 'staff-policy' })
   }
@@ -2586,7 +2649,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * Claude only (no Codex, OpenCode, Codex in Claude Code or other managed execution), at home here, for a person whose id fits. Else refused.
    */
   function assertStaffStart(floor: Floor, agent: FloorAgent) {
-    if (staffFence.activationBlocked() && (!agent.sessionId || nativeChats.info(agent.sessionId)?.policy !== STAFF_POLICY)) {
+    if (staffFence.activationBlocked() && (!agent.sessionId || !isStaffPolicy(nativeChats.info(agent.sessionId)?.policy))) {
       throw staffError('Staff activation is held: the staff provenance evidence needs review (GET /staff/preflight). Nothing was started.')
     }
     if (mode() === 'member') throw staffError("A person's own Assistant runs on the Server only.")
@@ -2605,7 +2668,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const w = whereAll()[sid]
     if (!w) return
     if (w.id !== self().id) throw staffError(`This Assistant's chat runs on ${w.name}, where its restrictions can't be checked. Stop it there first.`)
-    if (chats.info(sid)?.policy === STAFF_POLICY) return
+    if (isStaffPolicy(chats.info(sid)?.policy)) return
     log?.warn(`staff policy: chat ${sid.slice(0, 8)} of a person's own Assistant runs without it; the open is refused until it is stopped`)
     throw staffError("Restart required: this Assistant's chat is running without its restrictions (an older start). It takes no messages and no tools until it is stopped; stop it, then open it again.")
   }
@@ -2690,7 +2753,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const run = nativeChats.info(sid)
       if (run && runFenced(sid, false)) {
         const saved = staffFenced.get(sid)
-        const why = run.policy !== undefined && run.policy !== STAFF_POLICY ? 'unknown-policy'
+        const why = run.policy !== undefined && !isStaffPolicy(run.policy) ? 'unknown-policy'
           : (saved && saved.startedAt === run.startedAt ? saved.why : staffFence.reason(sid, run.startedAt))
         out.push({ ...row, why: why === 'unknown-policy' ? 'unknown-policy' : 'no-policy' })
       }
@@ -2725,18 +2788,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
     const person = agent.owner!.name || agent.owner!.username || 'its person'
-    const briefPath = writeBrief(briefsDir, sid, staffBrief({ agent: agent.name, person, md: agent.md, server: MCP_SERVER_NAME }))
+    // F-297: v2 when sending is on for this person now, else v1 exactly as before; the chat records it and the hub asks the switch again at every send.
+    const policy = staffPolicyFor(agent)
+    const briefPath = writeBrief(briefsDir, sid, staffBrief({ agent: agent.name, person, md: agent.md, server: MCP_SERVER_NAME, policy }))
     const mcpFile = path.join(staffDir, 'mcp', `${sid}.json`)
-    writeAtomic(mcpFile, `${json(staffMcpConfig(MCP_SERVER_NAME, process.execPath, shim))}\n`)
+    writeAtomic(mcpFile, `${json(staffMcpConfig(MCP_SERVER_NAME, process.execPath, shim, policy))}\n`)
     const dflt = defaultsNow()
     voiceLockGiven = null
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd: room, briefPath, mcpConfig: mcpFile, strictMcp: true, model: dflt.model, effort: dflt.effort || undefined, resume, cols: size.cols, rows: size.rows, policy: STAFF_POLICY })
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd: room, briefPath, mcpConfig: mcpFile, strictMcp: true, model: dflt.model, effort: dflt.effort || undefined, resume, cols: size.cols, rows: size.rows, policy })
     voiceLockGiven = null
     launched.set(sid, { effort: dflt.effort, at: new Date().toISOString(), ultracode: false })
     heartbeat.opened(sid)
     chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new'), ...startedBy(sid) })
     startCause.delete(sid)
-    log?.info(`chat ${sid.slice(0, 8)}: ${agent.name} started under the staff policy (${STAFF_POLICY})`)
+    log?.info(`chat ${sid.slice(0, 8)}: ${agent.name} started under the staff policy (${policy})`)
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
     return resume
   }
@@ -2749,7 +2814,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-221 (T4 review): held before it starts, whoever starts it, when a spoken line holds it (heldStart).
     heldStart(sid)
     // Order o7e6d: a staff Assistant starts only under the staff policy, never by any of the ways below.
-    if (isStaffAssistant(agent)) return staffStartHere(floor, agent, sid, size, nativeExecutable)
+    if (isStaffAssistant(agent)) return withStaffAdmission(agent, sid, () => staffStartHere(floor, agent, sid, size, nativeExecutable))
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
       const selection = openCodeSelection(agent, dflt)
@@ -2819,6 +2884,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-021 on the hub: who runs what, holding and letting go, stopping a chat wherever it runs
 
   /** Every chat running on the hub's PCs, by session. */
+  /** Whether this chat RUNS on the Server right now: in this process on the hub (or alone), and on a member PC what the hub's state frame says (the chat is on the hub's PC). */
+  function runsOnServer(sessionId: string): boolean {
+    return mode() === 'member' ? replica.where[sessionId]?.id === serverPcId() : !!chats.info(sessionId)
+  }
+
   function whereAll(): Record<string, { id: string; name: string; state: ChatState }> {
     const me = self()
     if (mode() === 'member') {
@@ -3121,7 +3191,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const staffClasses = hubStaffClasses(list)
       classesPushed = classesFingerprint(staffClasses)
       // Orders of95c / o9ccb / ocf0e: staffTyping, the choice in force here, so the members type by the Server's choice (PC link only).
-      const state = { t: 'state', floors: list, staffClasses, staffTyping: staffTyping.get(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
+      const state = { t: 'state', floors: list, staffClasses, staffTyping: staffTyping.get(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true }, terminalJudgesPerson: 1 }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -3304,6 +3374,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return
     }
     if (raw.t === 'state' && Array.isArray(raw.floors)) {
+      hubJudgesTerminal = raw.terminalJudgesPerson === 1
       replica = {
         engineSwitchContinuity: isObject(raw.engineSwitchContinuity) && raw.engineSwitchContinuity.version === 1 && raw.engineSwitchContinuity.failClosed === true && raw.engineSwitchContinuity.homePcPreparation === true
           ? { version: 1, failClosed: true, homePcPreparation: true } : undefined,
@@ -3726,14 +3797,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  async function openOnPeer(link: LinkPeer, floor: Floor, agent: FloorAgent, text?: string): Promise<ChatOpened> {
+  async function openOnPeer(link: LinkPeer, floor: Floor, agent: FloorAgent, text?: string, claim?: ReturnType<typeof terminalClaimLine>): Promise<ChatOpened> {
     // Order o7e6d: a staff Assistant never on another PC (its launch can't be shown here).
     if (isStaffAssistant(agent)) throw staffError("A person's own Assistant runs on the Server only.")
     requireLegacyExecution(agent, defaultsNow())
     const expectedEngine = engineFor(agent)
     if (isPcControl(floor)) { assertPcControlTarget(floor, link.id, {}); await requirePcControlPeer(link) }
     await requirePeerEngine(link, agent)
-    const opened = await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, expectedEngine, text }, 60_000)
+    // F-302 L4b: a member PC names the person it opens this for (member-terminal.ts), only to a Server whose state frame says it judges it; the Server refuses an `open` without a usable claim.
+    const opened = await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, expectedEngine, text, ...(claim && mode() === 'member' && hubJudgesTerminal ? claim : {}) }, 60_000)
     // Legacy Claude-only apps can still open Claude. They never prove support for a newer engine.
     if (opened.engine === undefined && expectedEngine !== 'claude') throw engineUpdateRequired(link.name)
     if (opened.engine !== undefined) requireRunningEngine(expectedEngine, opened.engine)
@@ -3994,6 +4066,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const pairLast = new Map<string, number>()
   const targetHits = new Map<string, number[]>()
   const broadcastLast = new Map<string, number>()
+  /**
+   * F-297: the checks a STAFF send asks again while it is delivered (its person's switch, its policy, the person's right on the target), kept by the Caller object THAT send passes as `actor`; deliveryAcl and typeInto read
+   * them. A WeakMap, so nothing is kept after the send, and only staffSendToChat ever registers one: every other caller is asked nothing more than before.
+   */
+  const liveChecks = new WeakMap<object, () => boolean>()
 
   /** Counts a message against the cooldowns; returns what takes it back (a message the chat refused because of a draft starts no cooldown). */
   function relayAllowed(from: string, to: string): () => void {
@@ -4022,6 +4099,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       else undo()
       throw e
     })
+  /** F-297: whether the checks a STAFF send registered (liveChecks) still hold, asked right before a write; a caller that registered none is never refused by this. */
+  const stillAllowed = (c: { sessionId: string }, opt: { caller?: Caller }) => !opt.caller || !liveChecks.has(opt.caller) || deliveryAcl(opt.caller, c.sessionId)
 
   function rosterOf(floor: Floor, me: FloorAgent) {
     const byId = new Map(floor.agents.map(a => [a.id, a]))
@@ -4161,6 +4240,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const confirmed = opt.confirmed === true && !oldWayForClaude(c.sessionId)
     assertMessageRuntime(c.sessionId,c.id,confirmed)
     const refuseDraft = false
+    // F-297: a STAFF send (the caller registered its live checks) NEVER joins unsent text, on any path: the hub looked first (staffSendToChat), and this is the last step, at the write itself.
+    const staffSend = !!opt.caller && liveChecks.has(opt.caller)
     if (confirmed) {
       let result: unknown, diagnostic: DeliveryReceipt | null = null
       if (c.id === self().id) {
@@ -4182,7 +4263,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         } finally { clearTimeout(timer) }
       }
       if (result === 'draft') {
-        if (!joinsDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
+        // F-297: a staff send NEVER joins unsent text (it is a person's own words, and the Enter that follows would submit them with it).
+        if (!joinsDraft(c.sessionId) || staffSend) throw apiError(409, draftWords(c.sessionId))
         // Nothing was typed by the confirmed sender. Send the old direct way, joining the unsent text.
         log?.info(`chat ${c.sessionId.slice(0, 8)}: the box holds unsent text; the message is typed the old direct way after it (no receipt)`)
         if (c.id === self().id) {
@@ -4206,11 +4288,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // confirmed way would. Every other caller (tune, effort, a direct send, the Assistant's lines) keeps its own answer for a chat that takes nothing.
       if (opt.confirmed === true) refuseFencedHere(c.sessionId)
       await mirrorYields(c.sessionId)
-      return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
+      // F-297: the last step before the write: a staff send asks its checks again (nothing for any other caller).
+      if (!stillAllowed(c, opt)) return false
+      return chats.type(c.sessionId, body, refuseDraft || staffSend ? { refuseDraft: true } : undefined)
     }
     const link = team?.member(c.id)
     if (!link) return false
-    const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(e => lostAnswer(e, opt))
+    if (!stillAllowed(c, opt)) return false
+    const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft || staffSend ? { refuseDraft: true } : {}) }).catch(e => lostAnswer(e, opt))
     if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
     return r === true
   }
@@ -4295,7 +4380,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch { return null }
   }
   const deliveryAcl = (actor: Caller, sid: string) => {
-    try { const at = bySession(sid); return !!at && (access.needChat(actor, at.agent, 'type', 'message delivery'), true) } catch { return false }
+    // F-297: a staff send's own checks (its person's switch, its policy, the scope) are asked here too; nothing is registered for any other actor.
+    try { const at = bySession(sid); return !!at && (access.needChat(actor, at.agent, 'type', 'message delivery'), true) && (liveChecks.get(actor)?.() ?? true) } catch { return false }
   }
   function sayIntent(raw: unknown): Omit<SayRequest, 'text'> {
     if (!isObject(raw)) return {}
@@ -4713,7 +4799,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** The route of one waiting question: its floor's in force, unless its chat's prompts stay the owner's whatever the floor's route. */
   const routeOfQuestion = (q: WaitingQuestion): QuestionRoute => {
     const f = floors.list().find(x => x.id === q.floorId), a = f?.agents.find(x => x.id === q.agentId)
-    return f && a && routableChat(f, a) ? questionRouteOf(f.id) : OWNER_ROUTE
+    // F4 (Agent 14): a prompt goes to the people of its floor only where they can answer it: a chat on the Server (on the default typing choice) stays the OWNER's, so his list, his badge and his heartbeat count it and it is never left with nobody.
+    return f && a && routableChat(f, a) && access.typingScopeOpen(a) ? questionRouteOf(f.id) : OWNER_ROUTE
   }
   /** The owner's share of the waiting questions (his floors' only) and a count of the ones with someone else, for when he looks. */
   const ownerQuestions = () => splitQuestions(waitingQuestions(), routeOfQuestion)
@@ -4724,8 +4811,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * PC-control floor or slot, a person's own Assistant or the Orchestrator. Asked when listing, before an answer, and again right before the
    * key is written into the chat.
    */
+  /** The words of a refused answer, Cancel or Ignore: when the person IS one of the floor's chosen people and only the typing choice stops them (a chat on the Server), say that, not that they were not chosen. */
+  function decisionRefusedWords(c: Caller, at: { floor: Floor; agent: FloorAgent } | null): string {
+    if (at && c.person && routableChat(at.floor, at.agent) && decidesOn(questionRouteOf(at.floor.id), c.person.id) && !access.typingScopeOpen(at.agent)) return 'This chat runs on the Server, and a chat on the Server is answered by the owner of this app unless he opens typing on every PC.'
+    return "This is for the owner of this app, or for the people he chose to decide for this chat's floor; that is not you now."
+  }
   function decides(c: Caller, at: { floor: Floor; agent: FloorAgent } | null): boolean {
     if (!at || !c.person || access.isAdmin(c) || !routableChat(at.floor, at.agent)) return false
+    // F-300 S3 (Lead's safe default): their digit IS typing into that chat, so a chat that is the Server's is theirs only on the owner's wide typing choice (access.typingScopeOpen: the same terms as mayType's scope), never by default. Asked at the list, the
+    // answer, the Cancel and the last check before the key is written, because they all come through here.
+    if (!access.typingScopeOpen(at.agent)) return false
     return decidesOn(questionRouteOf(at.floor.id), c.person.id)
   }
 
@@ -4785,6 +4880,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // Who was present at a chat: a line that could not be written is told once, with who did what (chat-presence.ts).
       const lostPresence = presence.news()
       if (lostPresence.length) lines.push(`${lostPresence.length} presence line${lostPresence.length === 1 ? ' was' : 's were'} NOT written to the chats' presence record (the file could not be written): ${lostPresence.map(e => describePresence(e)).join('; ')}.`)
+      // F-297: what a person's own Assistant sent, whose line could not be written: told once, with who and to which chat (staff-sends.ts; the words never).
+      const lostStaffSends = staffSends.news()
+      if (lostStaffSends.length) lines.push(`${lostStaffSends.length} staff Assistant send line${lostStaffSends.length === 1 ? ' was' : 's were'} NOT written to the staff-sends record (the file could not be written): ${lostStaffSends.map(e => describeStaffSend(e)).join('; ')}.`)
       if (prepared.size) lines.push(`${prepared.size} card${prepared.size === 1 ? ' is' : 's are'} prepared for you in the Send tab.`)
       const replies = orders.list().filter(x => x.pending).length
       if (replies) lines.push(`${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.`)
@@ -5385,6 +5483,95 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const toolsRefreshTimer = setInterval(() => void refreshAssistantTools(), o.toolsRefreshEveryMs ?? 60_000)
   toolsRefreshTimer.unref?.()
 
+  // ---------------------------------------------------------------------------------------
+  // F-297 stage B (Lead approved f297-design.md; his orders o7712, odbb7 and od8e2)
+
+  /** Kept once the one-time seed below has been decided (seeded, or a choice was already there): never again after it, whatever the owner does to the row. */
+  const staffSeedFile = path.join(o.dir, 'staff-send-seed.json')
+  let staffSeedSaid = false
+  /**
+   * His order od8e2, "yes let ravis be on since start": ONCE, at the build's first start on the Server (and only when the real app asks for it: `staffSendSeed`, set by main.ts), Ravi's `assistant-send` switch is turned ON in
+   * Settings > Access, logged there as a change by the app that cites his orders. It never overwrites a choice (the access store refuses), and the owner changes or removes it like any other with one tap; once it
+   * has been decided it is never made again, so turning Ravi off stays off. With no `rteja` in the CRM directory yet nothing is turned on, and that is said in the log (it is looked for again).
+   */
+  function seedStaffSend(): void {
+    if (!o.staffSendSeed || !o.featureAccess || !o.auth || mode() === 'member' || existsSync(staffSeedFile)) return
+    try {
+      const ravi = o.auth.directory().find(u => u.username.toLowerCase() === 'rteja')
+      if (!ravi) {
+        if (!staffSeedSaid) log?.warn("staff send: Ravi's switch was NOT turned on from the start: there is no `rteja` in the CRM directory yet (it is looked for again)")
+        staffSeedSaid = true
+        return
+      }
+      const done = o.featureAccess.seed(STAFF_SEND_FEATURE, { mode: 'people', people: [ravi.id.toLowerCase()] }, { id: 'system', name: 'the app (F-297: his orders o7712, odbb7 and od8e2)' })
+      if (done === 'refused') {
+        log?.warn('staff send: the first-start seed of the switch was refused by the access store; nothing was turned on')
+        return
+      }
+      writeAtomic(staffSeedFile, `${JSON.stringify({ at: new Date().toISOString(), outcome: done, person: ravi.id.toLowerCase() })}\n`)
+      log?.info(done === 'seeded' ? "staff send: Ravi's switch was turned on from the start (his orders o7712, odbb7 and od8e2); the owner can turn it off in Settings > Access" : "staff send: the 'assistant-send' row already had a choice, so nothing was turned on")
+    } catch (e) {
+      log?.warn(`staff send: the first-start seed of the switch could not be made (${message(e)})`)
+    }
+  }
+
+  /** A policy the switch no longer matches, tried at most once in a while per chat. */
+  const staffConvergeTried = new Map<string, number>()
+  /** How often it looks, how long an Assistant must have been quiet, and when a try that did not work is made again: the app's options (tests shorten them) or the stated times (staff-send.ts). */
+  const converge = staffConvergeTimes(o)
+  /** When each running staff Assistant was first seen QUIET (idle, nothing in flight) by the looks below: cleared at the first look that finds it anything else. */
+  const staffQuietSince = new Map<string, number>()
+  /**
+   * A person's Assistant is started under the policy its switch asks for at that moment, and a chat records it. When the owner turns the switch on (or off) while the Assistant runs, its recorded policy no longer
+   * matches. THE COST, said plainly: that person's Assistant chat is RESTARTED, once, and its conversation is resumed. It is done only when the chat has been QUIET for at least a minute (60 s by default,
+   * seen on consecutive looks that are 20 s apart): idle, with no question on its screen, no unsent words in its box and none of the app's own texts waiting to be typed into it (so no send to it, and no send
+   * from it, is in flight); never while it is working or asking. The restart is the app's own (restartChat) and its start line says why (cause `switch`; the presence record's `by: app` is restartChat's default). Once
+   * per chat and change, tried again after five minutes if that did not work; never a chat that is not a staff Assistant or runs under a policy this build does not know.
+   */
+  async function convergeStaffPolicies(): Promise<void> {
+    if (closing || mode() === 'member' || !recoveryDone) return
+    const live = nativeChats.live()
+    for (const sid of [...staffQuietSince.keys()]) if (!live.some(run => run.sessionId === sid)) staffQuietSince.delete(sid)
+    for (const run of live) {
+      if (!isStaffPolicy(run.policy)) continue
+      let at: { floor: Floor; agent: FloorAgent } | null = null
+      try { at = bySession(run.sessionId) } catch { at = null }
+      if (!at || !isStaffAssistant(at.agent)) continue
+      if (staffPolicyFor(at.agent) === run.policy) {
+        staffConvergeTried.delete(run.sessionId)
+        staffQuietSince.delete(run.sessionId)
+        continue
+      }
+      // Quiet: idle, no question (the state says it), no unsent words in its box, nothing of the app's waiting to be typed into it.
+      if (run.state !== 'idle' || hasDraft(run.sessionId) || (chats.waiting?.(run.sessionId) ?? 0) > 0) {
+        staffQuietSince.delete(run.sessionId)
+        continue
+      }
+      const since = staffQuietSince.get(run.sessionId) ?? Date.now()
+      staffQuietSince.set(run.sessionId, since)
+      if (Date.now() - since < converge.idle) continue
+      const last = staffConvergeTried.get(run.sessionId)
+      if (last !== undefined && Date.now() - last < converge.retry) continue
+      staffConvergeTried.set(run.sessionId, Date.now())
+      staffQuietSince.delete(run.sessionId)
+      startCause.set(run.sessionId, 'switch')
+      try {
+        if (await restartChat(run.sessionId)) log?.info(`staff send: ${at.agent.name}'s chat ${run.sessionId.slice(0, 8)} was restarted to start under the policy its switch asks for now`)
+      } catch (e) {
+        log?.warn(`staff send: couldn't restart chat ${run.sessionId.slice(0, 8)} for its switch: ${message(e)}`)
+      } finally {
+        // The start that took it has already used it; one that never happened must not leave it for the next start of this chat.
+        startCause.delete(run.sessionId)
+      }
+    }
+  }
+  seedStaffSend()
+  const staffConvergeTimer = setInterval(() => {
+    seedStaffSend()
+    void convergeStaffPolicies()
+  }, converge.every)
+  staffConvergeTimer.unref?.()
+
   /** The id of the order a message from `agent` to `toSid` is, or null when it is none (not the Assistant's, or an acknowledgement or a reply). */
   function orderFrom(floor: Floor, agent: FloorAgent, sid: string, toSid: string, body: string): string | null {
     if (!orderReplies() || mode() === 'member' || !isOrchestratorAgent(floor.name, agent)) return null
@@ -5671,10 +5858,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  /** Order o7e6d: a tool call a staff Assistant may not make (nothing was done). */
-  function staffDenied(name: string) {
+  /** Order o7e6d: a tool call a staff Assistant may not make (nothing was done). F-297: under staff-v2 the words also say it sends messages to its person's chats. */
+  function staffDenied(name: string, policy?: unknown) {
     log?.info(`staff policy: tool ${String(name).slice(0, 60)} refused`)
-    return Object.assign(apiError(403, 'This Assistant only talks, reads its own chats and looks at its own page; that tool is not open to it.'), { code: 'staff-policy' })
+    return Object.assign(apiError(403, policy === STAFF_POLICY_V2 ? "This Assistant only talks, reads its own chats, looks at its own page and sends messages to the chats its person may type into; that tool is not open to it." : 'This Assistant only talks, reads its own chats and looks at its own page; that tool is not open to it.'), { code: 'staff-policy' })
   }
 
   /**
@@ -5687,8 +5874,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const run = sid ? chats.info(sid) : null
     // A fenced run stays fenced even when its agent is now someone else's or no staff Assistant (Lead, 15 Nov); S1, B3: the one check (runFenced).
     if (!isStaffAssistant(agent) && !run?.policy && !(sid && runFenced(sid))) return
-    if (run?.policy !== STAFF_POLICY) throw fencedToolError(sid, name, agent)
-    if (!staffToolAllowed(name)) throw staffDenied(name)
+    const policy = run?.policy
+    if (!isStaffPolicy(policy)) throw fencedToolError(sid, name, agent)
+    if (!staffToolAllowed(name, policy)) throw staffDenied(name, policy)
   }
 
   /** Order o7e6d S1: the open of an agent whose chat runs here fenced is refused (409, code staff-policy); nothing is stopped or started. */
@@ -5710,7 +5898,147 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Order o7e6d: what a staff Assistant's read tools show is that person's own chats only (own-assistant.ts ownAssistantMayUse); null: not a staff chat. */
   function staffPerson(sid: string, agent: FloorAgent): string | null {
-    return sid && chats.info(sid)?.policy === STAFF_POLICY ? agent.owner?.id ?? '' : null
+    return sid && isStaffPolicy(chats.info(sid)?.policy) ? agent.owner?.id ?? '' : null
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-297 (stage A; Lead approved f297-design.md): a person's own Assistant under staff-v2 sends ONE message to a chat its person may type into. The decision is made HERE, on the hub, at every send, by the page's own
+  // typing rule; the Assistant's words are checked (staff-send.ts), the line the chat sees is the hub's and never the sender's, and the send is written AHEAD (staff-sends.ts) and fails closed.
+
+  /** The owner's per-person switch (Settings > Access, 'assistant-send'): is it open to this person NOW? Missing, unreadable or no sign-in wired = off. */
+  function staffSendOn(c: Caller): boolean {
+    return o.featureAccess?.allows(c, STAFF_SEND_FEATURE) === true
+  }
+  /** The policy a person's own Assistant STARTS under: v2 when sending is on for them now, else v1 (the old way, byte for byte). The chat records it; the hub asks the switch again at every send. */
+  function staffPolicyFor(agent: FloorAgent): StaffPolicy {
+    return staffSendOn(access.asChat(agent)) ? STAFF_POLICY_V2 : STAFF_POLICY
+  }
+  /** The person's own count of sends (5 a minute, 60 an hour), in memory. */
+  const staffRate = createStaffRate()
+  /** What staff Assistants sent and where, never the text (staff-sends.ts); GET /staff-sends. */
+  const staffSends = createStaffSendRecord({ file: path.join(o.dir, 'staff-sends.jsonl'), error: m => log?.error(m) })
+  /**
+   * Whether this person may SEND to that agent's chat: the page's own typing rule (an agent they own, or a share "Can type", under the owner's staff-typing choice: access.mayType) on an agent they can see at all;
+   * never a PC-control slot or a person's Assistant. The Assistant never has more than its person: a "Can view" share is not sendable because they cannot type there either.
+   */
+  const staffMaySendTo = (me: Caller, target: FloorAgent): boolean => !target.pcControlSlot && !isPersonAssistant(target) && access.rights(me, target) !== null && access.mayType(me, target)
+  /** A staff-v2 chat whose person's switch is ON now: what the widened lists (and the send) are for. With the switch off the lists are v1's own-chats-only ones again. */
+  const staffScoped = (sid: string, me: Caller): boolean => !!sid && chats.info(sid)?.policy === STAFF_POLICY_V2 && staffSendOn(me)
+
+  /**
+   * A READ WIDENING, NAMES ONLY (Lead: said in the commit and tested on its own): what a staff-v2 Assistant sees of the live chats is every chat its person can see on the Agents page, as a floor, an agent, a role, what it is doing
+   * (working, asking, idle), a PC and `canSend`. Never a word of any chat. A PC-control slot and a person's Assistant are not listed.
+   */
+  function staffScopeChats(sid: string, agent: FloorAgent, me: Caller) {
+    const out: { sessionId: string; floor: string; agent: string; role: string; doing: string; pc: string; canSend: boolean }[] = []
+    for (const [s, w] of Object.entries(whereAll())) {
+      if (s === sid) continue
+      const at = bySession(s)
+      if (!at || at.agent.pcControlSlot || isPersonAssistant(at.agent) || access.rights(me, at.agent) === null) continue
+      out.push({ sessionId: s, floor: at.floor.name, agent: at.agent.name, role: at.agent.role ?? '', doing: w.state, pc: w.name, canSend: staffMaySendTo(me, at.agent) })
+    }
+    return { you: agent.name, scope: 'every chat that is yours or was shared with you: names and states only; canSend says whether you may send to it', chats: out }
+  }
+  /** The roster of the same scope (names only): every floor with something the person can see, each agent online, offline or never opened, and `canSend`. */
+  function staffScopeRoster(me: Caller) {
+    const where = whereAll()
+    const out: { floor: string; total: number; online: number; agents: { name: string; role: string; status: string; doing: string | null; pc: string | null; sessionId: string | null; canSend: boolean }[] }[] = []
+    for (const f of allFloors()) {
+      const seen = f.agents.filter(a => !a.pcControlSlot && !isPersonAssistant(a) && access.rights(me, a) !== null)
+      if (!seen.length) continue
+      const agents = seen.map(a => {
+        const live = a.sessionId ? where[a.sessionId] : undefined
+        return { name: a.name, role: a.role ?? '', status: live ? 'online' : a.sessionId ? 'offline' : 'never opened', doing: live ? live.state : null, pc: live ? live.name : null, sessionId: live ? (a.sessionId ?? null) : null, canSend: staffMaySendTo(me, a) }
+      })
+      out.push({ floor: f.name, total: agents.length, online: agents.filter(a => a.status === 'online').length, agents })
+    }
+    return { scope: 'the floors that are yours or were shared with you: names and states only', floors: out }
+  }
+
+  /**
+   * The send itself, in the order the design says: the person's switch; the chat (running, not the sender's own); the scope (access.mayType, the page's own rule); the words; the chat's screen (a question, unsent text: a staff
+   * send NEVER joins a person's unsent words); the person's rate and today's pair and target cooldowns; the ATTEMPT line written ahead (nothing is typed if it cannot be); then the hub's line and, as the very last step, the
+   * checks again. Every refusal is one record line and plain words that say nothing was sent. The Assistant is told where the answer is: it does not come back here (stage 1).
+   */
+  async function staffSendToChat(sid: string, floor: Floor, agent: FloorAgent, me: Caller, args: Record<string, unknown>): Promise<string> {
+    const personName = agent.owner?.name || agent.owner?.username || 'its person'
+    const person = { id: agent.owner?.id ?? '', name: personName }
+    const from = { id: sid.slice(0, 8), agent: agent.name, floor: floor.name }
+    const named = typeof args.sessionId === 'string' && UUID_RE.test(args.sessionId) ? args.sessionId.toLowerCase() : null
+    let at: { floor: Floor; agent: FloorAgent } | null = null
+    try { at = named ? bySession(named) : null } catch { at = null }
+    const refuse = (reason: StaffSendRefusal, status: number, words: string): never => {
+      staffSends.refused({ kind: 'send-refused', reason, person, from, ...(named && at ? { to: { id: named.slice(0, 8), agent: at.agent.name, floor: at.floor.name } } : {}) })
+      throw Object.assign(apiError(status, words), { code: 'staff-send', reason })
+    }
+    if (!staffSendOn(me)) return refuse('switch-off', 403, staffSendWords('switch-off'))
+    const w = named ? whereAll()[named] : undefined
+    if (!named || !at || !w) return refuse('chat-gone', 404, staffSendWords('chat-gone'))
+    if (named === sid || !staffMaySendTo(me, at.agent)) {
+      access.deny(me, 'tool send_to_chat (staff)', named)
+      return refuse('not-in-scope', 403, staffSendWords('not-in-scope'))
+    }
+    const checked = staffSendText(args.text)
+    if (!checked.ok) return refuse('text', 400, staffSendTextWords(checked.why))
+    // M1, first: a refusal from here on starts no cooldown and counts nothing.
+    if (atPrompt(named)) return refuse('at-prompt', 409, promptWords(named))
+    if (hasDraft(named)) return refuse('draft', 409, draftWords(named))
+    const taken = staffRate.take(person.id)
+    if ('limited' in taken) return refuse('rate', 429, staffSendWords('rate', taken.limited))
+    let undoRelay: () => void
+    try {
+      undoRelay = relayAllowed(sid, named)
+    } catch (e) {
+      taken.undo()
+      return refuse('rate', 429, message(e))
+    }
+    const undo = () => {
+      taken.undo()
+      undoRelay()
+    }
+    const target = { id: named.slice(0, 8), agent: at.agent.name, floor: at.floor.name }
+    try {
+      staffSends.attempt({ kind: 'send-attempt', person, from, to: target, pc: w.name })
+    } catch (e) {
+      undo()
+      log?.error(`staff sends: the attempt could not be written, so nothing was sent (${message(e)})`)
+      return refuse('record-failed', 409, staffSendWords('record-failed'))
+    }
+    const ended = (outcome: StaffSendOutcome) => staffSends.outcome({ kind: 'send-outcome', outcome, person, from, to: target, pc: w.name })
+    const line = neutralizeMarks(`${staffSendPrefix({ assistant: agent.name, floor: floor.name, sid, person: personName })} ${checked.text}`)
+    /** The checks again (fail closed: any error is "no"): the person's switch, this chat's policy, and the person's right on the target as it is NOW. */
+    const still = () => {
+      try {
+        const live = bySession(named)
+        return staffSendOn(me) && chats.info(sid)?.policy === STAFF_POLICY_V2 && !!live && staffMaySendTo(me, live.agent)
+      } catch {
+        return false
+      }
+    }
+    // From here on the checks above are asked AGAIN at the last step before the write (typeInto's stillAllowed; deliveryAcl for a confirmed delivery), so a right taken away between the first look and the write stops the send.
+    liveChecks.set(me, still)
+    await o.staffSendGap?.()
+    let delivered = false
+    try {
+      delivered = await typeIntoOrUndo(undo, { sessionId: named, id: w.id }, line, undefined, me)
+    } catch (e) {
+      const code = (e as { code?: string } | null)?.code
+      ended(code === 'delivery-unconfirmed' || code === 'delivery-pending' ? 'handed-over' : still() ? 'blocked' : 'revoked-mid-send')
+      throw e
+    }
+    if (!delivered) {
+      const revoked = !still()
+      // Unsent words appeared in the box after the first look: the pool refused the write (typeInto asks it to for a staff send) and typed nothing.
+      if (!revoked && hasDraft(named)) {
+        ended('blocked')
+        throw Object.assign(apiError(409, draftWords(named)), { code: 'staff-send', reason: 'draft' })
+      }
+      ended(revoked ? 'revoked-mid-send' : 'stopped')
+      throw Object.assign(apiError(revoked ? 403 : 409, revoked ? STAFF_SEND_REVOKED_WORDS : 'That chat stopped before the message reached it. Nothing was sent.'), { code: 'staff-send', reason: revoked ? 'not-in-scope' : 'chat-gone' })
+    }
+    ended('delivered')
+    log?.info(`staff send: chat ${sid.slice(0, 8)} sent a message to chat ${named.slice(0, 8)}`)
+    return staffSendDone(named, personName)
   }
 
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
@@ -5721,14 +6049,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
     // Order o7e6d: a chat started under a policy is held to it here too, before anything is passed on (staffGate decides for this pool's chats).
-    if (me.policy && (me.policy !== STAFF_POLICY || !staffToolAllowed(name))) throw staffDenied(name)
+    if (me.policy && (!isStaffPolicy(me.policy) || !staffToolAllowed(name, me.policy))) throw staffDenied(name, me.policy)
     // C0: known runtime provenance is checked before forwarding, regardless of current binding or Server availability.
     if (runFenced(me.sessionId)) throw fencedToolError(me.sessionId, name, null)
     if (mode() === 'member' && !isLocalSession(me.sessionId)) {
       // C0: normal forwarding needs a reachable Server, as before S1; it does NOT require a fresh administrator class for ordinary chats.
       // Only a staff-policy run's Server tools wait for fresh remote state. A local own-store origin stays independent of freshness.
       const link = needHub()
-      if (me.policy === STAFF_POLICY && !originInOwnStore(me) && !replicaIsFresh()) throw Object.assign(apiError(503, `${team?.hub()?.name ?? 'The Server'} has just been reached again and its floors are not known fresh here yet, so this Assistant's Server tools wait; try again in a moment.`), { code: 'hub-offline' })
+      if (isStaffPolicy(me.policy) && !originInOwnStore(me) && !replicaIsFresh()) throw Object.assign(apiError(503, `${team?.hub()?.name ?? 'The Server'} has just been reached again and its floors are not known fresh here yet, so this Assistant's Server tools wait; try again in a moment.`), { code: 'hub-offline' })
       return request<string>(link, 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
         if (['send_to_chat', 'app_send_to_chat', 'broadcast_to_chats'].includes(name) && [502, 504].includes(error?.status)) throw Object.assign(apiError(409, 'Delivery is not confirmed after the connection failed; pending messages may already be submitted or may still complete. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
         throw error
@@ -5884,7 +6212,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (pcName && !pc) throw apiError(404, `No PC called ${String(args.pc)} within reach; app_chats lists them`)
         const opened =
           pc && !pc.here
-            ? await openOnPeer(peerOf(pc.id), f, a)
+            ? await openOnPeer(peerOf(pc.id), f, a, undefined, terminalClaimLine(me, access.isAdmin(me)))
             : await openChat(f.id, a.id, { takeOver: args.takeOver === true }, undefined, undefined, { kind: 'chat', chat: presenceChat(sid) })
         return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
       }
@@ -5911,6 +6239,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (a.sessionId === sid) return `${kept}. This is your own chat: it keeps its effort until it starts again (type /effort ${level} in it to change it now).`
         if (w.state === 'running') return `${kept}. Its chat is working right now, so it keeps its effort until it starts again; ask again once it is waiting to set it at once.`
         if (atPrompt(a.sessionId)) return `${kept}. ${promptWords(a.sessionId)}`
+        // F-302 (Agent 14's L5): typed into the chat only where its owner may type (mayType, with the Server scope); otherwise it is kept for the chat's next start.
+        if (!access.mayType(me, a)) return `${kept}. Typing into its running chat is not open to its owner (Settings > Access, who may type in chats), so it keeps its effort until it starts again.`
         if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, `/effort ${level}`, { human: true }))) return `${kept}; its chat stopped before it could be set now.`
         log?.info(`${agent.name} set ${a.name}'s effort to ${level}`)
         return `${kept}, and its running chat (on ${w.name}) is on ${level} now: /effort ${level} was typed into it.`
@@ -5938,6 +6268,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return `Stopping chat ${target.sessionId}.`
       }
       case 'list_chats': {
+        // F-297: a staff-v2 Assistant with its person's switch ON sees the chats of its person's scope, NAMES AND STATES ONLY (staffScopeChats); with the switch off it is v1's own-chats-only list again.
+        if (staffScoped(sid, me)) return json(staffScopeChats(sid, agent, me))
         const byId = new Map(floor.agents.map(a => [a.id, a]))
         // o7e6d: a staff Assistant sees its person's own chats only (never one shared with them).
         const person = staffPerson(sid, agent)
@@ -5949,6 +6281,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json({ floor: floor.name, you: agent.name, chats: others })
       }
       case 'floor_roster': {
+        // F-297: the same widening, names only (staffScopeRoster), for a staff-v2 Assistant whose switch is ON.
+        if (staffScoped(sid, me)) return json(staffScopeRoster(me))
         // o7e6d: a staff Assistant sees its person's own agents only.
         const person = staffPerson(sid, agent)
         return json(rosterOf({ ...floor, agents: floor.agents.filter(a => a.id === agent.id || (access.rights(me, a) !== null && (person === null || ownAssistantMayUse(a.owner?.id, person)))) }, agent))
@@ -6064,6 +6398,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
       }
       case 'send_to_chat': {
+        // F-297: a person's own Assistant under staff-v2 sends by its own rules (staffSendToChat); staffGate already refused v1 and every other policy.
+        if (chats.info(sid)?.policy === STAFF_POLICY_V2) return staffSendToChat(sid, floor, agent, me, args)
         const c = siblingOf(floor, args.sessionId)
         if (c.sessionId === sid) throw apiError(400, "That's your own chat")
         mayOn(c.sessionId, 'type')
@@ -7005,7 +7341,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // at the last check before the key is written. Their right is the floor's, not a share of the chat (his "1A": unshared chats too).
     if (!access.isAdmin(caller)) {
       const at = decisions && agent.sessionId ? floors.bySession(agent.sessionId) : null
-      if (!at || at.agent.id !== agent.id || !decides(caller, at)) throw authError(403, decisions ? "This is for the owner of this app, or for the people he chose to decide for this chat's floor; that is not you now." : 'This is for the owner of this app.', 'admin-only')
+      if (!at || at.agent.id !== agent.id || !decides(caller, at)) throw authError(403, decisions ? decisionRefusedWords(caller, at) : 'This is for the owner of this app.', 'admin-only')
     } else access.needChat(caller, agent, need, 'human approval/send')
     const at = agent.sessionId ? whereAll()[agent.sessionId] : null
     if (mode() === 'member' && (at?.id ?? agent.homePc) !== self().id) throw Object.assign(apiError(409, 'Sign in on the Server page to act on a chat running on another PC.'), { code: 'hub-sign-in-required', hubOrigin: null })
@@ -7171,7 +7507,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
         const p = await promptOfChat({ sessionId: sid, id: w.id })
         // On his list, a floor whose decisions go to people says whose they are.
-        const route = admin && routableChat(f, a) ? questionRouteOf(f.id) : OWNER_ROUTE
+        const route = admin && routableChat(f, a) && access.typingScopeOpen(a) ? questionRouteOf(f.id) : OWNER_ROUTE
         return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable, ...(route.to === 'people' ? { routedTo: routeNames(route) } : {}) }
       }),
     )
@@ -7466,7 +7802,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * (`/model`, `/effort`, `/effort ultracode`). A chat that is working, or at a question, or stopped, takes
    * them at its next start; the answer says which.
    */
-  async function tuneAgent(floorId: string, agentId: string, raw: unknown): Promise<TuneAnswer> {
+  async function tuneAgent(floorId: string, agentId: string, raw: unknown, caller?: Caller): Promise<TuneAnswer> {
     requireLegacyExecution(agentOf(floorOf(floorId), agentId), defaultsNow())
     if (!isObject(raw)) throw apiError(400, 'Expected {model?, effort?, ultracode?}')
     if (raw.codexModel !== undefined || raw.codexEffort !== undefined) return tuneCodex(floorId, agentId, raw)
@@ -7507,6 +7843,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!w || !a.sessionId) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat isn't running, so it applies when the chat next starts.` }
     if (w.state === 'running') return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat is working right now, so it applies at its next start. Change it again once the chat is waiting to apply it at once.` }
     if (w.state === 'question') return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat is at a question, so it applies at its next start. Answer it, then change it again to apply it at once.` }
+    // F-302 (Agent 14's L5): /model and /effort are TYPED into the running chat, so a caller who is not an administrator needs the typing right on it (mayType, with the Server scope). The setting itself is theirs as the
+    // chat's owner and is kept; it applies at the chat's next start.
+    if (caller && !access.mayType(caller, a)) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; typing into its running chat is not open to you on this chat, so it applies at its next start.` }
     for (const [i, c] of commands.entries()) {
       if (i > 0) await new Promise(r => setTimeout(r, TUNE_GAP_MS))
       if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, c, { human: true }))) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat stopped before it could be set now, so it applies at its next start.` }
@@ -7939,6 +8278,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       pushState()
       return next
     }, 'local'],
+    // F-302 L4 (Agent 14's R2): the PCs the owner marks as HIS, so that an unsigned page there (sign-in off) counts as the app's owner on a member's terminal stream. The owner's only (access.ts POLICY) and a signed-in human's, as the staff-typing choice.
+    ['GET', /^\/owner-pcs$/, () => ({ pcs: ownerPcs.list(), ...(ownerPcs.unreadable() ? { unreadable: true as const } : {}) })],
+    ['PUT', /^\/owner-pcs$/, (_, r) => {
+      if (mode() === 'member') throw Object.assign(apiError(409, "The owner's PCs are marked on the Server's page."), { code: 'hub-sign-in-required', hubOrigin: null })
+      const by = requireCrmHuman(o.auth, r, true)
+      const next = ownerPcs.set(r.body)
+      log?.info(`owner PCs: ${describeHuman(by)} marked ${next.pcs.length} PC(s) as his`)
+      return next
+    }, 'local'],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
     // oc58f follow-up: the answer says when the saved choice could not be read (the card is in force until he chooses again).
     // o0c50: where each floor's questions are pushed to the owner (owner only, access.ts POLICY); rights are unchanged.
@@ -8122,7 +8470,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Forwarded on members: an old hub must answer 404, rather than a new member promising safety for it.
     ['GET', /^\/engine-switch-capabilities$/, () => ({ version: 1, failClosed: true, homePcRouting: true })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
-    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body, callerOf(r))],
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
     // o0c50: ?scope=mine (the default) | all | floor:<id> (shared/question-routing.ts); anything else is refused, never widened.
     ['GET', /^\/approvals$/, (_, r) => {
@@ -8169,6 +8517,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Who was present at a chat (chat-presence.ts): newest first, with the lines that could not be written since this run started, and WHAT THE RECORD DOES NOT COVER (`notRecorded`, a
     // constant: an empty stretch is "nothing listed as recorded", never "nothing happened"). The owner's only (POLICY; no ROUTES rule) AND a signed-in human's (humanOnly: R6, as floor-events above).
     ['GET', /^\/chat-presence$/, (_, r) => (humanOnly(r), { presence: presence.list(Math.min(500, Number(r.query.get('limit')) || 100)), notRecorded: NOT_RECORDED, ...(presence.unrecorded().length ? { unrecorded: presence.unrecorded() } : {}) })],
+    // F-297: what a person's own Assistant sent and where, NEVER the text (staff-sends.ts): newest first, what the record does not cover (`notRecorded`, a constant), and the lines that could not be written since this run
+    // started. The owner's only: an OWNER row in POLICY AND humanOnly from the start (a chat's key, even the owner's own chat's, is refused, as is a program with only the app's token).
+    ['GET', /^\/staff-sends$/, (_, r) => (humanOnly(r), { sends: staffSends.list(Math.min(500, Number(r.query.get('limit')) || 100)), notRecorded: STAFF_SEND_NOT_RECORDED, ...(staffSends.unrecorded().length ? { unrecorded: staffSends.unrecorded() } : {}) })],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
@@ -8233,6 +8584,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const say = isObject(r.body) && typeof r.body.say === 'string' ? r.body.say.slice(0, MAX_SAY_TEXT) : undefined
         if (mode() === 'member') return await request<ChatOpened>(needHub(), 'http', { method: 'POST', rest: `/floors/${enc(id)}/agents/${enc(agentId)}/run-on`, body: { pc, say } }, 60_000)
         const agent = agentOf(floorOf(id), agentId)
+        // F-302 (Agent 14's L2): a message typed with the start IS typing: it needs the typing right on the chat as it will be, on the PC it is asked to run on (a chat that runs on the Server now counts as the
+        // Server's even while it moves). A start without words stays the owner's, as the route table says.
+        if (say) access.needChat(callerOf(r), { ...agent, homePc: pc }, 'type', 'run-on with a message')
         if (engineFor(agent) === 'opencode' && agent.opencodeSession && agent.homePc && agent.homePc !== pc) throw apiError(409, 'OpenCode conversations resume on their home PC. Switch engines to carry the conversation to another PC.')
         let opened: ChatOpened
         let name = self().name
@@ -8585,7 +8939,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
         // Order o7e6d: a chat with a policy, or a staff Assistant's quarantined run, is told the staff tools only (none unless it runs under the
         // staff policy). Its shim does not ask.
-        if (me.policy || isStaffSid(me.sessionId)) return r.query.get('stamp') === '1' ? { version: STAFF_TOOLS_STAMP } : { version: STAFF_TOOLS_STAMP, tools: me.policy === STAFF_POLICY ? STAFF_TOOLS : [] }
+        if (me.policy || isStaffSid(me.sessionId)) {
+          // F-297: each staff policy has its own list and stamp; no policy, or one this build does not know, keeps v1's stamp and an empty list, as before.
+          const known = isStaffPolicy(me.policy) ? me.policy : null
+          const version = staffToolsStampOf(known ?? STAFF_POLICY)
+          return r.query.get('stamp') === '1' ? { version } : { version, tools: known ? staffToolsOf(known) : [] }
+        }
         // Only a request that says it is asking for the list (not just checking its stamp) is a chat given the list.
         if (r.query.get('given') === '1') toolsSeen.note(me.sessionId, TOOLS_NOW)
         return r.query.get('stamp') === '1' ? { version: TOOLS_NOW } : { version: TOOLS_NOW, tools: TOOLS }
@@ -8607,7 +8966,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // (a staff-policy run), never moves it to another session (no session id is taken from the report), and gets an empty answer BEFORE any
         // recall: shared memory is never read for it, and its 4-tool gate is not bypassed (memory_* stay refused).
         if (info && (info.policy || isStaffSid(info.sessionId))) {
-          if (info.policy === STAFF_POLICY) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, null)
+          if (isStaffPolicy(info.policy)) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, null)
           return { text: '' }
         }
         if (info) {
@@ -8765,6 +9124,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (r.method === 'DELETE' && /^\/floors\/[^/]+$/.test(r.rest)) for (const agent of floorOf(params[0]).agents) requireLegacyExecution(agent, defaultsNow())
   }
 
+  /**
+   * F-300 S0 (the census, person-assistant-doors.ts): a person (not the owner of the app) keeps on their own Assistant only the doors the table marks 'allow'. Any other door under
+   * /floors/:floor/agents/:agent/, and every door nobody has classified, is refused when that agent is a person's own Assistant. Any other agent, and the owner of the app: nothing changes.
+   */
+  function refusePersonDoor(c: Caller, r: MountRequest, where: string) {
+    if (access.isAdmin(c)) return
+    const door = personDoorOf(r.method, r.rest)
+    if (!door || door.verdict === 'allow') return
+    const m = /^\/floors\/([^/]+)\/agents\/([^/]+)\//.exec(r.rest)
+    if (!m) return
+    let agent: FloorAgent
+    try {
+      agent = agentOf(floorOf(decodeURIComponent(m[1])), decodeURIComponent(m[2]))
+    } catch {
+      return
+    }
+    if (!isPersonAssistant(agent)) return
+    // A person's own Assistant lives on the Server: asking it to open THERE (a member PC's page reaches it at its home through the Server's run-on) names no new place, so it passes. Any other PC is refused here (and assertStaffStart holds it too).
+    if (door.tail === 'run-on' && isObject(r.body) && r.body.pc === serverPcId()) return
+    o.auth?.deny(c, 403, 'admin-only', where)
+    throw authError(403, PERSON_DOOR_REFUSED, 'admin-only')
+  }
+
   /** F-118: what a route's rule needs of its caller, checked before anything runs. A route with no rule is for the owner of the app. */
   function checkRule(rule: Rule | undefined, params: string[], r: MountRequest) {
     const c = callerOf(r)
@@ -8775,6 +9157,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       o.auth?.deny(c, 403, 'not-allowed', where)
       throw authError(403, 'This is not open to you. The owner of this app opens pages and features in Settings › Access.', 'not-allowed')
     }
+    refusePersonDoor(c, r, where)
     if (rule === undefined || rule.kind === 'owner') {
       if (access.isAdmin(c)) return
       // Order o9465: a feature's own routes (shared/access.ts ROUTES, e.g. Tasks) open to someone Settings › Access opened that feature to. Only
@@ -8789,8 +9172,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'create':
       case 'self':
         return
-      case 'floor':
-        return access.needFloor(c, floorOf(params[rule.floor]), rule.need, where)
+      case 'floor': {
+        const f = floorOf(params[rule.floor])
+        access.needFloor(c, f, rule.need, where)
+        // F-300 S0: a floor with a person's own Assistant on it: its chart (PATCH) may rename the Assistant and move its box and change nothing that decides how it runs (the floor's name, and every field in
+        // person-assistant-doors.ts CHART_LOCKED, are the owner of the app's); writing its memory is the owner of the app's; deleting it stays its maker's (floor('delete'), o3b2f: the record keeps who removed it). (An add or a drop is refuseAssistantFloorChange's.)
+        if (rule.need !== 'view' && !access.isAdmin(c) && f.agents.some(a => isPersonAssistant(a))) {
+          const chart = /^\/floors\/[^/]+$/.test(r.rest)
+          const touched = r.method === 'PATCH' && chart ? personChartTouches(f, r.body) : r.method === 'DELETE' && chart ? null : 'the floor'
+          if (touched !== null) {
+            o.auth?.deny(c, 403, 'admin-only', where)
+            throw authError(403, PERSON_DOOR_REFUSED, 'admin-only')
+          }
+        }
+        return
+      }
       case 'chat': {
         const f = floorOf(params[rule.floor])
         return access.needChat(c, agentOf(f, params[rule.agent]), rule.need, where)
@@ -9086,13 +9482,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
+            // F-302 L4b (Agent 14's R6): judged like a terminal stream: the person this PC opens it for (v exactly 2, a person, or the owner's own unsigned page of a PC he marked as his), who must OWN the chat, and a message typed with the start
+            // only where that person may type on the Server (the L2 rule over the link). A member that names no usable person is refused with the plain words and nothing is started. A claim, not a proof (member-terminal.ts). The START of a
+            // Server chat by a person who is not an administrator is L6 (his question), not decided here.
+            const claim = terminalClaimOf(raw, { admins: o.auth?.admins() ?? [], ownerPc: ownerPcs.has(from.id) })
+            if (claim.kind === 'none') throw authError(403, terminalNotice(claim.why), 'not-yours')
+            const asked = agentOf(floorOf(raw.floorId), raw.agentId)
+            if (access.rights(claim.caller, asked)?.can !== 'owner') throw authError(403, 'Only the owner of a chat can open it on the Server from another PC.', 'not-yours')
             const expected = engineFor(agentOf(floorOf(raw.floorId), raw.agentId))
             if (raw.expectedEngine === undefined && expected !== 'claude') throw engineUpdateRequired(from.name)
             if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
             const target = floorOf(raw.floorId)
             if (isPcControl(target)) { assertPcControlTarget(target, self().id, {}); if (raw.expectedEngine === undefined) throw pcControlError('pc-control-update-required', 'PC Control requires explicit engine proof.') }
             return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }, undefined, undefined, { kind: 'pc', pc: { id: from.id, name: from.name } }).then(opened => {
-              if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
+              if (opened.started && typeof raw.text === 'string' && raw.text) {
+                if (access.mayType(claim.caller, { ...asked, homePc: self().id })) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
+                else log?.info(`terminal: ${from.name} opened chat ${opened.sessionId.slice(0, 8)} for a person who may not type into it on the Server: its message was not typed`)
+              }
               return opened
             })
           })
@@ -9259,19 +9665,37 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // WebSockets
 
+  /**
+   * F-302 L4 (Agent 14's census, L4; Agent 3's design page): what a person may do at a chat's terminal RIGHT NOW. `view`: the chat is theirs to see (a chat on a floor: they have rights to it; a session that is no chat's: the owner of the app only).
+   * `keys`: raw keys and draft text: the runtime is admitted, the chat has NO staff policy (a person's own Assistant takes no raw key from any page: its words go in by the checked send only; the pool refuses them as well; a staff
+   * Assistant counts as a policy chat for everybody, whether or not its run carries the flag, here or on another PC: a4) and the page's own
+   * typing rule holds (access.mayType: the owner of the chat or a share Can type, under the owner's choice with the Server scope, where the chat RUNS counted). `size`: keys, or, for a policy chat, its OWNER (a3: geometry only).
+   * The hub's own pages ask it for their caller; the link asks it for the person a member PC claims (serveTerminal): ONE function, so a rule added to one door cannot be forgotten on the other.
+   */
+  function terminalRights(sid: string, caller: Caller): { view: boolean; keys: boolean; size: boolean } {
+    const at = bySession(sid)
+    const view = at ? access.rights(caller, at.agent) !== null : access.isAdmin(caller)
+    const admitted = !at || runtimeSidAllowed(sid)
+    // F-302 a4 (Agent 14's review): a STAFF Assistant (a person's own Assistant whose owner is not an administrator: isStaffAssistant) takes no raw key and no draft from a page, from anybody, WHATEVER the pool says of its run. A flagged run
+    // already takes none from anyone (administrator included); a run with no flag (an older start) is fenced one layer down (runFenced, on the `chats` facade), but a fence that cannot be proved (a chat that runs on another PC: its flag
+    // is never visible here; a member's stale replica; a failed lookup) must not leave this layer open. An administrator's OWN Assistant is not a staff one, and he types in it as ever.
+    const policy = !!chats.info(sid)?.policy || (!!at && isStaffAssistant(at.agent))
+    const keys = admitted && !policy && (at ? access.mayType(caller, at.agent) : access.isAdmin(caller))
+    const size = keys || (!!at && admitted && policy && isPersonAssistant(at.agent) && !!caller.person && at.agent.owner?.id === caller.person.id)
+    return { view, keys, size }
+  }
+
   function terminal(query: URLSearchParams, caller: Caller) {
     const sid = query.get('session') ?? ''
     // Who is at this page's terminal, for the presence record (chat-presence.ts): the person signed in on it, or the open app; the keys are noted where they reach the chat.
     const by = actorOfCaller(caller)
     // F-118: a person who may only view gets the screen and nothing they send reaches the chat (not keys, not a resize).
     // It is asked again at every key: a share changed to 'view' while the socket is open takes typing away at once.
-    const typing = () => {
-      const at = bySession(sid)
-      if (at && !runtimeSidAllowed(sid)) return false
-      // o7e6d: the same rule as every other typing path (access.mayType): a non-owner types into their own person-assistant only.
-      // o7e6d: a chat on no floor (moved, deleted or not yet placed) is the owner's to type into only; a non-owner's socket never keeps its keys.
-      return at ? access.mayType(caller, at.agent) : access.isAdmin(caller)
-    }
+    // F-302 L4: both are the ONE function terminalRights() below, asked at every frame, so the hub's own pages and a member's stream through the link cannot disagree.
+    const typing = () => terminalRights(sid, caller).keys
+    const sizing = () => terminalRights(sid, caller).size
+    /** What a member PC's first line says about this page's person (member-terminal.ts): sent only to a Server that said it judges it. */
+    const claim = terminalClaimLine(caller, access.isAdmin(caller))
     return (ws: WsSocket) => {
       const current = bySession(sid), running = chats.info(sid)
       // F-163: a paused bridge chat whose run lost its admission is still shown (typing() above keeps its keys out).
@@ -9282,23 +9706,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
         catch { ws.sendText(JSON.stringify({ t: 'exit', code: null })); return ws.close(1008, 'Saved and running engines disagree; reconcile the conversation first.') }
       }
       // F-193: a chat box's live mirror of the input line: no replay, no output, never a size; only for someone who may type.
-      if (query.get('mode') === 'draft') return draftSocket(sid, ws, typing)
+      if (query.get('mode') === 'draft') return draftSocket(sid, ws, typing, claim)
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
       // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
-      if (!detach && remoteTerminal(sid, ws, typing, undefined, by)) return
+      if (!detach && remoteTerminal(sid, ws, typing, undefined, by, claim)) return
       if (!detach) {
         ws.sendText(JSON.stringify({ t: 'exit', code: null }))
         return ws.close(1000, "That chat isn't running")
       }
       ws.onText(raw => {
-        if (!typing()) return
+        // Keys need the typing right; a size needs that or, for a policy chat, being its owner (sizing()): asked at every frame.
+        const keys = typing(), size = keys || sizing()
+        if (!size) return
         let m: TerminalClientMessage
         try {
           m = JSON.parse(raw) as TerminalClientMessage
         } catch {
           return
         }
-        if (m.t === 'in' && typeof m.d === 'string') chats.input(sid, m.d, by)
+        if (m.t === 'in' && typeof m.d === 'string') { if (keys) chats.input(sid, m.d, by) }
         else if (m.t === 'size' && typeof m.cols === 'number' && typeof m.rows === 'number') chats.resize(sid, m.cols, m.rows)
       })
       ws.onClose(detach)
@@ -9308,11 +9734,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** F-193: one draft-set from a page or the link; anything else is dropped. */
   const draftSetOf = (m: unknown) => isObject(m) && m.t === 'draft-set' && typeof m.text === 'string' && m.text.length <= 20_000 && Number.isSafeInteger(m.seq) && Number.isSafeInteger(m.base) ? { seq: m.seq as number, text: m.text, base: m.base as number, seal: m.seal === true } : null
   /** F-193: a chat box's mirror of a chat's input line, here or on the chat's PC (over the link, as its terminal is). */
-  function draftSocket(sid: string, ws: WsSocket, typing: () => boolean) {
+  function draftSocket(sid: string, ws: WsSocket, typing: () => boolean, claim?: ReturnType<typeof terminalClaimLine>) {
     if (!typing()) return ws.close(1008, 'Only someone who may type in this chat gets its draft.')
     const mirror = chats.draftMirror?.(sid, { send: m => { if (typing()) ws.sendText(JSON.stringify(m)) } }) ?? null
     if (!mirror) {
-      if (remoteTerminal(sid, ws, typing, 'draft')) return
+      if (remoteTerminal(sid, ws, typing, 'draft', undefined, claim)) return
       ws.sendText(JSON.stringify({ t: 'exit', code: null }))
       return ws.close(1000, "That chat isn't running")
     }
@@ -9343,7 +9769,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * carries the same messages the page's socket does, one JSON line each; it keeps running
    * there, and what is typed here goes to it. False when it isn't running on a PC within reach.
    */
-  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true, as?: 'draft', by?: ChatActor): boolean {
+  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true, as?: 'draft', by?: ChatActor, claim?: ReturnType<typeof terminalClaimLine>): boolean {
     const w = whereAll()[sid]
     if (!w || w.id === self().id) return false
     let link: LinkPeer
@@ -9380,7 +9806,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       s => {
         if (closed) return void s.destroy()
         stream = s
-        writeLine(s, { sessionId: sid, ...(expected ? { expectedEngine: engineFor(expected.agent) } : {}), ...(as ? { mode: as } : {}) })
+        // F-302 L4: a member PC names the person its page is for (member-terminal.ts), only to a Server that said it judges it; the Server judges that claim itself and the member's own check above is only fast feedback.
+        writeLine(s, { sessionId: sid, ...(expected ? { expectedEngine: engineFor(expected.agent) } : {}), ...(as ? { mode: as } : {}), ...(claim && mode() === 'member' && hubJudgesTerminal ? claim : {}) })
         for (const raw of early.splice(0)) relayLine(s, raw)
         readLines(s, m => ws.sendText(JSON.stringify(m)))
         s.on('close', () => !closed && ws.close(1000, `The link to ${link.name} closed`))
@@ -9419,6 +9846,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Who sent these keys, for the presence record: the PC that asked. The PERSON on that PC is not carried over the link, so a line may name a PC rather than a person
     // (chat-presence.ts says so); with no `from` the keys are `unattributed`, never filed as somebody.
     const by: ChatActor = from ? { kind: 'pc', pc: { id: from.id, name: from.name } } : UNATTRIBUTED
+    // F-302 L4 (Agent 14's census L4, his review R2-R5): on the HUB a stream from a member PC is JUDGED: its first line names the person its page is for (member-terminal.ts: `v` exactly 2, a valid person or an unsigned page of a PC the owner marked as his),
+    // and from then on every key, size and draft frame is asked of the SAME function the hub's own pages use (terminalRights), per frame, fixed to that person for the stream. A stream without a usable claim looks and does not type, and is told so once.
+    // The member's own check is fast feedback and is never consulted. NOT a proof of the person: a member PC that is modified can claim any person (see member-terminal.ts). The role where a member serves its hub (no `from`) is not judged.
+    const judged = !!from && mode() === 'hub'
+    let claimed: Caller | null = null
     let sid: string | null = null
     let detach: (() => void) | null = null
     let draft: { set(seq: number, text: string, base: number, seal?: boolean): void } | null = null
@@ -9429,6 +9861,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const ended = () => {
       writeLine(stream, { t: 'exit', code: null })
       stream.end()
+    }
+    /** A page's frame, passed on only when this person may do it NOW (asked again at every frame and at the flush of a queue): keys and drafts need `keys`, a size needs `size`, anything else is dropped. Not judged: the member serving its hub. */
+    const frameOk = (m: Record<string, unknown>): boolean => {
+      if (!judged) return true
+      if (!claimed || sid === null) return false
+      const r = terminalRights(sid, claimed)
+      if (m.t === 'in' || m.t === 'draft-set') return r.keys
+      if (m.t === 'size') return r.size
+      return false
     }
     readLines(stream, raw => {
       if (!isObject(raw)) return
@@ -9441,8 +9882,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
           if (current && raw.expectedEngine !== undefined) requireRunningEngine(engineFor(current.agent), raw.expectedEngine as RuntimeEngine)
           if (current && running) requireRunningEngine(engineFor(current.agent), running.engine)
         } catch { return ended() }
+        if (judged) {
+          const claim = terminalClaimOf(raw, { admins: o.auth?.admins() ?? [], ownerPc: ownerPcs.has(from!.id) })
+          if (claim.kind === 'none') {
+            writeLine(stream, { t: 'notice', text: terminalNotice(claim.why) })
+            log?.info(`terminal: ${from!.name} opened chat ${sid.slice(0, 8)} without a usable person (${claim.why}): it may look, not type`)
+          } else {
+            claimed = claim.caller
+            if (claim.kind === 'open-app') log?.info(`terminal: ${from!.name} opened chat ${sid.slice(0, 8)} as the app's own unsigned page (as claimed by a PC the owner marked as his)`)
+            // The first look: the person must be able to see this chat (a chat on no floor is for administrators only); and from now on a floors change judges the stream again, as the hub's own sockets are: a share taken away stops the output too.
+            if (!terminalRights(sid, claimed).view) return ended()
+            watch(sid, claimed, { sendText: () => {}, onText: () => {}, onClose: cb => void stream.on('close', cb), close: () => ended() } as WsSocket)
+          }
+        }
         // F-193: a chat box's live mirror of the input line, asked over the link (an older PC ignores mode and the page falls back).
         if (raw.mode === 'draft') {
+          // The mirror is for someone who may type: a judged stream asks for the keys right at the first line.
+          if (judged && !(claimed && terminalRights(sid, claimed).keys)) return ended()
           const m = chats.draftMirror?.(sid, { send: r => void writeLine(stream, r) }) ?? null
           if (m) {
             draft = m
@@ -9465,7 +9921,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (stream.destroyed) return void s.destroy()
             relay = s
             writeLine(s, { sessionId: asked, ...(expectedEngine ? { expectedEngine } : {}), ...(raw.mode === 'draft' ? { mode: 'draft' } : {}) })
-            for (const m of early!.splice(0)) writeLine(s, m)
+            // Frames queued before the second PC's stream opened are judged AGAIN now (the rights may have changed in between).
+            for (const m of early!.splice(0)) if (frameOk(m)) writeLine(s, m)
             readLines(s, m => void writeLine(stream, m))
             s.on('close', () => stream.end())
             s.on('error', () => stream.destroy())
@@ -9477,6 +9934,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (early !== null) {
         if (!legacySidAllowed(sid)) return ended()
+        // Judged before it is handed on: a refused frame never reaches the second PC.
+        if (!frameOk(raw)) return
         // This PC is only the go-between (a member's keys to a chat on another member): they never reach chats.input here, so they are noted as they are handed to the link.
         noteRelayedFrame(sid, raw, by, toPc)
         if (relay) writeLine(relay, raw)
@@ -9485,11 +9944,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (draft) {
         const d = draftSetOf(raw)
-        if (d && !switchFences.blocked(sid)) draft.set(d.seq, d.text, d.base, d.seal)
+        if (d && frameOk(raw) && !switchFences.blocked(sid)) draft.set(d.seq, d.text, d.base, d.seal)
         return
       }
-      if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d, by)
-      else if (raw.t === 'size' && typeof raw.cols === 'number' && typeof raw.rows === 'number') chats.resize(sid, raw.cols, raw.rows)
+      if (raw.t === 'in' && typeof raw.d === 'string') { if (frameOk(raw)) chats.input(sid, raw.d, by) }
+      else if (raw.t === 'size' && typeof raw.cols === 'number' && typeof raw.rows === 'number') { if (frameOk(raw)) chats.resize(sid, raw.cols, raw.rows) }
     })
     stream.on('close', () => {
       detach?.()
@@ -9595,8 +10054,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const where = `WS ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${rest}`
       if (rest === '/terminal' || rest === '/chat') {
         const at = bySession(query.get('session') ?? '')
-        if (at) access.needChat(caller, at.agent, 'view', where)
-        else if (!access.isAdmin(caller)) {
+        if (at) {
+          access.needChat(caller, at.agent, 'view', where)
+          // F-300 S0: the sockets of a person's own Assistant are asked against the table (person-assistant-doors.ts): the chat feed and the terminal VIEW are theirs (keys: terminalRights(), F-302 a2); the owner of the app is not asked.
+          if (isPersonAssistant(at.agent) && !access.isAdmin(caller) && personSocketOf(rest) !== 'allow') {
+            access.deny(caller, where, at.agent.sessionId)
+            throw authError(403, PERSON_DOOR_REFUSED, 'admin-only')
+          }
+        } else if (!access.isAdmin(caller)) {
           access.deny(caller, where)
           throw authError(403, "That chat isn't yours.", 'not-yours')
         }
@@ -9772,6 +10237,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
       clearInterval(toolsRefreshTimer)
+      clearInterval(staffConvergeTimer)
       clearInterval(voiceTimer)
       events.clear()
       // o13d4: settles once the last writes into the state folder are done; never rejects (a failed close was never thrown before either).

@@ -360,6 +360,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     credential: () => claude.credentialWithSubscription(),
     auth,
     featureAccess,
+    // F-297 (his order od8e2, "yes let ravis be on since start"): the one-time turning-on of Ravi's staff-send switch is the real app's, never a test's (agentic/index.ts seedStaffSend).
+    staffSendSeed: true,
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
     claude: process.env.SAD_TEST_CLAUDE || undefined,
     projectsDir: testClaudeHome ? path.join(testClaudeHome, 'projects') : undefined,

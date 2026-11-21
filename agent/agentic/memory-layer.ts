@@ -20,8 +20,8 @@ import type { Logger } from '../log.ts'
 import { createEmbedder, type Embedder } from './embedder.ts'
 import { librarianEnv, runLibrarian, takeMaterial, writeInbox, type Material, type NoteMaterial, type SeedMaterial } from './librarian.ts'
 import { fuse, nearest, sections, snippet, terms, WordIndex, type FusedHit, type WordHit } from './memory-search.ts'
-import { cleanSaid, createTurnLog, type SessionRef, type Turn } from './memory-turns.ts'
-import { CORE, createWiki, OWNER_NAME, pagePath } from './wiki.ts'
+import { cleanSaid, createTurnLog, isRelayText, redact, type SessionRef, type Turn } from './memory-turns.ts'
+import { CORE, createWiki, INBOX_KEEP_DAYS, OWNER_NAME, pagePath } from './wiki.ts'
 
 // F-051: the memory layer (agent/SPEC.md › F-051), run on the hub (or a PC on its own); the
 // other PCs' chats reach it through the hub as their tool calls do.
@@ -81,11 +81,31 @@ export interface MemoryLayerOptions {
   modelsDir: string
   /** Every note of a floor. */
   notes: (floorId: string) => MemoryEntry[]
+  /**
+   * The floors whose chats FEED this memory, with only the agents that do (memory-people.ts `feedFloors`): their chats' turns are read and kept. A turn already in the log whose session
+   * is not one of these (or an earlier session of one: conversationHistory) is not indexed, not read and not compiled.
+   */
   floors: () => Floor[]
+  /**
+   * oc65c/F-051 S4: the floors whose NOTES this memory reads (memory-people.ts `noteFloors`: every agent on the floor is the person's). Left out: the same floors as `floors`.
+   */
+  noteFloors?: () => Floor[]
+  /**
+   * oc65c/F-051 S4 (Agent 14's F2): the floors, with only the agents, whose chats do NOT feed this memory (memory-people.ts `unfedFloors`). Their transcripts are not read, but their read
+   * position is moved to the end of their files at every collect, so what is typed in them while they do not feed (another person's words in a chat shared for typing, the old
+   * owner's backlog of a chat that changed hands) is never read as this person's later. Left out: none are skipped.
+   */
+  unfedFloors?: () => Floor[]
   /** A session's JSONL on this PC, or null. */
   transcript: (sessionId: string) => string | null
   /** Claude Code's projects folder: the memory files its chats keep are material too. */
   projectsDir: string
+  /**
+   * oc65c/F-051 S3: the project folders (names under projectsDir) whose Claude Code memory files (`<project>/memory/*.md`) this memory may read: the person's OWN, and
+   * no other person's chat runs in them (memory-people.ts `ownProjects`). Left out: none: the memory files of every project are no longer swept, and a layer that is not
+   * told whose folders are its own reads no memory file at all (fail closed). What is read is redacted like a note.
+   */
+  memoryProjects?: () => readonly string[]
   token?: () => string | null
   /** claude on this PC, or null. */
   claude?: () => string | null
@@ -210,6 +230,7 @@ export function cleanSettings(v: unknown, base: MemorySettings): MemorySettings 
     model: (LIBRARIAN_MODELS as readonly unknown[]).includes(s.model) ? (s.model as MemorySettings['model']) : base.model,
     recall: typeof s.recall === 'boolean' ? s.recall : base.recall,
     fromChats: typeof s.fromChats === 'boolean' ? s.fromChats : base.fromChats,
+    fromAgents: typeof s.fromAgents === 'boolean' ? s.fromAgents : base.fromAgents,
     pastChats: typeof s.pastChats === 'boolean' ? s.pastChats : base.pastChats,
   }
 }
@@ -306,14 +327,17 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     vectors.delete(id)
   }
 
-  const floorName = (id: string) => o.floors().find(f => f.id === id)?.name ?? id
+  /** The floors whose notes are read (S4). */
+  const noteFloorList = (): Floor[] => (o.noteFloors ?? o.floors)()
+  const floorName = (id: string) => noteFloorList().find(f => f.id === id)?.name ?? id
 
   function syncNotes(floorId: string) {
     const prefix = `note:${floorId}/`
     const seen = new Set<string>()
     let entries: MemoryEntry[] = []
     try {
-      entries = o.notes(floorId)
+      // S4: the notes of a floor that is not one of this person's (a chat of another person is on it) are not read: any that were are let go below.
+      entries = noteFloorList().some(f => f.id === floorId) ? o.notes(floorId) : []
     } catch {
       entries = []
     }
@@ -326,7 +350,8 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         kind: 'note',
         title: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (a chat) on ${fname}` : `${name} on ${fname}`,
         heading: null,
-        text: e.tags.length ? `${e.text}\n[${e.tags.join(', ')}]` : e.text,
+        // S3 (F2): a note is redacted like a turn before it is indexed (it is recalled into chats and compiled by the librarian). The floor's own note is as it was.
+        text: redact(e.tags.length ? `${e.text}\n[${e.tags.join(', ')}]` : e.text),
         path: null,
         floorId,
         sessionId: e.sessionId,
@@ -337,7 +362,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
   }
 
   function syncAllNotes() {
-    const ids = new Set(o.floors().map(f => f.id))
+    const ids = new Set(noteFloorList().map(f => f.id))
     for (const id of ids) syncNotes(id)
     // A floor that went takes its notes with it.
     for (const d of [...docs.values()]) if (d.kind === 'note' && d.floorId && !ids.has(d.floorId)) drop(d.id)
@@ -380,12 +405,46 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       kind: 'turn',
       title: t.from === 'shubham' ? `${name} to ${t.agentName} on ${t.floorName}` : `Another chat to ${t.agentName} on ${t.floorName}`,
       heading: null,
-      text: t.answer ? `${t.said}\n\nAnswer: ${t.answer}` : t.said,
+      // S3 (Agent 14's F1): the log may hold turns made under an older rule set (the owner's 14 MB one): redacted here too (idempotent), as in memory_read below.
+      text: redact(t.answer ? `${t.said}\n\nAnswer: ${t.answer}` : t.said),
       path: null,
       floorId: t.floorId,
       sessionId: t.sessionId,
       at: t.at,
     })
+  }
+
+  /**
+   * S4: the sessions of the chats that feed this memory now: each agent's chat, and the earlier sessions of that agent (its native lineage). A turn from any other session (another
+   * person's chat in a log made before turns were joined to their owner, a chat that is shared for typing, a PC Control chat, a chat that went) is not this memory's.
+   */
+  function fedSessions(): Set<string> {
+    const out = new Set<string>()
+    for (const f of o.floors()) {
+      for (const a of f.agents) {
+        if (a.sessionId) out.add(a.sessionId)
+        for (const r of a.conversationHistory ?? []) if (typeof r.sessionId === 'string' && r.sessionId) out.add(r.sessionId)
+      }
+    }
+    return out
+  }
+  /**
+   * S4: a turn is kept in the index and compiled when its chat feeds this memory and it was SAID: a relay (what the chats and the app type into a chat: message, broadcast, reply,
+   * heartbeat; Agent 14's F3) only with `fromAgents`. Judged on the `said` text too, because the legacy log's `from` was made by a regex that knew two of the four shapes.
+   */
+  const turnFed = (t: Turn, fed: ReadonlySet<string>) => fed.has(t.sessionId) && ((t.from === 'shubham' && !isRelayText(t.said)) || state.settings.fromAgents)
+
+  /** The turn docs are made to match: the turns that feed the memory in, the others out (a setting or a chat's owner, share or kind changed). */
+  function syncTurns() {
+    const fed = fedSessions()
+    const want = new Set<string>()
+    for (const t of turns.all()) {
+      if (!turnFed(t, fed)) continue
+      const id = `turn:${t.id}`
+      want.add(id)
+      if (!docs.has(id)) turnDoc(t)
+    }
+    for (const id of [...docs.keys()]) if (id.startsWith('turn:') && !want.has(id)) drop(id)
   }
 
   function sessionRefs(): SessionRef[] {
@@ -400,16 +459,29 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     return out
   }
 
+  /** The chats that do not feed this memory, as session refs (their files are only measured, never read). */
+  function skipRefs(): SessionRef[] {
+    const out: SessionRef[] = []
+    for (const f of o.unfedFloors?.() ?? []) {
+      for (const a of f.agents) {
+        if (!a.sessionId) continue
+        const file = o.transcript(a.sessionId)
+        if (file) out.push({ sessionId: a.sessionId, file, floorId: f.id, floorName: f.name, agentName: a.name })
+      }
+    }
+    return out
+  }
+
   function collectTurns(): number {
     if (!state.settings.fromChats) return 0
     let found: Turn[] = []
     try {
-      found = turns.collect(sessionRefs())
+      found = turns.collect(sessionRefs(), Date.now(), skipRefs())
     } catch (e) {
       log?.warn(`memory: couldn't read the floor chats' turns: ${e instanceof Error ? e.message : String(e)}`)
       return 0
     }
-    for (const t of found) turnDoc(t)
+    syncTurns()
     if (found.length) void pump()
     return found.length
   }
@@ -499,14 +571,27 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
   // -------------------------------------------------------------------------------------------
   // The librarian
 
-  function seedFiles(): SeedMaterial[] {
-    const out: SeedMaterial[] = []
-    let projects: string[] = []
-    try {
-      projects = readdirSync(o.projectsDir)
-    } catch {
-      return out
+  /** `memoryProjects`, kept for 30 s (status asks for it every few seconds and it reads every floor's transcript place); a compile asks afresh. */
+  let projectsMemo: { at: number; list: string[] } | null = null
+  function ownProjectNames(fresh = false): string[] {
+    if (!o.memoryProjects) return []
+    const now = Date.now()
+    if (fresh || !projectsMemo || now - projectsMemo.at > 30_000) {
+      let list: string[] = []
+      try {
+        list = [...o.memoryProjects()]
+      } catch {
+        list = []
+      }
+      projectsMemo = { at: now, list }
     }
+    return projectsMemo.list
+  }
+
+  function seedFiles(fresh = false): SeedMaterial[] {
+    const out: SeedMaterial[] = []
+    // S3: only the project folders that are this person's own (a name, never a path: nothing outside projectsDir is read).
+    const projects = ownProjectNames(fresh).filter(p => typeof p === 'string' && p !== '' && p !== '.' && p !== '..' && p === path.basename(p) && !/[\\/]/.test(p))
     for (const p of projects) {
       const dir = path.join(o.projectsDir, p, 'memory')
       let files: string[] = []
@@ -520,7 +605,8 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         try {
           const st = statSync(file)
           if (st.size > 20_000) continue
-          out.push({ key: `${file}:${Math.round(st.mtimeMs)}`, label: `${p}/memory/${f}`, text: readFileSync(file, 'utf8') })
+          // S3 (F2): redacted before it is counted, handed to the librarian or written in the inbox.
+          out.push({ key: `${file}:${Math.round(st.mtimeMs)}`, label: `${p}/memory/${f}`, text: redact(readFileSync(file, 'utf8')) })
         } catch {
           // Gone.
         }
@@ -529,9 +615,10 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     return out
   }
 
-  function pending(): Material {
+  /** `askAfresh`: the person's project folders are asked for again, not taken from the 30 s memory (a compile does). */
+  function pending(askAfresh = false): Material {
     const notes: NoteMaterial[] = []
-    for (const f of o.floors()) {
+    for (const f of noteFloorList()) {
       let entries: MemoryEntry[] = []
       try {
         entries = o.notes(f.id)
@@ -542,22 +629,32 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         const key = `${f.id}/${e.id}`
         const version = e.editedAt ?? e.ts
         if (state.compiled.notes[key] === version) continue
-        notes.push({ key, floorName: f.name, author: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (an AI chat)` : name, at: version, text: e.text, version })
+        notes.push({ key, floorName: f.name, author: e.author === 'agent' ? `${e.authorName ?? 'a chat'} (an AI chat)` : name, at: version, text: redact(e.text), version })
       }
     }
     notes.sort((a, b) => a.at.localeCompare(b.at))
-    const seeds = state.settings.fromChats ? seedFiles().filter(s => state.compiled.seeds[s.key.slice(0, s.key.lastIndexOf(':'))] !== s.key.slice(s.key.lastIndexOf(':') + 1)) : []
+    const seeds = state.settings.fromChats ? seedFiles(askAfresh).filter(s => state.compiled.seeds[s.key.slice(0, s.key.lastIndexOf(':'))] !== s.key.slice(s.key.lastIndexOf(':') + 1)) : []
     const { past, fresh } = pendingTurns()
     // The past first (oldest first), then what came after the memory started.
-    return { notes, seeds, turns: state.settings.pastChats ? [...past, ...fresh] : fresh }
+    return { notes, seeds, turns: (state.settings.pastChats ? [...past, ...fresh] : fresh).map(e => e.t) }
   }
 
-  /** The turns still to compile: of the past (before the baseline), and since. */
-  function pendingTurns(): { past: Turn[]; fresh: Turn[] } {
+  /**
+   * The turns still to compile: of the past (before the baseline), and since, each with its place in the log. What was compiled is counted by PLACE (the log only grows), and a turn
+   * that does not feed this memory (S4: another person's chat, a relay while `fromAgents` is off) is skipped, never compiled: a run moves the count past it.
+   */
+  function pendingTurns(): { past: { t: Turn; pos: number }[]; fresh: { t: Turn; pos: number }[] } {
     if (!state.settings.fromChats) return { past: [], fresh: [] }
     const all = turns.all()
+    const fed = fedSessions()
     const base = Math.min(state.baseline ?? 0, all.length)
-    return { past: all.slice(Math.min(state.compiled.history, base), base), fresh: all.slice(Math.max(state.compiled.turns, base)) }
+    const pastFrom = Math.min(state.compiled.history, base)
+    const freshFrom = Math.max(state.compiled.turns, base)
+    const past: { t: Turn; pos: number }[] = []
+    const fresh: { t: Turn; pos: number }[] = []
+    for (let pos = pastFrom; pos < base; pos++) if (turnFed(all[pos], fed)) past.push({ t: all[pos], pos })
+    for (let pos = freshFrom; pos < all.length; pos++) if (turnFed(all[pos], fed)) fresh.push({ t: all[pos], pos })
+    return { past, fresh }
   }
 
   const turnChars = (list: Turn[]) => list.reduce((s, t) => s + t.said.length + Math.min(t.answer.length, 700), 0)
@@ -576,10 +673,11 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     let take: Material = { notes: [], turns: [], seeds: [] }
     let chars = 0
     let inbox: string | undefined
-    // How many of the turns given come from the past (they are first): what the run moves on.
-    const pastGiven = state.settings.pastChats ? pendingTurns().past.length : 0
+    // How many of the turns given come from the past (they are first): what the run moves on. Their places, from the same moment as the material below.
+    const pt = pendingTurns()
+    const pastGiven = state.settings.pastChats ? pt.past.length : 0
     if (mode === 'ingest') {
-      const t = takeMaterial(pending())
+      const t = takeMaterial(pending(true))
       take = t.take
       chars = t.chars
       if (!take.notes.length && !take.turns.length && !take.seeds.length) throw apiError(409, 'Nothing new to compile: every note and turn is in the wiki')
@@ -631,8 +729,10 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
           state.compiled.seeds[s.key.slice(0, cut)] = s.key.slice(cut + 1)
         }
         const fromPast = Math.min(take.turns.length, pastGiven)
-        state.compiled.history += fromPast
-        state.compiled.turns = Math.max(state.compiled.turns, state.baseline ?? 0) + (take.turns.length - fromPast)
+        if (fromPast > 0) state.compiled.history = pt.past[fromPast - 1].pos + 1
+        const freshTaken = take.turns.length - fromPast
+        state.compiled.turns = Math.max(state.compiled.turns, state.baseline ?? 0)
+        if (freshTaken > 0) state.compiled.turns = pt.fresh[freshTaken - 1].pos + 1
       } else if (inbox) rmSync(path.join(wiki.dir, ...inbox.split('/')), { force: true })
       try {
         wiki.writeIndex()
@@ -640,6 +740,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         const cost = r.costUsd !== null ? `, $${r.costUsd.toFixed(2)} at API rates` : ''
         wiki.appendLog(`${mode} | ${what} | ${run.model}${cost} | ${run.changed.length} pages changed`, r.ok ? r.summary || '(no account given)' : `Failed: ${r.error}`)
         await wiki.commit(`${mode} (run ${id}): ${run.changed.length} pages changed`)
+        purgeInbox()
       } catch (e) {
         log?.warn(`memory: after the run: ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -651,6 +752,12 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       o.onChange?.()
     })()
     return run
+  }
+
+  /** S3: the raw material of old runs is not kept (the inbox is never in git either: wiki.ts GITIGNORE). */
+  function purgeInbox() {
+    const n = wiki.purgeInbox(INBOX_KEEP_DAYS)
+    if (n) log?.info(`memory: ${n} old inbox file${n === 1 ? '' : 's'} removed`)
   }
 
   function autoCheck() {
@@ -698,8 +805,8 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     if (r.startsWith('note:') || r.startsWith('turn:')) {
       if (r.startsWith('turn:')) {
         const t = turns.get(r.slice(5))
-        if (!t) throw apiError(404, `No turn ${r}`)
-        return [`${t.from === 'shubham' ? name : 'Another chat'} to ${t.agentName} on ${t.floorName}, ${t.at}:`, t.said, '', `${t.agentName} answered:`, t.answer || '(no answer kept)'].join('\n')
+        if (!t || !turnFed(t, fedSessions())) throw apiError(404, `No turn ${r}`)
+        return [`${t.from === 'shubham' ? name : 'Another chat'} to ${t.agentName} on ${t.floorName}, ${t.at}:`, redact(t.said), '', `${t.agentName} answered:`, redact(t.answer) || '(no answer kept)'].join('\n')
       }
       const d = docs.get(r)
       if (!d) throw apiError(404, `No note ${r}`)
@@ -738,10 +845,11 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       if (started) return
       started = true
       await wiki.ensure().catch(e => log?.warn(`memory: couldn't make the wiki: ${e instanceof Error ? e.message : String(e)}`))
+      purgeInbox()
       loadVectors()
       syncAllNotes()
       syncWiki(true)
-      for (const t of turns.all()) turnDoc(t)
+      syncTurns()
       collectTurns()
       // The first start: every turn there is now is the past (searched, compiled only when asked).
       if (state.baseline === null) {
@@ -766,6 +874,7 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         every(60_000, collectTurns)
         every(30_000, () => syncWiki())
         every(15 * 60_000, autoCheck)
+        every(3_600_000, purgeInbox)
       }
       log?.info(`memory: ${docs.size} sections, notes and turns indexed; ${vectors.size} with meaning so far`)
     },
@@ -803,9 +912,10 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         pending: pendingCount(),
         past: (() => {
           const all = turns.all()
+          const fed = fedSessions()
           const base = Math.min(state.baseline ?? 0, all.length)
-          const left = all.slice(Math.min(state.compiled.history, base), base)
-          return { total: base, left: left.length, chars: turnChars(left) }
+          const left = all.slice(Math.min(state.compiled.history, base), base).filter(t => turnFed(t, fed))
+          return { total: all.slice(0, base).filter(t => turnFed(t, fed)).length, left: left.length, chars: turnChars(left) }
         })(),
         running: running ? { ...running } : null,
         runs: state.runs,
@@ -814,8 +924,14 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     },
 
     setSettings(patch) {
+      const before = state.settings.fromAgents
       state.settings = cleanSettings(patch, state.settings)
       save()
+      // S4: relays come in or go out of the index with the switch.
+      if (started && state.settings.fromAgents !== before) {
+        syncTurns()
+        void pump()
+      }
       if (state.settings.fromChats) collectTurns()
       return { ...state.settings }
     },

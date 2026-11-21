@@ -6,7 +6,7 @@ import { writeAtomic } from '../config.ts'
 // Orders of95c / o9ccb / ocf0e: which chats a non-owner may type into (shared/staff-typing.ts). The owner's choice, kept on the Server.
 //
 // Lead's call (ocf0e), the same shape as the Quick forwarding setting (quick-forwarding.ts): a MISSING file is no choice made yet, so it is
-// what he chose, A (DEFAULT_STAFF_TYPING); a file that is there but can't be used (any other read error, not JSON, not a known rule and
+// what he chose, A with the scope of o2f56, not on the Server (DEFAULT_STAFF_TYPING); a file that is there but can't be used (any other read error, not JSON, not a known rule and
 // scope) is a FAILURE, so it falls to the restrictive side, the 15 Nov rule (own Assistant only), and says so until a choice is saved again.
 // The two are never one case. A failed save changes nothing in memory.
 

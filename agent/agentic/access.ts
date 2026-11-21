@@ -169,6 +169,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // the Server's own page, in the route itself: never a chat's key, a member PC's word, or a name in the body).
   ['GET', /^\/staff-typing$/, OWNER],
   ['PUT', /^\/staff-typing$/, OWNER],
+  // F-302 L4: the PCs the owner marks as his (owner-pcs.ts): the owner's only, and a signed-in human's (the route asks requireCrmHuman).
+  ['GET', /^\/owner-pcs$/, OWNER],
+  ['PUT', /^\/owner-pcs$/, OWNER],
   // F-221 (ob98a): live talk's cards and direct line: the owner's page (and Send also takes his signed-in CRM session, in the route itself).
   ['GET', /^\/talk\/cards$/, OWNER],
   ['POST', /^\/talk\/cards\/([^/]+)\/send$/, OWNER],
@@ -197,6 +200,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // Who was present at a chat (chat-presence.ts): keys that reached a terminal (their class, never the keys) and the screen an Assistant drove (the kind of act, never what).
   // The owner's only; no ROUTES rule opens it, so no feature or share does either; the route is humanOnly as well (R6).
   ['GET', /^\/chat-presence$/, OWNER],
+  // F-297: what a person's own Assistant sent and where, never the text (staff-sends.ts). The owner's only; no ROUTES rule opens it, and the route is humanOnly as well.
+  ['GET', /^\/staff-sends$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents$/, floor('manage')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
   // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).
@@ -277,6 +282,12 @@ export interface Access {
    * own Assistant, and by his choice (staff-typing.ts, of95c / o9ccb / ocf0e) a chat they own and one shared to them as "Can type".
    */
   mayType(c: Caller, agent: FloorAgent): boolean
+  /**
+   * F-300 S3 (Lead's safe default; his o2f56: "I don't think anyone should be able to talk on the server"): do the owner's saved typing choice's own terms let a non-owner's keys reach this chat's PC at all? A chat that is not the Server's: yes. A chat that is
+   * the Server's (it runs as the Server's Windows user, with full tools): only on the one choice that opens typing there, 'owned-and-type-shares' with 'every-pc'; on the default, the 15 Nov rule or an unreadable choice: no. An access built with no choice at all
+   * (tests, older callers): yes, as mayType. Asked by a decision-maker's door (index.ts decides()), whose digit is typing without being a share: one source of truth with mayType's scope line.
+   */
+  typingScopeOpen(agent: FloorAgent): boolean
   floorSeen(c: Caller, f: Floor): boolean
   /** Throws 403 not-yours unless the caller sees / manages / may delete the floor. */
   needFloor(c: Caller, f: Floor, need: 'view' | 'manage' | 'delete', route: string): void
@@ -295,6 +306,11 @@ export interface AccessTyping {
   typing?: () => StaffTyping
   /** Whether a chat's home is the Server (for the 'not-on-server' scope). Left out, or unsure: true, so that scope stays closed. */
   serverChat?: (agent: FloorAgent) => boolean
+  /**
+   * F-300 S0: whether Settings > Access has the 'assistant' feature open to this (non-owner) caller NOW (read at every ask: closing it takes effect at once). While it is closed they have NO right on a
+   * person's own Assistant, whatever they made or own: every door of that chat (needChat, mayType, visible, the sockets, the chat's own tools) asks rights(). Left out (tests, older callers): no gate.
+   */
+  assistantOpen?: (c: Caller) => boolean
 }
 
 export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route: string, chatId: string | null) => void, o: AccessTyping = {}): Access {
@@ -307,6 +323,9 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
       if (c.machine) return { access: 'mine' as const, can: 'owner' as const }
       if (!c.person) return null
     }
+    // F-300 S0: a person's own Assistant needs the 'assistant' feature open to them, on every door of the chat, not only on the two routes that name it (shared/access.ts ROUTES): they MADE its floor, so
+    // the share clause let them in whatever Access said. Nothing changes for the owner of the app, or for any other agent.
+    if (isPersonAssistant(agent) && !isAdmin(c) && o.assistantOpen && !o.assistantOpen(c)) return null
     return chatRights(person(c), agent.owner ?? null, agent.sharedWith ?? [], admins())
   }
 
@@ -344,6 +363,13 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
     return r.access === 'shared' && r.can === 'type'
   }
 
+  function typingScopeOpen(agent: FloorAgent): boolean {
+    if (!o.typing) return true
+    if (!(o.serverChat?.(agent) ?? true)) return true
+    const t = o.typing()
+    return t.rule === 'owned-and-type-shares' && t.scope === 'every-pc'
+  }
+
   function needChat(c: Caller, agent: FloorAgent, need: Need, route: string) {
     const r = rights(c, agent)
     const ok = r !== null && (need === 'view' || (need === 'type' && mayType(c, agent)) || (need === 'owner' && r.can === 'owner'))
@@ -374,6 +400,7 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
     ownerOf: c => (c.person ? { id: c.person.id, username: c.person.username, name: c.person.name } : SBSKRRT_OWNER),
     rights,
     mayType,
+    typingScopeOpen,
     needChat,
     floorSeen,
     needFloor,

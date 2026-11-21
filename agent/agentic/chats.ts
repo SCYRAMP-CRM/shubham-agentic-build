@@ -21,7 +21,7 @@ import { createInputMirror, type InputMirror, type MirrorBox, type MirrorClient,
 import { answerColourQueries } from '../../shared/terminal-colours.ts'
 import { MCP_SERVER_NAME } from './briefs.ts'
 import type { ChatActor } from './chat-presence.ts'
-import { policyOf, STAFF_DROP_ENV, STAFF_ENV, STAFF_POLICY, staffArgs, staffText, type ChatPolicy } from './staff-policy.ts'
+import { isStaffPolicy, policyOf, STAFF_DROP_ENV, staffArgs, staffEnvOf, staffText, type ChatPolicy, type StaffPolicy } from './staff-policy.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
 // (node-pty, ConPTY on Windows), as agentic-claude-manager runs them (server/lib/terminal.js):
@@ -188,7 +188,7 @@ export interface StartChat {
    * Order o7e6d: a person's own Assistant starts under the staff policy (staff-policy.ts): its own launch (staffArgs, never the flags above),
    * no raw keys, checked words only. Native Claude only: with a bridge, Codex or OpenCode it is refused. Any other value is refused.
    */
-  policy?: typeof STAFF_POLICY
+  policy?: StaffPolicy
 }
 
 /** F-078: how a chat ended. cause: stopped (by him), idle-reaper, agent-stop (the app stopping: an Update, a restart), exited (it ended itself, code 0), crashed (a non-zero code), ended (no code). */
@@ -1109,7 +1109,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
    * nothing typed. A chat whose policy this build does not know takes nothing at all.
    */
   function staffWords(c: Chat, raw: string): string | null {
-    const checked = c.info.policy === STAFF_POLICY ? staffText(raw) : null
+    const checked = isStaffPolicy(c.info.policy) ? staffText(raw) : null
     if (checked?.ok) return checked.text
     log?.info(`chat ${c.info.sessionId.slice(0, 8)}: a text was not typed: ${checked ? `the staff policy refuses it (${checked.why})` : 'its policy is not known here'}`)
     return null
@@ -1319,7 +1319,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         || s.model !== 'gpt-6.1-sol' || s.effort !== 'max')) throw Object.assign(new Error('Invalid managed execution launch.'), { status: 409, code: 'execution-runtime-mismatch' })
       if (s.engine && s.engine !== 'claude' && s.engine !== 'codex') throw Object.assign(new Error('This native terminal pool does not support the requested engine.'), { status: 503, code: 'engine-not-supported' })
       // Order o7e6d: the staff policy or none. A staff chat is native Claude only: never with a bridge, as Codex or as OpenCode.
-      if (s.policy !== undefined && s.policy !== STAFF_POLICY) throw staffRefused('This chat names a policy this app does not know, so it was not started.')
+      if (s.policy !== undefined && !isStaffPolicy(s.policy)) throw staffRefused('This chat names a policy this app does not know, so it was not started.')
       if (s.policy && (s.bridge || s.codex || (s.engine ?? 'claude') !== 'claude')) throw staffRefused('A person’s own Assistant runs only as native Claude, so it was not started.')
       const existing = chats.get(s.sessionId)
       if (existing && !existing.exited) {
@@ -1393,8 +1393,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           // Order o7e6d: the staff launch (staff-policy.ts), none of the flags below. Without its own settings file or its own MCP file it is
           // not started at all (never the coding chats' settings or the shared MCP file in their place).
           if (!settings || !s.mcpConfig) throw staffRefused('The settings or the tools file of a person’s own Assistant could not be made, so it was not started.')
-          Object.assign(env, STAFF_ENV)
-          args = staffArgs({ sessionId: s.sessionId, resume: s.resume, briefPath: s.briefPath, mcpConfig: s.mcpConfig, server: MCP_SERVER_NAME, model: s.model, effort: s.effort, settings })
+          Object.assign(env, staffEnvOf(s.policy))
+          args = staffArgs({ sessionId: s.sessionId, resume: s.resume, briefPath: s.briefPath, mcpConfig: s.mcpConfig, server: MCP_SERVER_NAME, model: s.model, effort: s.effort, settings, policy: s.policy })
         } else {
           args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
           if (s.strictMcp) args.push('--strict-mcp-config')
@@ -1617,7 +1617,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return 'gone'
       // Order o7e6d: a staff chat's words are checked before anything is typed (staffWords); refused, nothing of it goes in.
       const text = c.info.policy ? staffWords(c, given) : given
-      if (text === null) { opt?.onBlocked?.(c.info.policy === STAFF_POLICY ? 'staff-text' : 'staff-runtime'); return 'blocked' }
+      if (text === null) { opt?.onBlocked?.(isStaffPolicy(c.info.policy) ? 'staff-text' : 'staff-runtime'); return 'blocked' }
       // Stage 1 (oad50): the simple send for a Claude chat, unless "Old way" is on. Nothing before it refuses on what the screen shows.
       // Only where Agent 12's transcript reader runs: a Claude chat that is not Codex-in-Claude (c.info.execution). Everything else keeps the checked path.
       if (simpleLayerFor(c.info, oldWay())) {

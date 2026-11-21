@@ -16,8 +16,11 @@
         root.dataset.theme = theme || 'parchment'
         root.dataset.mode =
           mode === 'light' || mode === 'dark' ? mode : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+        // F-305: the phone app's floating-button panel (the address shared/phone-panel.ts PANEL_ROUTE) is a card over other apps: its page is see-through from the first paint, not only once the page's code runs.
+        if (location.pathname.replace(/\/$/, '') === '/assistant-panel') root.dataset.panel = ''
       })()
     </script>
+    <style>html[data-panel],html[data-panel] body{background:0 0;overflow:hidden}</style>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -29,12 +32,12 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <meta name="apple-mobile-web-app-title" content="Agentic" />
     <title>shubham-agentic-build</title>
-    <script type="module" crossorigin src="/assets/index-DCO-z0XW.js"></script>
+    <script type="module" crossorigin src="/assets/index--bmryNO8.js"></script>
     <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-COiEfhsA.js">
     <link rel="modulepreload" crossorigin href="/assets/react-B8SKf8RM.js">
     <link rel="modulepreload" crossorigin href="/assets/react-dom-CaO2D5ST.js">
-    <link rel="modulepreload" crossorigin href="/assets/hooks-pHuLO7vO.js">
-    <link rel="modulepreload" crossorigin href="/assets/lib-AHVEKuvC.js">
+    <link rel="modulepreload" crossorigin href="/assets/hooks-VXhIiWdM.js">
+    <link rel="modulepreload" crossorigin href="/assets/lib-D0poHTj-.js">
     <link rel="modulepreload" crossorigin href="/assets/jsx-runtime-DePvh3-m.js">
     <link rel="modulepreload" crossorigin href="/assets/react-BohVWjCw.js">
     <link rel="modulepreload" crossorigin href="/assets/AnimatePresence-DK4MT7Ap.js">
@@ -61,9 +64,11 @@
     <link rel="modulepreload" crossorigin href="/assets/book-open-9tJ5kaEm.js">
     <link rel="modulepreload" crossorigin href="/assets/check-D1ksrk1l.js">
     <link rel="modulepreload" crossorigin href="/assets/check-check-CxSji4Aa.js">
+    <link rel="modulepreload" crossorigin href="/assets/chevron-down-BcQ4M_76.js">
     <link rel="modulepreload" crossorigin href="/assets/chevron-right-Cix0oiFM.js">
     <link rel="modulepreload" crossorigin href="/assets/circle-alert-cjUZj9qx.js">
     <link rel="modulepreload" crossorigin href="/assets/clock-BaMy0JXE.js">
+    <link rel="modulepreload" crossorigin href="/assets/crown-36Y8doEq.js">
     <link rel="modulepreload" crossorigin href="/assets/download-CaqaUtFT.js">
     <link rel="modulepreload" crossorigin href="/assets/ellipsis-vertical-WbjQVt6r.js">
     <link rel="modulepreload" crossorigin href="/assets/eye-N1q_tA4v.js">
@@ -71,15 +76,16 @@
     <link rel="modulepreload" crossorigin href="/assets/file-CktmA2QN.js">
     <link rel="modulepreload" crossorigin href="/assets/image-CAY6rP6q.js">
     <link rel="modulepreload" crossorigin href="/assets/keyboard-BXrD-h1m.js">
+    <link rel="modulepreload" crossorigin href="/assets/layers-DFavMhUZ.js">
     <link rel="modulepreload" crossorigin href="/assets/loader-circle-C68I5gKX.js">
     <link rel="modulepreload" crossorigin href="/assets/message-square-BtUJXKLK.js">
     <link rel="modulepreload" crossorigin href="/assets/mic-off-CxUoJO0l.js">
     <link rel="modulepreload" crossorigin href="/assets/mic-D7zx9miP.js">
     <link rel="modulepreload" crossorigin href="/assets/monitor-off-BxQQwbTg.js">
     <link rel="modulepreload" crossorigin href="/assets/monitor-B1B7k1Cj.js">
-    <link rel="modulepreload" crossorigin href="/assets/chevron-down-BcQ4M_76.js">
-    <link rel="modulepreload" crossorigin href="/assets/crown-36Y8doEq.js">
-    <link rel="modulepreload" crossorigin href="/assets/layers-DFavMhUZ.js">
+    <link rel="modulepreload" crossorigin href="/assets/paperclip-BiQQQx-O.js">
+    <link rel="modulepreload" crossorigin href="/assets/rotate-ccw-Dgxt25hS.js">
+    <link rel="modulepreload" crossorigin href="/assets/rotate-cw-DJygSj3N.js">
     <link rel="modulepreload" crossorigin href="/assets/sliders-horizontal-C0xlht8c.js">
     <link rel="modulepreload" crossorigin href="/assets/cpu-DDofJy-n.js">
     <link rel="modulepreload" crossorigin href="/assets/gauge-Gwdz3IGk.js">
@@ -94,7 +100,11 @@
     <link rel="modulepreload" crossorigin href="/assets/store-DuJpOdDa.js">
     <link rel="modulepreload" crossorigin href="/assets/transport-BSZb0ddI.js">
     <link rel="modulepreload" crossorigin href="/assets/ChatChips-C8G2xgii.js">
+    <link rel="modulepreload" crossorigin href="/assets/square-Cz30250W.js">
+    <link rel="modulepreload" crossorigin href="/assets/unplug-BEWJtU5C.js">
     <link rel="modulepreload" crossorigin href="/assets/user-round-CQA6jhvl.js">
+    <link rel="modulepreload" crossorigin href="/assets/volume-x-DMbbWUEO.js">
+    <link rel="modulepreload" crossorigin href="/assets/wrench-C0eRs13f.js">
     <link rel="modulepreload" crossorigin href="/assets/x-CBDQUtPR.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-ap1VxXmW.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-B4UmUoDo.js">
@@ -105,39 +115,27 @@
     <link rel="modulepreload" crossorigin href="/assets/dist-DeXHRxPq.js">
     <link rel="modulepreload" crossorigin href="/assets/dropdown-menu-CMNIyHyu.js">
     <link rel="modulepreload" crossorigin href="/assets/use-media-query-bRNCrcsk.js">
+    <link rel="modulepreload" crossorigin href="/assets/human-p4qVAc22.js">
     <link rel="modulepreload" crossorigin href="/assets/status-dot-Bc6E5_O4.js">
     <link rel="modulepreload" crossorigin href="/assets/util-Cn5bEZbM.js">
-    <link rel="modulepreload" crossorigin href="/assets/old-route-CRkCeTsz.js">
-    <link rel="modulepreload" crossorigin href="/assets/store-BdcgaIMJ.js">
-    <link rel="modulepreload" crossorigin href="/assets/pane-7rD54UMR.js">
-    <link rel="modulepreload" crossorigin href="/assets/PinToPane-DsiuHudM.js">
-    <link rel="modulepreload" crossorigin href="/assets/paperclip-BiQQQx-O.js">
-    <link rel="modulepreload" crossorigin href="/assets/rotate-ccw-Dgxt25hS.js">
-    <link rel="modulepreload" crossorigin href="/assets/rotate-cw-DJygSj3N.js">
-    <link rel="modulepreload" crossorigin href="/assets/square-Cz30250W.js">
-    <link rel="modulepreload" crossorigin href="/assets/unplug-BEWJtU5C.js">
-    <link rel="modulepreload" crossorigin href="/assets/volume-x-DMbbWUEO.js">
-    <link rel="modulepreload" crossorigin href="/assets/wrench-C0eRs13f.js">
-    <link rel="modulepreload" crossorigin href="/assets/human-p4qVAc22.js">
     <link rel="modulepreload" crossorigin href="/assets/preload-helper-BLdHbfdN.js">
     <link rel="modulepreload" crossorigin href="/assets/store-DY_ch073.js">
+    <link rel="modulepreload" crossorigin href="/assets/old-route-CRkCeTsz.js">
     <link rel="modulepreload" crossorigin href="/assets/voice-hub-DB5ZLsRG.js">
+    <link rel="modulepreload" crossorigin href="/assets/store-BdcgaIMJ.js">
     <link rel="modulepreload" crossorigin href="/assets/mic-owner-u2f0lG0C.js">
     <link rel="modulepreload" crossorigin href="/assets/keyboard-mode-CB2tBQ7F.js">
     <link rel="modulepreload" crossorigin href="/assets/dock-DslP6Vnf.js">
-    <link rel="modulepreload" crossorigin href="/assets/api-D1SlnKDr.js">
+    <link rel="modulepreload" crossorigin href="/assets/api-BkxRYbF7.js">
     <link rel="modulepreload" crossorigin href="/assets/format-gR853hSI.js">
     <link rel="modulepreload" crossorigin href="/assets/skeleton-clTILKSp.js">
     <link rel="modulepreload" crossorigin href="/assets/copy-CO4KLm1Y.js">
-    <link rel="modulepreload" crossorigin href="/assets/code-block-DnolQ9qT.js">
-    <link rel="modulepreload" crossorigin href="/assets/own-Bai6UhVx.js">
+    <link rel="modulepreload" crossorigin href="/assets/own-CIan0FCU.js">
     <link rel="modulepreload" crossorigin href="/assets/engine-progress-B-mbh_VE.js">
-    <link rel="modulepreload" crossorigin href="/assets/Conversation-Blwatvx_.js">
-    <link rel="modulepreload" crossorigin href="/assets/circle-check-BKvI5Fuj.js">
-    <link rel="modulepreload" crossorigin href="/assets/circle-BS93KXjM.js">
+    <link rel="modulepreload" crossorigin href="/assets/Conversation-BPFmiXLj.js">
+    <link rel="modulepreload" crossorigin href="/assets/circle-dashed-C_lrWpH4.js">
     <link rel="modulepreload" crossorigin href="/assets/eye-off-C-UPAoKX.js">
     <link rel="modulepreload" crossorigin href="/assets/log-in-BdXphLbH.js">
-    <link rel="modulepreload" crossorigin href="/assets/undo-2-rGMxyjXL.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-BDiw99Bl.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-BUbolD6D.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-BFjod0P4.js">
@@ -147,12 +145,13 @@
     <link rel="modulepreload" crossorigin href="/assets/SignInDialog-BFMcNVxY.js">
     <link rel="modulepreload" crossorigin href="/assets/assistant-CjuCu1fL.js">
     <link rel="modulepreload" crossorigin href="/assets/CrmLoginNotice-BTR3zFO4.js">
+    <link rel="modulepreload" crossorigin href="/assets/use-nest-DjeIyBkx.js">
     <link rel="modulepreload" crossorigin href="/assets/routing-store-CjwJFaTZ.js">
     <link rel="modulepreload" crossorigin href="/assets/pc-ports-DD3M-JU_.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-BKKRzApb.js">
     <link rel="modulepreload" crossorigin href="/assets/switch-Dk9BtbPQ.js">
-    <link rel="stylesheet" crossorigin href="/assets/PinToPane-Bq0drMqb.css">
-    <link rel="stylesheet" crossorigin href="/assets/index-M49TeOZu.css">
+    <link rel="stylesheet" crossorigin href="/assets/Conversation-Bq0drMqb.css">
+    <link rel="stylesheet" crossorigin href="/assets/index-Bz0rpbHK.css">
   </head>
   <body>
     <div id="root"></div>

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import path from 'node:path'
 import type { WikiPage, WikiPageMeta } from '../../shared/memory.ts'
 import { writeAtomic } from '../config.ts'
@@ -137,7 +137,17 @@ export interface Wiki {
   /** Commits everything when the wiki is a git repository; false when it isn't or nothing changed. */
   commit(message: string): Promise<boolean>
   git(): boolean
+  /**
+   * S3: deletes the inbox's files (the raw material of each run) older than `keepDays` days; how many went. The inbox is never in git (see GITIGNORE), so a secret that
+   * slipped past the redaction is gone with its file and not kept in the wiki's history.
+   */
+  purgeInbox(keepDays: number, now?: number): number
 }
+
+/** The wiki's .gitignore: half-written files, and the inbox (S3: raw material is kept on disk for a few days, never in the history). */
+export const GITIGNORE = '*.part\ninbox/\n'
+/** The inbox's files are kept this many days. */
+export const INBOX_KEEP_DAYS = 14
 
 /** A page's path, made safe: relative, forward slashes, .md, inside the wiki and outside inbox/ and .git/. */
 export function pagePath(rel: string): string | null {
@@ -243,9 +253,52 @@ export function createWiki(dir: string, person: string = OWNER_NAME): Wiki {
       if (!existsSync(path.join(dir, 'index.md'))) this.writeIndex()
       if (!hasGit && (await run('git', ['init', '-q'], dir)).ok) {
         hasGit = true
-        writeAtomic(path.join(dir, '.gitignore'), '*.part\n')
+        writeAtomic(path.join(dir, '.gitignore'), GITIGNORE)
         await this.commit('The wiki, started')
+      } else if (hasGit) {
+        // S3: a wiki that was started before the inbox was left out of git: the line is added and what the index holds of the inbox is let go (its history, if any, is
+        // what it was: nothing is rewritten here).
+        const file = path.join(dir, '.gitignore')
+        let have = ''
+        try {
+          have = readFileSync(file, 'utf8')
+        } catch {
+          // None yet.
+        }
+        if (!have.split(/\r?\n/).some(l => l.trim() === 'inbox/')) {
+          // Agent 14's N3a: the line is written only AFTER the index let go of the inbox. If git refuses now (an index lock, a running git), nothing is written and the next start
+          // tries again; written first, the migration would never run again and the old inbox files would stay tracked.
+          if ((await run('git', ['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', 'inbox'], dir)).ok) {
+            writeAtomic(file, `${have}${have === '' || have.endsWith('\n') ? '' : '\n'}${have.includes('*.part') ? '' : '*.part\n'}inbox/\n`)
+            await this.commit('The inbox is not kept in git')
+          }
+        }
       }
+    },
+
+    purgeInbox(keepDays, now = Date.now()) {
+      const inbox = path.join(dir, 'inbox')
+      const before = now - Math.max(1, keepDays) * 86_400_000
+      let gone = 0
+      let names: string[] = []
+      try {
+        names = readdirSync(inbox)
+      } catch {
+        return 0
+      }
+      for (const n of names) {
+        if (!n.endsWith('.md')) continue
+        const file = path.join(inbox, n)
+        try {
+          if (statSync(file).mtimeMs < before) {
+            rmSync(file, { force: true })
+            gone++
+          }
+        } catch {
+          // Gone already.
+        }
+      }
+      return gone
     },
 
     pages() {
@@ -307,6 +360,9 @@ export function createWiki(dir: string, person: string = OWNER_NAME): Wiki {
     async commit(message) {
       if (!hasGit) return false
       if (!(await run('git', ['add', '-A'], dir)).ok) return false
+      // Agent 14's R2: the inbox is never part of a commit, whatever the state of .gitignore (a migration that git refused at start leaves the line unwritten): raw material is not
+      // history. It is taken out of the index again after the add (an exclude pathspec makes git refuse when the inbox is ignored). A tracked old inbox is let go here too.
+      if (!(await run('git', ['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', 'inbox'], dir)).ok) return false
       const staged = await run('git', ['diff', '--cached', '--quiet'], dir)
       if (staged.ok) return false
       return (await run('git', [...GIT_ID, 'commit', '-q', '-m', message], dir)).ok
