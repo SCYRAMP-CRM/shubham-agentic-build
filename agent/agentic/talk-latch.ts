@@ -54,6 +54,9 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   memory_recent: 'read',
   memory_read: 'read',
   memory_recall: 'read',
+  // F-309 N1: the agent's notebook: reading it is a read.
+  notebook_search: 'read',
+  notebook_read: 'read',
   task_list: 'read',
   wa_chats: 'read',
   wa_read: 'read',
@@ -72,6 +75,8 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   task_add: 'note',
   task_update: 'note',
   memory_save: 'note',
+  // F-309 N1: a note to the agent's notebook is as harmless as a floor note (the server saves it, merges it or holds it for the owner; it never acts).
+  notebook_add: 'note',
   // They only prepare: his own tap sends.
   prepare_send: 'prepare',
   wa_prepare_send: 'prepare',

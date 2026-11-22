@@ -41,6 +41,9 @@ self.addEventListener('fetch', event => {
   if (req.mode !== 'navigate') return
   const url = new URL(req.url)
   if (url.origin !== self.location.origin || url.pathname.startsWith('/agent-api')) return
+  // F-310: the phone app's floating card (/assistant-panel) is a card over other apps and has no use for the offline page below; its page goes straight to the network, not through this worker (which, when it
+  // had been stopped, had to be woken first: time on every open of the card). shared/phone-panel.ts PANEL_ROUTE is this address; src/panel/card-speed-wiring.test.mjs runs this handler against it.
+  if (url.pathname.replace(/\/$/, '') === '/assistant-panel') return
   event.respondWith(
     fetch(req).catch(
       () => new Response(OFFLINE, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } }),

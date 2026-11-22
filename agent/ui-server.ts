@@ -8,6 +8,7 @@ import { AUTH_PAGE_HEADER } from '../shared/auth.ts'
 import { applyVia } from './auth/via.ts'
 import { fromApp, hostAllowed } from './local-host.ts'
 import type { Logger } from './log.ts'
+import { etagMatches, isCompressible, MAX_BYTES, MIN_BYTES, pickEncoding, StaticCache, type Encoding } from './static-compress.ts'
 
 // F-020: the app as a build has no Vite dev server, so the agent serves the built page itself
 // (`--app <dir>`, the build's `app/` folder) on the page port, 5173 as Vite used, so the phone's
@@ -42,6 +43,8 @@ export interface UiServerOptions {
 
 export interface UiServer {
   port: number
+  /** F-310: how many compressions the static text has cost since start (one per file and encoding: never per request). */
+  compressions(): number
   close(): Promise<void>
 }
 
@@ -87,6 +90,7 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
   const root = path.resolve(o.appDir)
   const log = o.log
   const sockets = new Set<Duplex>()
+  const statics = new StaticCache()
 
   /** A file under the app folder for this URL path, or null (never outside it). */
   async function fileFor(urlPath: string): Promise<string | null> {
@@ -114,19 +118,63 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
     // Any other path is the router's: the page itself. A missing asset stays a 404.
     if (!file && !path.extname(url.pathname)) file = path.join(root, 'index.html')
     if (!file) return plain(res, 404, 'Not found')
+    const ext = path.extname(file).toLowerCase()
+    const hashed = file.startsWith(path.join(root, 'assets') + path.sep)
+    const type = TYPES[ext] ?? 'application/octet-stream'
+    // Built assets carry a hash in their name; the page and the rest must be asked for again.
+    const cache = hashed ? 'public, max-age=31536000, immutable' : 'no-cache'
+    if (isCompressible(ext)) return text(req, res, file, type, cache)
     let body: Buffer
     try {
       body = await readFile(file)
     } catch {
       return plain(res, 404, 'Not found')
     }
-    const hashed = file.startsWith(path.join(root, 'assets') + path.sep)
-    res.writeHead(200, {
-      'Content-Type': TYPES[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
-      'Content-Length': body.length,
-      // Built assets carry a hash in their name; the page and the rest must be asked for again.
-      'Cache-Control': hashed ? 'public, max-age=31536000, immutable' : 'no-cache',
-    })
+    res.writeHead(200, { 'Content-Type': type, 'Content-Length': body.length, 'Cache-Control': cache })
+    res.end(req.method === 'HEAD' ? undefined : body)
+  }
+
+  /**
+   * F-310: the static text (JS, CSS, HTML, SVG, JSON): sent compressed when the client accepts it (shared/the cache in static-compress.ts: once per file, never per request), with the validators of the
+   * representation it is (an ETag per encoding, 304 for If-None-Match) and Vary: Accept-Encoding. A Range request, a file under MIN_BYTES or over MAX_BYTES, and a client that accepts nothing get the file as it is.
+   */
+  async function text(req: IncomingMessage, res: ServerResponse, file: string, type: string, cache: string) {
+    let st: Awaited<ReturnType<typeof stat>>
+    let tag: string
+    try {
+      st = await stat(file)
+      tag = await statics.tag(file, st)
+    } catch {
+      return plain(res, 404, 'Not found')
+    }
+    const wanted = req.headers.range || st.size < MIN_BYTES || st.size > MAX_BYTES ? null : pickEncoding(req.headers['accept-encoding'])
+    const headers: http.OutgoingHttpHeaders = { 'Content-Type': type, 'Cache-Control': cache, Vary: 'Accept-Encoding' }
+    const planned = `"${tag}${wanted ? `-${wanted}` : ''}"`
+    if (etagMatches(req.headers['if-none-match'], planned)) {
+      res.writeHead(304, { ...headers, ETag: planned })
+      return res.end()
+    }
+    let body: Buffer | null = null
+    let used: Encoding | null = null
+    if (wanted) {
+      try {
+        body = await statics.encoded(file, st, wanted)
+        used = wanted
+      } catch {
+        body = null
+      }
+    }
+    if (!body) {
+      try {
+        body = await readFile(file)
+      } catch {
+        return plain(res, 404, 'Not found')
+      }
+    }
+    headers.ETag = `"${tag}${used ? `-${used}` : ''}"`
+    headers['Content-Length'] = body.length
+    if (used) headers['Content-Encoding'] = used
+    res.writeHead(200, headers)
     res.end(req.method === 'HEAD' ? undefined : body)
   }
 
@@ -239,6 +287,7 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
   log?.info(`the app's page: http://localhost:${port} (from ${root})`)
   return {
     port,
+    compressions: () => statics.stats.compressions,
     close: async () => {
       for (const s of sockets) s.destroy()
       sockets.clear()

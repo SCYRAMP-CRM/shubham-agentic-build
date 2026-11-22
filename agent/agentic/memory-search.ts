@@ -50,13 +50,28 @@ export class WordIndex {
   }
 
   set(id: string, text: string) {
-    this.remove(id)
     const words = terms(text)
     const tf = new Map<string, number>()
     for (const w of words) tf.set(w, (tf.get(w) ?? 0) + 1)
+    this.setCounts(id, tf, words.length)
+  }
+
+  /** A document from its word counts already made (F-309: the agent notebook keeps them on disk): the same as set() of its text. The map is kept, not copied: do not change it. */
+  setCounts(id: string, tf: Map<string, number>, len: number) {
+    this.remove(id)
     for (const w of tf.keys()) this.df.set(w, (this.df.get(w) ?? 0) + 1)
-    this.docs.set(id, { tf, len: words.length })
-    this.totalLen += words.length
+    this.docs.set(id, { tf, len })
+    this.totalLen += len
+  }
+
+  /** A document's word counts and length, or undefined (to keep them, or to see which words it holds). */
+  counts(id: string): { tf: Map<string, number>; len: number } | undefined {
+    return this.docs.get(id)
+  }
+
+  /** Whether any document holds this word. */
+  knows(word: string): boolean {
+    return this.df.has(word)
   }
 
   remove(id: string) {
@@ -232,9 +247,23 @@ function pieces(text: string): string[] {
   return out
 }
 
+/**
+ * The text as ONE line: every kind of white space, every control character (C0, DEL and the C1 ones, U+0085 among them) and the line and paragraph separators (U+2028, U+2029) become one
+ * space. A model reads any of them as the start of a new line or heading, so a text that goes into a brief or a recall (which are read as instructions are) must not carry one (F-309 R1-a).
+ * (`\s` alone misses U+0085 and the other control characters.)
+ */
+export function flatText(text: string): string {
+  let out = ''
+  for (const ch of text) {
+    const c = ch.codePointAt(0) ?? 0
+    out += c <= 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 || /\s/.test(ch) ? ' ' : ch
+  }
+  return out.replace(/ {2,}/g, ' ').trim()
+}
+
 /** A snippet of `text` near the first of the query's words it holds, about `max` characters. */
 export function snippet(text: string, query: string, max = 320): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
+  const flat = flatText(text)
   if (flat.length <= max) return flat
   const lower = flat.toLowerCase()
   let at = -1

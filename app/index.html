@@ -1,6 +1,8 @@
 <!doctype html>
 <html lang="en" data-theme="parchment" data-mode="dark">
   <head>
+    <script type="application/json" id="panel-preload">["/assets/PanelRoot-B4srtgcs.js","/assets/external-link--x056Ox_.js","/assets/TalkButton-CJu6l6aF.js","/assets/look-BkD43vjj.js","/assets/phone-B_3PM_sX.js","/assets/TalkCard-DFLN4C7S.js","/assets/send-hO7Q3R-R.js","/assets/Orb-DtIj3NCT.js"]</script>
+
     <meta charset="UTF-8" />
     <!-- The stored theme and mode, applied before first paint so there is no flash.
          src/theme/ThemeProvider.tsx takes over from here and uses the same keys. -->
@@ -17,10 +19,42 @@
         root.dataset.mode =
           mode === 'light' || mode === 'dark' ? mode : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
         // F-305: the phone app's floating-button panel (the address shared/phone-panel.ts PANEL_ROUTE) is a card over other apps: its page is see-through from the first paint, not only once the page's code runs.
-        if (location.pathname.replace(/\/$/, '') === '/assistant-panel') root.dataset.panel = ''
+        if (location.pathname.replace(/\/$/, '') === '/assistant-panel') {
+          root.dataset.panel = ''
+          // F-310 (his order oa0fe: the card opens slowly), on the card's address only; shared/card-boot.ts says what each part is for, src/panel/card-speed-wiring.test.mjs runs this script against it.
+          window.__sadMarks = { head: performance.now() }
+          // 1. SHEET: the skeleton below is sized from the view the card kept last time (the last key it wrote, then its mode and share; nothing kept is the usual 72%).
+          try {
+            var last = localStorage.getItem('sad-panel-last-key')
+            var view = last && last.indexOf('sad-panel-view:') === 0 ? JSON.parse(localStorage.getItem(last)) : null
+            var share = view && typeof view.h === 'number' && isFinite(view.h) ? Math.min(0.92, Math.max(0.35, view.h)) : 0.72
+            root.dataset.panelSkel = view && view.mode === 'max' ? 'max' : 'min'
+            root.style.setProperty('--panel-h', 'min(100dvh, max(' + Math.round(share * 1000) / 10 + 'dvh, 360px))')
+          } catch (e) {}
+          // 2. AUTH: who is this browser: the page's own sign-in check takes this answer instead of asking again (src/auth/session.ts, once, while fresh).
+          try {
+            var early = fetch('/agent-api/auth/status', { cache: 'no-store', credentials: 'same-origin' })
+            early.catch(function () {})
+            window.__sadEarly = { auth: early, at: performance.now() }
+          } catch (e) {}
+          // 3. PRELOAD: the card's own chunks (listed by the build in #panel-preload, absent in dev) start loading now, not after the app's entry has run.
+          try {
+            var list = JSON.parse(document.getElementById('panel-preload').textContent)
+            var added = 0
+            for (var i = 0; i < list.length && added < 40; i++) {
+              if (typeof list[i] !== 'string' || !/^\/assets\/[A-Za-z0-9._-]+\.js$/.test(list[i])) continue
+              var link = document.createElement('link')
+              link.rel = 'modulepreload'
+              link.crossOrigin = 'anonymous'
+              link.href = list[i]
+              document.head.appendChild(link)
+              added++
+            }
+          } catch (e) {}
+        }
       })()
     </script>
-    <style>html[data-panel],html[data-panel] body{background:0 0;overflow:hidden}</style>
+    <style>html[data-panel],html[data-panel] body{background:0 0;overflow:hidden}[data-skel]{display:none}html[data-panel] [data-skel]{pointer-events:none;display:block;position:fixed;inset:0}html[data-panel] [data-skel-sheet]{height:min(100dvh,max(72dvh,360px));height:var(--panel-h,min(100dvh, max(72dvh, 360px)));box-sizing:border-box;background:var(--canvas,#101010);border:1px solid var(--hairline-strong,#333);box-shadow:var(--elevation-overlay,0 -8px 32px #0006);padding-bottom:env(safe-area-inset-bottom);border-bottom:0;border-radius:16px 16px 0 0;flex-direction:column;display:flex;position:absolute;bottom:0;left:0;right:0;overflow:hidden}html[data-panel-skel=max] [data-skel-sheet]{height:auto;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border:0;border-radius:0;top:0}[data-skel-grip]{flex:none;justify-content:center;align-items:center;height:24px;display:flex}html[data-panel-skel=max] [data-skel-grip]{display:none}[data-skel-grip] i{background:var(--hairline-strong,#333);border-radius:2px;width:36px;height:4px}[data-skel-head]{border-bottom:1px solid var(--hairline,#262626);flex:none;align-items:center;gap:6px;height:44px;padding:0 8px 0 4px;display:flex}[data-skel-head] i{background:var(--surface-strong,#1c1c1c);border-radius:10px;width:36px;height:20px}[data-skel-head] i:first-child{width:84px}[data-skel-head] b{background:var(--surface-strong,#1c1c1c);border-radius:8px;width:28px;height:28px;margin-left:auto}[data-skel-head] b+b{margin-left:12px}[data-skel-body]{flex-direction:column;flex:1;gap:12px;padding:16px;display:flex}[data-skel-body] i{background:var(--surface-strong,#1c1c1c);border-radius:16px;width:62%;height:36px}[data-skel-body] i:nth-child(2n){align-self:flex-end;width:48%}</style>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -32,7 +66,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <meta name="apple-mobile-web-app-title" content="Agentic" />
     <title>shubham-agentic-build</title>
-    <script type="module" crossorigin src="/assets/index-Cj8tpiUR.js"></script>
+    <script type="module" crossorigin src="/assets/index-DkM2isaf.js"></script>
     <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-COiEfhsA.js">
     <link rel="modulepreload" crossorigin href="/assets/react-B8SKf8RM.js">
     <link rel="modulepreload" crossorigin href="/assets/react-dom-CaO2D5ST.js">
@@ -95,11 +129,11 @@
     <link rel="modulepreload" crossorigin href="/assets/agentic-LatdEW2P.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-C427dJSI.js">
     <link rel="modulepreload" crossorigin href="/assets/live-BfaWBkBB.js">
-    <link rel="modulepreload" crossorigin href="/assets/session-CnWEEb--.js">
+    <link rel="modulepreload" crossorigin href="/assets/session-Dojw2zGv.js">
     <link rel="modulepreload" crossorigin href="/assets/chat-execution-CTBWqnS3.js">
-    <link rel="modulepreload" crossorigin href="/assets/store-MxoHcckH.js">
-    <link rel="modulepreload" crossorigin href="/assets/transport-WEzzoLRj.js">
-    <link rel="modulepreload" crossorigin href="/assets/ChatChips-DuOUAJVR.js">
+    <link rel="modulepreload" crossorigin href="/assets/store-BKXb0p2x.js">
+    <link rel="modulepreload" crossorigin href="/assets/transport-t8upcdal.js">
+    <link rel="modulepreload" crossorigin href="/assets/ChatChips-0xUQzBqe.js">
     <link rel="modulepreload" crossorigin href="/assets/square-Cz30250W.js">
     <link rel="modulepreload" crossorigin href="/assets/unplug-BEWJtU5C.js">
     <link rel="modulepreload" crossorigin href="/assets/user-round-CQA6jhvl.js">
@@ -119,9 +153,9 @@
     <link rel="modulepreload" crossorigin href="/assets/status-dot-Bc6E5_O4.js">
     <link rel="modulepreload" crossorigin href="/assets/util-Cn5bEZbM.js">
     <link rel="modulepreload" crossorigin href="/assets/preload-helper-BLdHbfdN.js">
-    <link rel="modulepreload" crossorigin href="/assets/store-B7iAZUpP.js">
+    <link rel="modulepreload" crossorigin href="/assets/store-C8_jQjid.js">
     <link rel="modulepreload" crossorigin href="/assets/old-route-CRkCeTsz.js">
-    <link rel="modulepreload" crossorigin href="/assets/voice-hub-B_8bDEE2.js">
+    <link rel="modulepreload" crossorigin href="/assets/voice-hub-DTBTbrWA.js">
     <link rel="modulepreload" crossorigin href="/assets/store-BdcgaIMJ.js">
     <link rel="modulepreload" crossorigin href="/assets/mic-owner-u2f0lG0C.js">
     <link rel="modulepreload" crossorigin href="/assets/keyboard-mode-CB2tBQ7F.js">
@@ -131,8 +165,8 @@
     <link rel="modulepreload" crossorigin href="/assets/skeleton-clTILKSp.js">
     <link rel="modulepreload" crossorigin href="/assets/copy-CO4KLm1Y.js">
     <link rel="modulepreload" crossorigin href="/assets/own-CIan0FCU.js">
-    <link rel="modulepreload" crossorigin href="/assets/engine-progress-BWINsfwd.js">
-    <link rel="modulepreload" crossorigin href="/assets/Conversation-D4l14Wc-.js">
+    <link rel="modulepreload" crossorigin href="/assets/engine-progress-DLP-4US8.js">
+    <link rel="modulepreload" crossorigin href="/assets/Conversation-B1z9FesM.js">
     <link rel="modulepreload" crossorigin href="/assets/circle-dashed-C_lrWpH4.js">
     <link rel="modulepreload" crossorigin href="/assets/eye-off-C-UPAoKX.js">
     <link rel="modulepreload" crossorigin href="/assets/log-in-BdXphLbH.js">
@@ -142,18 +176,26 @@
     <link rel="modulepreload" crossorigin href="/assets/dialog-DXP0xYtW.js">
     <link rel="modulepreload" crossorigin href="/assets/app-name-CAXnLyt-.js">
     <link rel="modulepreload" crossorigin href="/assets/input-2S5gI2Ri.js">
-    <link rel="modulepreload" crossorigin href="/assets/SignInDialog-n6UM2VHX.js">
+    <link rel="modulepreload" crossorigin href="/assets/SignInDialog-BDwZCGBa.js">
     <link rel="modulepreload" crossorigin href="/assets/assistant-CjuCu1fL.js">
-    <link rel="modulepreload" crossorigin href="/assets/CrmLoginNotice-BsTwRt0k.js">
-    <link rel="modulepreload" crossorigin href="/assets/routing-store-Bu5B1hPP.js">
+    <link rel="modulepreload" crossorigin href="/assets/CrmLoginNotice-CfIBJXwn.js">
+    <link rel="modulepreload" crossorigin href="/assets/routing-store-Dc-ijkhn.js">
     <link rel="modulepreload" crossorigin href="/assets/pc-ports-DD3M-JU_.js">
     <link rel="modulepreload" crossorigin href="/assets/dist-BKKRzApb.js">
     <link rel="modulepreload" crossorigin href="/assets/switch-Dk9BtbPQ.js">
     <link rel="modulepreload" crossorigin href="/assets/use-nest-Cas1NJw8.js">
     <link rel="stylesheet" crossorigin href="/assets/Conversation-Bq0drMqb.css">
-    <link rel="stylesheet" crossorigin href="/assets/index-DBKNlG-S.css">
+    <link rel="stylesheet" crossorigin href="/assets/index-XKaongFL.css">
   </head>
   <body>
     <div id="root"></div>
+    <!-- F-310: the card's skeleton (hidden on every other address); src/panel/PanelCard.tsx removes it when its own sheet is drawn. -->
+    <div data-skel aria-hidden="true">
+      <div data-skel-sheet>
+        <div data-skel-grip><i></i></div>
+        <div data-skel-head><i></i><i></i><i></i><i></i><i></i><b></b><b></b><b></b></div>
+        <div data-skel-body><i></i><i></i><i></i></div>
+      </div>
+    </div>
   </body>
 </html>

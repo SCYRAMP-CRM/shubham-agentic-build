@@ -257,6 +257,14 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/memory\/brief$/, OWNER],
   ['POST', /^\/memory\/compile$/, OWNER],
   ['PATCH', /^\/memory\/settings$/, OWNER],
+  // F-309 N1: the agent notebooks (memory-notebook.ts): the table, the notes, the held list, the refusals log. The owner of the app's only: the routes themselves ask for the first owner
+  // (a second owner does not read or erase them) and refuse a chat's key (index.ts notebookOwner).
+  ['GET', /^\/notebooks$/, OWNER],
+  ['PATCH', /^\/notebooks\/settings$/, OWNER],
+  ['GET', /^\/notebooks\/([a-z0-9-]+)\/(notes|held|log)$/, OWNER],
+  ['POST', /^\/notebooks\/([a-z0-9-]+)\/held\/([^/]+)$/, OWNER],
+  ['POST', /^\/notebooks\/([a-z0-9-]+)\/notes\/([^/]+)\/share$/, OWNER],
+  ['DELETE', /^\/notebooks\/([a-z0-9-]+)\/notes\/([^/]+)$/, OWNER],
 ]
 
 const policyKey = (method: string, pattern: RegExp) => `${method} ${pattern.source}`

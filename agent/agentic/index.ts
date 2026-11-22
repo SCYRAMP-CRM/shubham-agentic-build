@@ -230,6 +230,7 @@ import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
+import { createNotebooks, joinSections } from './memory-notebook.ts'
 import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, feedFloors, noteFloors, ownProjects, quickMayUseMemory, unfedFloors, type QuickTalker } from './memory-people.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
 import { answer, pullFrom as pullTranscriptFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
@@ -305,6 +306,10 @@ const NEEDS_SERVER = new Set([
   'wa_prepare_send',
   'watchdog_status',
   'memory_read',
+  // F-309 N1: the agent notebooks live on the Server (its state folder), whichever PC the chat runs on.
+  'notebook_add',
+  'notebook_search',
+  'notebook_read',
   'prepare_send',
   'crm_whoami',
   'crm_members',
@@ -924,10 +929,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function chatSettings(s: StartChat): string | undefined {
     // Order o7e6d: a staff chat gets its own file (never the memory's recall, the voice lock or a coding chat's file); a failed write throws.
     if (s.policy) return staffSettingsNow()
-    const picked = o.memory?.start ? hooksFile : promptHookSettings()
+    const at = mode() === 'member' ? undefined : allFloors().flatMap(f => (f.id === s.floorId ? f.agents.filter(a => a.id === s.agentId).map(a => ({ f, a })) : []))[0]
+    // F-309 N2: a chat that has a notebook gets the recall hook (the one that prints what the notebook found for each prompt), also with the memory layer off; a chat with none is picked for exactly as before.
+    // notebook-door: K10
+    const hasNotebook = !!at && notebooks.forChat(at.f, at.a).ok
+    const picked = o.memory?.start || hasNotebook ? hooksFile : promptHookSettings()
     // Order ofedf: with no hook of the other kinds, a chat still gets the usage status line (its own file) while usage is on.
     const base = picked ?? (usageOn ? statusOnlyFile : undefined)
-    const at = mode() === 'member' ? undefined : allFloors().flatMap(f => (f.id === s.floorId ? f.agents.filter(a => a.id === s.agentId).map(a => ({ f, a })) : []))[0]
     if (!at || !isOrchestratorAgent(at.f.name, at.a) || !LATCH_NAME.test(s.sessionId)) return base
     const prompt = base === hooksFile ? memoryPromptHook : base === promptHookFile ? reportPromptHook : null
     try {
@@ -1147,6 +1155,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const TOOLS_NOW = toolsVersion(TOOLS)
   const upSince = Date.now()
   const memory = createMemoryStore(path.join(o.dir, 'memory'))
+  // F-309 N1: the agent notebooks (memory-notebook.ts), OFF until the owner switches them on and maps a floor to one (agent-notebooks/settings.json). Written by a chat's three notebook_* tools,
+  // read by the owner through the /notebooks routes. Nothing in the F-051 layer flows into it; the F-051 guard (admins) only decides whether notes that record what a person said are served.
+  const notebooks = createNotebooks({ dir: o.dir, floors: () => floors.list(), appOwnerId: SBSKRRT_OWNER.id, admins: () => o.auth?.admins() ?? [SBSKRRT_OWNER.id] })
   // F-056: the task list (the Tasks tab, and the chats' task tools), kept on the hub like the floors.
   // Behind TaskStore (tasks.ts): a hosted database can take its place without anything else changing.
   const tasks = createFileTaskStore(path.join(o.dir, 'tasks.json'))
@@ -2098,7 +2109,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
         prepareClaudeConfig(cwd, claudeJson, poolOptions.addDirs)
         // memory-door: B4
-        const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief(agent) : '', orderReplies())
+        const brief = composeAgentBrief(floor, { ...agent, model: '' }, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies())
           + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
         const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
         return { sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: writeBrief(briefsDir, sid, brief),
@@ -2539,7 +2550,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       requireConfirmedThread()
       const dflt = defaultsNow()
       // memory-door: B2
-      const brief = composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies(), 'Codex')
+      const brief = composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), 'Codex')
       const mcp: Record<string, McpServerToml> = {
         // The shim is told whose chat it is by the terminal's environment, never by a file.
         [MCP_SERVER_NAME]: { command: process.execPath, args: [shim], env_vars: ['SAD_AGENTIC_KEY', 'SAD_AGENTIC_URL'] },
@@ -2846,7 +2857,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const registry = readRegistry(mcpRegistryFile)
       for (const name of chosen(registry, agent.mcpServers)) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
       // memory-door: B3
-      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies(), 'OpenCode'), mcp })
+      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), 'OpenCode'), mcp })
       heartbeat.opened(sid)
       chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new', ...startedBy(sid) })
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -2864,7 +2875,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on: this chat's OWNER's, never another person's.
     // memory-door: B1
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief(agent) : '', orderReplies()))
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies()))
     // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
     const dflt = defaultsNow()
     const effort = agent.effort || dflt.effort
@@ -5671,6 +5682,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
     o.auth?.deny(c, 403, 'admin-only', where)
     throw authError(403, words, 'admin-only')
   }
+  /**
+   * F-309 N1: the owner's view of the agent notebooks, and THE ONLY place `notebooks.asOwner(` is called. A chat's key (an agent calling these routes itself) is refused, and so is every
+   * administrator who is not the first owner by id: the notebooks hold what an agent was told, a second owner included does not read or erase them. The six /notebooks routes call this.
+   */
+  /**
+   * F-309 N2: a chat's start brief gets its notebook's section after the memory's (the four chat starts: Claude, Codex, OpenCode and the Claude Code harness of a Codex execution). THE ONLY place
+   * a brief asks the notebook. With no notebook for the chat (off, no row, another person's, PC Control, a member PC) the memory's section comes back as it was, byte for byte (joinSections).
+   */
+  function withNotebook(memorySection: string, floor: Floor, agent: FloorAgent): string {
+    if (mode() === 'member') return memorySection
+    // notebook-door: K11
+    const nb = notebooks.forChat(floor, agent)
+    return joinSections(memorySection, nb.ok ? nb.chat.brief() : '')
+  }
+  function notebookOwner(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    return notebooks.asOwner()
+  }
 
   /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
@@ -6527,13 +6557,42 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!layer) throw memoryDenied(agent, name, as?.quick)
         return layer.read(typeof args.ref === 'string' ? args.ref : '')
       }
+      // F-309 N1: the agent's NOTEBOOK (memory-notebook.ts). The notebook is found from this chat's floor and agent by the owner's table: a call never names a notebook, an owner or an
+      // instance, and a chat the table does not cover (off, no row, another person's, PC Control) is told so and saves or reads nothing. Each case has its marker (notebook-door: K1..K3).
+      case 'notebook_add': {
+        // notebook-door: K1
+        const nb = notebooks.forChat(floor, agent)
+        if (!nb.ok) return json({ status: 'off', saved: false, why: nb.why })
+        return json({ ...nb.chat.add(args), notebook: nb.chat.template.name, instance: nb.chat.instance.name })
+      }
+      case 'notebook_search': {
+        // notebook-door: K2
+        const nb = notebooks.forChat(floor, agent)
+        if (!nb.ok) return json({ status: 'off', why: nb.why, hits: [] })
+        const found = nb.chat.search(typeof args.query === 'string' ? args.query : '', {
+          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          only: typeof args.only === 'string' ? args.only : undefined,
+          history: args.history === true,
+        })
+        return json({ notebook: nb.chat.template.name, instance: nb.chat.instance.name, ...found })
+      }
+      case 'notebook_read': {
+        // notebook-door: K3
+        const nb = notebooks.forChat(floor, agent)
+        if (!nb.ok) throw apiError(409, nb.why)
+        return nb.chat.read(typeof args.ref === 'string' ? args.ref : '')
+      }
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
       case 'memory_recall': {
         // S2: the chat's OWNER's recall, and '' for a chat that is shared, whose owner has no memory yet, or whose owner is not an administrator. Never on a member PC:
         // a chat of a floor made there would make and start a layer on that PC (the hub answers the chats it holds).
         // memory-door: T3
         const layer = memoryOn && mode() !== 'member' && access.isAdmin(me) ? await chatLayer(agent) : null
-        return layer ? layer.recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+        const fromMemory = layer ? await layer.recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+        // F-309 N2: then the notebook's own line for this prompt (the chat's own notebook, found as for its tools); with none, the answer is the memory's, exactly as it was (joinSections).
+        // notebook-door: K12
+        const nb = mode() === 'member' ? null : notebooks.forChat(floor, agent)
+        return joinSections(fromMemory, nb && nb.ok ? nb.chat.recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : '')
       }
       // F-056: the app's one task list (the Tasks tab), for every chat.
       case 'task_add': {
@@ -9086,6 +9145,48 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     // memory-door: R8
     ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await routeLayer(r)).setSettings(r.body) })],
+    // F-309 N1: the agent notebooks, the OWNER's (notebookOwner: never a chat's key, the first owner by id). Each has its marker (notebook-door: K4..K9), so a tenth route is a red test.
+    // notebook-door: K4
+    ['GET', /^\/notebooks$/, (_, r) => notebookOwner(r).status()],
+    // notebook-door: K5
+    ['PATCH', /^\/notebooks\/settings$/, (_, r) => ({ settings: notebookOwner(r).setSettings(r.body) })],
+    [
+      'GET',
+      /^\/notebooks\/([a-z0-9-]+)\/(notes|held|log)$/,
+      ([t, what], r) => {
+        // notebook-door: K6
+        const nb = notebookOwner(r)
+        if (what === 'notes') return { notes: nb.notes(t) }
+        if (what === 'held') return { held: nb.held(t) }
+        return { log: nb.log(t, Number(r.query.get('limit')) || 200) }
+      },
+    ],
+    [
+      'POST',
+      /^\/notebooks\/([a-z0-9-]+)\/held\/([^/]+)$/,
+      ([t, heldId], r) => {
+        const b = isObject(r.body) ? r.body : {}
+        // notebook-door: K7
+        const nb = notebookOwner(r)
+        if (b.action === 'delete') {
+          nb.deleteHeld(t, heldId)
+          return { deleted: heldId }
+        }
+        if (b.action === 'release') return { result: nb.releaseHeld(t, heldId, { text: b.text }) }
+        throw apiError(400, 'action is release or delete')
+      },
+    ],
+    // notebook-door: K8
+    ['POST', /^\/notebooks\/([a-z0-9-]+)\/notes\/([^/]+)\/share$/, ([t, noteId], r) => ({ note: notebookOwner(r).share(t, noteId) })],
+    [
+      'DELETE',
+      /^\/notebooks\/([a-z0-9-]+)\/notes\/([^/]+)$/,
+      ([t, noteId], r) => {
+        // notebook-door: K9
+        notebookOwner(r).erase(t, noteId)
+        return { erased: noteId }
+      },
+    ],
   ]
 
   const callerOf = (r: MountRequest): Caller => r.caller ?? OPEN
