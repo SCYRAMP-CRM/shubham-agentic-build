@@ -22,6 +22,8 @@ export interface SendFields {
   textSha: string
   /** The Assistant's draft id, or '' for his own typing. */
   draft: string
+  /** F-312: which NUMBER the chat is of (a chat id means a different chat in each); left out, the first. The ticket is for exactly this number: one made for another is refused. */
+  acct?: string
 }
 
 interface Payload {
@@ -29,6 +31,8 @@ interface Payload {
   c: string
   h: string
   d: string
+  /** F-312: the number (left out of a ticket made before numbers existed: the first). */
+  a?: string
   by: string
   exp: number
   n: string
@@ -39,7 +43,7 @@ const KEY_RE = /^[0-9a-f]{64}$/
 
 /** The agent's side: a ticket for this send, by `by`, made at `now`. (`ttl` is for the tests that make a ticket that lives too long.) */
 export function issueSendTicket(key: string, f: SendFields, by: string, now: number, ttl = TICKET_MS): string {
-  const payload: Payload = { v: 1, c: f.chatId, h: f.textSha, d: f.draft, by: by.replace(/[\r\n]/g, ' ').slice(0, 200), exp: now + ttl, n: randomBytes(12).toString('hex') }
+  const payload: Payload = { v: 1, c: f.chatId, h: f.textSha, d: f.draft, a: f.acct ?? 'main', by: by.replace(/[\r\n]/g, ' ').slice(0, 200), exp: now + ttl, n: randomBytes(12).toString('hex') }
   const first = b64(Buffer.from(JSON.stringify(payload), 'utf8'))
   return `${first}.${b64(createHmac('sha256', key).update(first).digest())}`
 }
@@ -90,7 +94,7 @@ export function createTicketVerifier(now: () => number = Date.now): TicketVerifi
       if (p.v !== 1 || typeof p.c !== 'string' || typeof p.h !== 'string' || typeof p.d !== 'string' || typeof p.by !== 'string' || typeof p.n !== 'string' || !Number.isSafeInteger(p.exp)) return refuse()
       const exp = p.exp as number
       if (exp < t || exp - t > TICKET_MS) return refuse()
-      if (p.c !== f.chatId || p.h !== f.textSha || p.d !== f.draft) return refuse()
+      if (p.c !== f.chatId || p.h !== f.textSha || p.d !== f.draft || (p.a ?? 'main') !== (f.acct ?? 'main')) return refuse()
       for (const [n, until] of used) if (until < t) used.delete(n)
       if (used.has(p.n) || used.size >= 10_000) return refuse()
       used.set(p.n, exp)

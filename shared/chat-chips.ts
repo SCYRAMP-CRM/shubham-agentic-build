@@ -176,3 +176,30 @@ export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel
 
   return { model, effort, ultracode, pc }
 }
+
+/**
+ * F-316: what a chat says of the agent it is a copy of. An instance (a copy made from another agent) carries the
+ * template it comes from on the agent itself, `template: { id, name }`, set only by the server's "add a copy" door.
+ * A chat with no such field is its own template: it says nothing (never an empty chip, never "null"). The field is
+ * read defensively: a hand-made or older object with something else in its place says nothing either.
+ */
+export interface ChipTemplateAgent {
+  name: string
+  template?: { id?: unknown; name?: unknown } | null
+}
+
+/** The longest template name the chip itself shows; the tooltip carries the whole name. */
+export const TEMPLATE_CHIP_NAME_MAX = 32
+
+export function templateChip(agent: ChipTemplateAgent): Chip | null {
+  const t = agent.template
+  if (!t || typeof t !== 'object' || typeof t.name !== 'string') return null
+  const name = t.name.trim()
+  if (!name) return null
+  const shown = name.length > TEMPLATE_CHIP_NAME_MAX ? `${name.slice(0, TEMPLATE_CHIP_NAME_MAX - 1)}…` : name
+  return {
+    text: `instance of ${shown}`,
+    title: `${agent.name} is an instance of ${name}.`,
+    kind: 'known',
+  }
+}

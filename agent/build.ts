@@ -4,9 +4,12 @@ import { StringDecoder } from 'node:string_decoder'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
-import { UPDATE_EXIT_CODE, type BuildInfo, type BuildVersion, type PublishRequest } from '../shared/build.ts'
+import { buildStatusOf, UPDATE_EXIT_CODE, UPDATE_WHY_WORDS, type BuildInfo, type BuildVersion, type PublishRequest, type UpdateWhyNot } from '../shared/build.ts'
 import { apiError, type ApiMount, type MountRequest } from './api.ts'
-import { authError } from './auth/types.ts'
+import { appendAccessLog, appendAccessLogOrThrow } from './auth/access-log.ts'
+import { createRefusalAudit } from './build-update-refusals.ts'
+import { authError, type UpdateRights } from './auth/types.ts'
+import type { UpdatePolicyStore } from './build-update-policy.ts'
 import type { Logger } from './log.ts'
 import { cleanPublishActor, maySkipTests, PUBLISH_READY, publishActor, publishDecision, publishRequest, samePublishAudit, type PublishDecision } from './publish-policy.ts'
 import { beginPublishRecord, finishPublishRecord, publishHistory } from './publish-history.ts'
@@ -115,15 +118,22 @@ export interface BuildOptions {
   hostWaitMs?: number
   hostPollMs?: number
   /**
-   * F-173a: who may press Update (POST /update) and cancel it (POST /update-cancel) from a route. main.ts passes F-119's rule
-   * (auth/types.ts mayPublish): a PAGE (a browser, remote or local) needs a signed-in administrator; a program on the Server with
-   * the local machine token and no page headers is as before (Lead presses Update that way on the person's typed words). That is
-   * NOT Publish's rule any more: obcbd narrowed Publish to the owner signed in or the machine-token channel (publish-policy.ts
-   * publishActor), so an administrator who is not the owner may press Update from a page but may not publish.
+   * F-173a: who may press Update (POST /update) and cancel it (POST /update-cancel) from a route. Shubham's order ob12b (22 Nov 2026): it answers WHAT the caller is (auth/types.ts updateRights, wired by main.ts):
+   * the OWNER (the first owner by id, or the PC's own program: as before, with force and cancel) or a PERSON (any other signed-in person while the owner's switch is on: the guards below apply, no force, no cancel),
+   * or it THROWS (not signed in; the switch is off), the error carrying a `why` code for the Build page. Returning nothing means the owner, so a caller that supplies `() => {}` keeps what it had.
    * Required and without a default, so a build made without it does not compile. The AUTOMATIC update never goes through this route:
    * it spends a permit (commitUpdate) that only the coordinator in this process can make.
    */
-  authorizeUpdate: (r: MountRequest) => void
+  authorizeUpdate: (r: MountRequest) => UpdateRights | void
+  /**
+   * Shubham's order ob12b: the first owner's switch ("people may press Update") and the time of the last person's press, in a small file that survives the restart an Update causes. Left out (tests; a caller that does not
+   * integrate it): no switch routes, and the cooldown is kept in memory only.
+   */
+  policy?: UpdatePolicyStore
+  /** Shubham's order ob12b: the folder of access-log.jsonl (the agent folder); every press by a person, and every flip of the switch, is one line there (who, when, from which build to which, the outcome; never an address or a token). */
+  auditDir?: string
+  /** Tests: the clock. */
+  now?: () => number
   /** F-173a: the automatic update hears the Cancel button, and holds the build it was about to apply. */
   onUpdateCancel?: () => void
 }
@@ -265,6 +275,8 @@ export function createBuild(o: BuildOptions): Build {
         : !o.supervised
           ? 'This build was not started by its Start.cmd, so it cannot start itself again: run Update.cmd, then Start.cmd.'
           : null
+  /** The same three reasons as a CODE, for what a person's Build page is told (shared/build.ts UPDATE_WHY_WORDS has the words). */
+  const cannotWhy: UpdateWhyNot | null = kind !== 'build' ? 'dev' : !isClone ? 'not-a-clone' : !o.supervised ? 'not-supervised' : null
 
   const update: BuildInfo['update'] = { state: 'unknown', available: null, checkedAt: null, error: null, can: cannot === null, cannot, hostWait: null }
   const publish: NonNullable<BuildInfo['publish']> | null = o.devDir
@@ -638,19 +650,172 @@ export function createBuild(o: BuildOptions): Build {
   const devEvery = publish ? setInterval(() => void devStatus().catch(() => {}), DEV_EVERY_MS) : null
   devEvery?.unref()
 
+  // ---- Shubham's order ob12b (22 Nov 2026): people may press Update, under guards. The first owner keeps force, the wait and cancel; a person never cuts a busy chat.
+  /** A person's accepted presses are at least this far apart, and none comes this soon after the app (re)started: an Update restarts the app, so the second rule stops a loop of presses on a fresh start. */
+  const PERSON_COOLDOWN_MS = 30 * 60_000
+  const PERSON_QUIET_AFTER_START_MS = 10 * 60_000
+  const clock = o.now ?? Date.now
+  const startedAt = clock()
+  /** The time of the last accepted press by a person, in memory too (the file, when there is one, is what survives the restart). */
+  let lastPersonPress: number | null = null
+
+  /** What this caller is for Update; a throw (not signed in, the switch off) is answered as it is, with its `why`. */
+  const rightsOf = (r: MountRequest): UpdateRights => o.authorizeUpdate(r) ?? { kind: 'owner' }
+  const whyOfThrow = (e: unknown): UpdateWhyNot => {
+    const w = (e as { why?: unknown }).why
+    return typeof w === 'string' && (Object.keys(UPDATE_WHY_WORDS) as string[]).includes(w) ? (w as UpdateWhyNot) : 'first-owner-only'
+  }
+  /** The owner, or a refusal: cancel, the switch. By id (authorizeUpdate), so a second owner is a person here and is refused. */
+  function needOwner(r: MountRequest) {
+    const rights = rightsOf(r)
+    if (rights.kind !== 'owner') throw authError(403, 'This is for the first owner of this app only.', 'admin-only')
+    return rights
+  }
+  const policyAnswer = () => {
+    if (!o.policy) throw apiError(404, 'No such path: /build/update-policy')
+    return { peopleMayUpdate: o.policy.read().peopleMayUpdate }
+  }
+
+  /** Why this caller cannot press Update now, as a code (UPDATE_WHY_WORDS has the words); null: they may. The status and the press ask this ONE function, so the page never offers what the press refuses. */
+  function whyNot(rights: UpdateRights): UpdateWhyNot | null {
+    if (rights.kind === 'person' && o.role() !== 'hub') return 'member'
+    if (!update.can) return cannotWhy ?? 'dev'
+    // B-5a (Agent 14): the owner's status says "no newer build" too (it used to say allowed with nothing to update to). His own press, POST /update, is not asked this: force and the wait are his.
+    if (update.state !== 'available' || !update.available) return 'no-newer'
+    if (rights.kind === 'owner') return null
+    if (publish?.state === 'running') return 'publishing'
+    if (heldBy().length > 0) return 'held'
+    const now = clock()
+    // B-4 (Agent 14): a press time in the FUTURE (a file edited by hand or written under a wrong clock) counts as none: otherwise `now - last` is negative and holds everyone until that time.
+    const past = (t: number | null) => (t !== null && t <= now ? t : null)
+    const filed = past(o.policy?.read().lastPersonPressAt ?? null)
+    const kept = past(lastPersonPress)
+    const last = filed === null ? kept : kept === null ? filed : Math.max(filed, kept)
+    if (last !== null && now - last < PERSON_COOLDOWN_MS) return 'cooldown'
+    if (now - startedAt < PERSON_QUIET_AFTER_START_MS) return 'just-started'
+    return null
+  }
+  const statusFor = (why: UpdateWhyNot | null) => {
+    const gate = o.chatHostGate?.current ?? null
+    return buildStatusOf(info(), { allowed: why === null, why, restartsChats: gate && update.available ? hostChanges(gate) : null })
+  }
+
+  /** One line in access-log.jsonl (the one appender: the Access page's history skips lines that are not a choice): who, when, and what. Never an address, a header or a token. */
+  function audit(by: { id: string; name: string }, what: Record<string, unknown>) {
+    if (!o.auditDir) return
+    appendAccessLog(o.auditDir, { at: new Date(clock()).toISOString(), by: { id: by.id, name: by.name }, ...what }, m => log?.warn(m))
+  }
+
+  /** B-1 (Agent 14): a person's REFUSED presses go to their OWN small file (build-update-refusals.jsonl, size-capped, one line per person per reason per 10 minutes), never into access-log.jsonl: that file also holds the Access history and the
+   * owners file's changes and rotates at 4 MB, so a loop of refused presses could push the owner's real history out of it. Accepted presses and the switch stay in the Access log. */
+  const refusals = o.auditDir ? createRefusalAudit({ dir: o.auditDir, now: clock, warn: m => log?.warn(m) }) : null
+  /**
+   * B-3 (Agent 14): "no record, no press". An ACCEPTED press is written to the Access log FIRST, by the variant that reports failure; a press whose line cannot be written (no folder, a full disk, a locked file) is refused with fixed words
+   * and starts nothing, so the wall this change removes is never open without a trace. (appendAccessLog alone never throws: the change it records already stands; here the line must stand before the change.)
+   */
+  function recordAccepted(by: { id: string; name: string }, what: Record<string, unknown>): void {
+    if (!o.auditDir) throw new Error('there is no folder for the audit')
+    appendAccessLogOrThrow(o.auditDir, { at: new Date(clock()).toISOString(), by: { id: by.id, name: by.name }, ...what })
+  }
+
+  /** A refused press changes nothing and says why in fixed words (never the guard's own words: they can name a chat). */
+  function refusePress(by: { id: string; name: string }, why: UpdateWhyNot | 'look-again' | 'force'): never {
+    refusals?.note({ by, update: { from: current?.version ?? null, to: update.available?.version ?? null, outcome: 'refused', why } })
+    log?.warn(`updating: a person's press was refused (${why}): nothing was started`)
+    if (why === 'force') throw authError(403, 'Restart anyway is for the first owner of this app only.', 'admin-only')
+    if (why === 'look-again') throw Object.assign(apiError(409, 'A newer build came out, or there is none now: look again before you press Update.'), { code: 'look-again' })
+    throw Object.assign(apiError(409, UPDATE_WHY_WORDS[why]), { code: 'update-refused', why })
+  }
+
+  function personUpdate(rights: Extract<UpdateRights, { kind: 'person' }>, body: unknown) {
+    const by = rights.by
+    if (isObject(body) && body.force === true) refusePress(by, 'force')
+    const why = whyNot(rights)
+    if (why !== null) refusePress(by, why)
+    // The press names the build the person SAW: a stale page or a stray request cannot restart everything for a build nobody looked at.
+    if (!isObject(body) || typeof body.to !== 'string' || body.to !== update.available?.version) refusePress(by, 'look-again')
+    const from = current?.version ?? null
+    const to = update.available?.version ?? null
+    // R-1 (Agent 14): a press that finds a wait for busy chats ALREADY running changes nothing (startUpdate answers "waiting" without a second wait), so it writes NO line and starts NO cooldown: otherwise a signed-in person looping
+    // POST {to} while the owner's wait runs (hours, with busy chats) would fill the Access log with 'accepted' lines. Decided by the very test startUpdate makes, in the same tick: if the chats went idle since, the press DOES start the restart
+    // and is recorded like any other.
+    const gate = o.chatHostGate?.current ?? null
+    const joinsWait = hostWait !== null && gate !== null && hostChanges(gate) && gate.busy() > 0
+    // The line first (B-3): outcome 'accepted' = the wall let this press through; what the app then does (restart now, wait for chats) is in the app's own log.
+    const acceptOrRefuse = () => {
+      try {
+        recordAccepted(by, { update: { from, to, outcome: 'accepted' } })
+      } catch (e) {
+        log?.warn(`updating: a person's press could not be recorded (${e instanceof Error ? e.message : String(e)}), so it was refused: nothing was started`)
+        refusePress(by, 'no-record')
+      }
+    }
+    if (!joinsWait) acceptOrRefuse()
+    let result: ReturnType<typeof startUpdate>
+    try {
+      result = startUpdate({}, 'admin')
+    } catch (e) {
+      // Held at the very last look (the guard): fixed words, never the guard's own.
+      if ((e as { code?: unknown }).code === 'update-held') refusePress(by, 'held')
+      refusals?.note({ by, update: { from, to, outcome: 'refused', why: 'error' } })
+      throw e
+    }
+    if (!joinsWait) {
+      const at = clock()
+      lastPersonPress = at
+      try {
+        o.policy?.stampPress(at)
+      } catch (e) {
+        log?.warn(`updating: could not record the press for the cooldown: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    log?.info(`updating: a person pressed Update (${from ?? '?'} to ${to ?? '?'}): ${result.restarting ? 'restarting' : 'waiting for the chats'}`)
+    return { restarting: result.restarting === true, status: statusFor(whyNot(rights)) }
+  }
+
   const routes: Record<string, (r: MountRequest) => unknown> = {
     // F-119: whether this browser may press Publish rides with the info, for the page that shows the button.
     'GET /info': r => ({ ...info(), mayPublish: publishActor(r.headers, r.caller) !== null }),
+    // Shubham's order ob12b: what a signed-in PERSON's Build page reads (shared/build.ts buildStatusOf: an ALLOW-LIST, never /info). Open to whoever the API gate lets reach it (the Access row 'build'); the owner's /info, /check and /publish are not.
+    'GET /status': r => {
+      // Whether THIS caller may press Update now, by the very rights and guards POST /update applies (so the page never offers what the press refuses).
+      let why: UpdateWhyNot | null
+      try {
+        why = whyNot(rightsOf(r))
+      } catch (e) {
+        why = whyOfThrow(e)
+      }
+      return statusFor(why)
+    },
     'POST /check': () => check(),
-    // F-173a: from a page, only a signed-in administrator presses Update or cancels it (F-119's rule, not Publish's: obcbd narrowed Publish to the owner); a program on this PC with the machine token and no page headers is as before.
+    // F-173a + Shubham's order ob12b: the OWNER (the first owner by id, or the PC's own program) presses as it always was (force and the wait are his); a PERSON (any other signed-in person, a second owner included) presses
+    // under the guards while the owner's switch is on, and the answer is the allow-list, never /info; anyone else is refused as authorizeUpdate says.
     'POST /update': r => {
-      o.authorizeUpdate(r)
-      // The person's own press: its body (force, after the wait) is theirs, as it always was.
+      const rights = rightsOf(r)
+      if (rights.kind === 'person') return personUpdate(rights, r.body)
+      // The owner's own press: its body (force, after the wait) is his, as it always was.
       return startUpdate(r.body, 'admin')
     },
+    // Cancelling an update (and a restart anyway, above) stays the first owner's: a person never cuts into a wait the owner or another person started.
     'POST /update-cancel': r => {
-      o.authorizeUpdate(r)
+      needOwner(r)
       return cancelUpdate()
+    },
+    // The first owner's switch: may people press Update. By id (a second owner is a person for this and cannot flip it).
+    'GET /update-policy': r => {
+      needOwner(r)
+      return policyAnswer()
+    },
+    'PUT /update-policy': r => {
+      const rights = needOwner(r)
+      const policy = o.policy
+      if (!policy) throw apiError(404, 'No such path: /build/update-policy')
+      if (!isObject(r.body) || typeof r.body.peopleMayUpdate !== 'boolean') throw apiError(400, 'Expected {peopleMayUpdate: true or false}')
+      const on = r.body.peopleMayUpdate
+      policy.setPeopleMayUpdate(on)
+      log?.info(`updating: the first owner switched Update for everyone else ${on ? 'ON' : 'OFF'}`)
+      audit({ id: rights.by?.id ?? 'local-machine', name: rights.by?.name ?? 'the PC\'s own program' }, { policy: { peopleMayUpdate: on } })
+      return policyAnswer()
     },
     'POST /publish': r => {
       // F-119: from a page, only a browser signed in as sbskrrt; a local tool with the machine token and no page headers is as before.

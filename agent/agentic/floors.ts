@@ -1,12 +1,13 @@
 import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE, OPENCODE_PROVIDERS, isOpenCodeFreeModel } from '../../shared/opencode.ts'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, constants as fsConstants, copyFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import {
   AGENT_BRIEF_MAX,
   AGENT_EFFORTS,
   AGENT_MODELS,
   AGENT_ULTRACODES,
   FLOOR_PREAMBLE_MAX,
+  isPersonAssistant,
   MAX_AGENTS_PER_FLOOR,
   type AgentEffort,
   type AgentModel,
@@ -18,6 +19,7 @@ import {
 } from '../../shared/agentic.ts'
 import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, ENGINE_CHANGE_CODE, ENGINE_CHANGE_MESSAGE, engineOf, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
 import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
+import { cleanTemplate, isTemplateId, templateIdOf, templateName, type AgentTemplate } from '../../shared/agent-template.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import { conversationHistory, rememberConversation } from './conversation-history.ts'
@@ -85,6 +87,8 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
   const a = isObject(raw) ? raw : {}
   if (['executionProfile', 'executionRevision', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(a, k))) executionIdentityOf(a)
   const name = str(a.name, NAME_MAX).trim()
+  // F-316: the template is kept only when it is a whole, valid one; otherwise there is NO key at all (never null: a file with no templates stays byte for byte what it was).
+  const template = cleanTemplate(a.template)
   const hydrated: FloorAgent = {
     id: typeof a.id === 'string' && a.id ? a.id.slice(0, 64) : randomUUID(),
     ...(a.pcControlSlot === 1 || a.pcControlSlot === 2 ? { pcControlSlot: a.pcControlSlot } : {}),
@@ -119,6 +123,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     // F-118: the hub's own, like sessionId and homePc: a page's copy of the chart never sets them (patch() puts the old ones back).
     owner: ownerOf(a.owner),
     sharedWith: shareList(a.sharedWith),
+    ...(template ? { template } : {}),
   }
   if (Object.hasOwn(a, 'executionProfile')) {
     // New explicit identities are never repaired into another native binding during hydration.
@@ -248,6 +253,19 @@ export interface FloorStore {
   moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null, as?: ChatOwner | null): { from: Floor; to: Floor }
   /** `via`: when a chat's own tool adds the agent, the first 8 characters of that chat's session id (the floor-events line names the chat that acted). */
   addAgent(floorId: string, req: NewAgent, as?: ChatOwner | null, via?: string): { floor: Floor; agent: FloorAgent }
+  /**
+   * F-316 T2: a new chat that is a COPY of another and an instance of its template (POST /floors/:floorId/agents/copy; shared/agentic.ts CopyAgentRequest). ONE write or none: every check is made on
+   * the floors as they are, then the copy (and, for a source with no template, the source's new template) are written together. The caller (index.ts) has already decided that the caller may own the
+   * source, and R1b. `req` is the raw body. A source with no template needs `templateName`; a template that already has the id the name gives is joined, under its own name.
+   */
+  copyAgent(toFloorId: string, req: unknown, as?: ChatOwner | null, via?: string): { floor: Floor; agent: FloorAgent; stamped: boolean }
+  /**
+   * F-316 T2, the first owner's one click: every chat of the floor that has no template (and is not PC Control or a person's Assistant) becomes an instance of `template`. Before anything is
+   * written, floors.json is copied beside itself (floors.json.before-template-<UTC>, never deleted here) and the stamped chats are recorded (floors.json.template-stamps.jsonl): the way back.
+   */
+  stampTemplate(floorId: string, template: unknown, as?: ChatOwner | null): { floor: Floor; stamped: number; skipped: number; copy: string | null }
+  /** F-316 T2: takes the template away from exactly the chats the last stamping of it on this floor gave it (and that still have it). */
+  unstampTemplate(floorId: string, templateId: unknown, as?: ChatOwner | null): { floor: Floor; removed: number }
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
   /** F-134: the Codex conversation id of an agent's chat (null: none yet). Only the agent calls this, never a page. */
@@ -499,6 +517,55 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     return a
   }
 
+  /**
+   * F-316 T2: the way back for the owner's stamping. floors.json is copied to floors.json.before-template-<UTC> (never overwritten, never deleted here); returns that file's name, or null for a store with
+   * no file yet or one that writes nothing. When the copy cannot be made the stamping is refused and nothing is changed.
+   */
+  function keepFileCopy(): string | null {
+    if (opts.readOnly || !existsSync(file)) return null
+    const at = now().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
+    for (let i = 1; i <= 50; i++) {
+      const dest = `${file}.before-template-${at}${i > 1 ? `-${i}` : ''}`
+      if (existsSync(dest)) continue
+      try {
+        copyFileSync(file, dest, fsConstants.COPYFILE_EXCL)
+      } catch (error) {
+        throw apiError(500, `A copy of floors.json could not be kept (${error instanceof Error ? error.message : String(error)}): nothing was changed.`)
+      }
+      return dest.replace(/^.*[\\/]/, '')
+    }
+    throw apiError(500, 'A copy of floors.json could not be kept (too many beside it): nothing was changed.')
+  }
+  const journalFile = `${file}.template-stamps.jsonl`
+  interface StampRecord { id: string; at: string; op: 'stamp' | 'unstamp'; by: { id: string; name: string } | null; floor: { id: string; name: string }; template: AgentTemplate; agents: string[]; copy?: string | null; undoes?: string }
+  /** The record of stampings and undos, one JSON line each, appended before the change is written (so the way back exists first); it is kept, never rewritten. */
+  function journal(e: Omit<StampRecord, 'id' | 'at'>): void {
+    if (opts.readOnly) return
+    try {
+      appendFileSync(journalFile, `${JSON.stringify({ id: randomUUID(), at: now(), ...e })}\n`)
+    } catch (error) {
+      throw apiError(500, `The record of this change could not be written (${error instanceof Error ? error.message : String(error)}): nothing was changed.`)
+    }
+  }
+  /** The latest stamping of this template on this floor that has not been undone yet. */
+  function lastStamp(floorId: string, templateId: string): StampRecord | null {
+    let lines: string[]
+    try { lines = readFileSync(journalFile, 'utf8').split('\n') } catch { return null }
+    const undone = new Set<string>()
+    const stamps: StampRecord[] = []
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let rec: unknown
+      try { rec = JSON.parse(line) } catch { continue }
+      if (!isObject(rec) || typeof rec.id !== 'string' || !isObject(rec.floor) || rec.floor.id !== floorId || !isObject(rec.template) || rec.template.id !== templateId || !Array.isArray(rec.agents)) continue
+      const clean = cleanTemplate(rec.template)
+      if (!clean) continue
+      if (rec.op === 'unstamp' && typeof rec.undoes === 'string') undone.add(rec.undoes)
+      else if (rec.op === 'stamp') stamps.push({ ...(rec as unknown as StampRecord), template: clean, agents: rec.agents.filter((x): x is string => typeof x === 'string') })
+    }
+    return stamps.filter(r => !undone.has(r.id)).at(-1) ?? null
+  }
+
   function uniqueName(floor: Floor, wanted: string, exceptId?: string): boolean {
     const w = wanted.trim().toLowerCase()
     return !floor.agents.some(a => a.id !== exceptId && a.name.trim().toLowerCase() === w)
@@ -695,6 +762,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           const was = before.get(a.id)
           a.owner = was ? (was.owner ?? null) : (as ?? null)
           a.sharedWith = was?.sharedWith ?? []
+          // F-316: nor its template (the family it is an instance of): kept from what was there, never taken from the page, so a chart that leaves it out cannot wipe it and one that
+          // sends it cannot set it. An agent the chart adds has none.
+          if (was?.template) a.template = was.template
+          else delete a.template
           return a
         })
         const names = new Set<string>()
@@ -862,6 +933,140 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       return { floor: clone(floor), agent: clone(agent) }
     },
 
+    copyAgent(toFloorId, req, as, via) {
+      assertWritable()
+      if (!isObject(req) || !isObject(req.from) || typeof req.from.floorId !== 'string' || !req.from.floorId || typeof req.from.agentId !== 'string' || !req.from.agentId) {
+        throw apiError(400, 'Expected {from: {floorId, agentId}, name?, templateName?}')
+      }
+      if (req.name !== undefined && typeof req.name !== 'string') throw apiError(400, 'name is text')
+      if (req.templateName !== undefined && typeof req.templateName !== 'string') throw apiError(400, 'templateName is text')
+      const to = find(toFloorId)
+      const fromFloor = find(req.from.floorId)
+      const src = agentOf(fromFloor, req.from.agentId)
+      if (to.workspace === 'pc-control' || fromFloor.workspace === 'pc-control' || src.pcControlSlot) throw Object.assign(apiError(409, 'PC Control has exactly two persistent slots.'), { code: 'pc-control-immutable' })
+      if (isPersonAssistant(src)) throw Object.assign(apiError(409, "A person's own Assistant cannot be copied."), { code: 'copy-source-refused' })
+      if (src.executionProfile === 'codex-in-claude-v1') throw executionHttpError('execution-capability-required', 'selection')
+      if (to.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `This floor already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
+      let name = typeof req.name === 'string' ? req.name.trim().slice(0, NAME_MAX) : ''
+      if (name) {
+        if (!uniqueName(to, name)) throw apiError(409, `There is already an agent called "${name}" on this floor`)
+      } else {
+        const base = src.name.trim().slice(0, NAME_MAX - 8) || 'Agent'
+        let n = 2
+        do name = `${base} ${n++}`
+        while (!uniqueName(to, name))
+      }
+      // The family: the source's own, or (a source with no template) the one the owner names: the same name always gives the same id, and an id that is in use is joined under its own name.
+      let template = src.template
+      let stampSource = false
+      if (!template) {
+        const given = templateName(req.templateName)
+        if (!given) throw Object.assign(apiError(409, 'This chat is in no template yet. Say what to call the family it starts.'), { code: 'template-name-required' })
+        const id = templateIdOf(given)
+        template = floors.flatMap(f => f.agents).find(a => a.template?.id === id)?.template ?? { id, name: given }
+        stampSource = true
+      }
+      const family: AgentTemplate = { id: template.id, name: template.name }
+      // Staged on copies of the floors, written once: a failure anywhere leaves the file and the list as they were.
+      const toNext = clone(to)
+      const fromNext = fromFloor === to ? toNext : clone(fromFloor)
+      if (stampSource) {
+        const mine = fromNext.agents.find(a => a.id === src.id)
+        if (mine) mine.template = { ...family }
+        fromNext.updatedAt = now()
+      }
+      const boss = toNext.agents.find(a => a.isBoss)
+      const index = toNext.agents.length
+      const desk = index === 0 ? { x: 320, y: 40 } : { x: 80 + ((index - 1) % 4) * 250, y: 240 + Math.floor((index - 1) / 4) * 190 }
+      const copy = hydrateAgent(
+        {
+          name,
+          role: src.role,
+          md: src.md,
+          reportsTo: boss?.id ?? null,
+          model: src.model,
+          effort: src.effort,
+          ultracode: src.ultracode,
+          engine: src.engine,
+          opencodeProvider: src.opencodeProvider,
+          opencodeModel: src.opencodeModel,
+          codexModel: src.codexModel,
+          codexEffort: src.codexEffort,
+          skills: src.skills,
+          mcpServers: src.mcpServers,
+          owner: as ?? null,
+          template: family,
+          ...desk,
+        },
+        index,
+      )
+      toNext.agents = repairAgents([...toNext.agents, copy])
+      toNext.updatedAt = now()
+      // Agent 14's T2-2: the stamping of the SOURCE is recorded like the owner's own stamping (before the write, so the way back exists first; no copy of floors.json for one chat), and the undo reaches it.
+      if (stampSource) journal({ op: 'stamp', by: actorOf(as), floor: refOf(fromFloor), template: family, agents: [src.id], copy: null })
+      const previousFloors = floors
+      floors = floors.map(f => (f.id === toNext.id ? toNext : f.id === fromNext.id ? fromNext : f))
+      try { save() } catch (error) { floors = previousFloors; throw error }
+      report({ kind: 'agent-copied', by: actorOf(as), ...(via ? { chat: via } : {}), floor: refOf(toNext), agent: refOf(copy), source: refOf(src), sourceFloor: refOf(fromNext), template: family, agents: toNext.agents.length })
+      return { floor: clone(toNext), agent: clone(toNext.agents.find(a => a.id === copy.id) ?? copy), stamped: stampSource }
+    },
+
+    stampTemplate(floorId, raw, as) {
+      assertWritable()
+      const family = cleanTemplate(raw)
+      if (!family) throw apiError(400, 'Expected {id, name}: an id (lower case letters, digits and dashes, at most 40) and a name')
+      const floor = find(floorId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control slots take no template.'), { code: 'pc-control-immutable' })
+      const next = clone(floor)
+      const stamped: string[] = []
+      let skipped = 0
+      for (const a of next.agents) {
+        if (a.template || a.pcControlSlot || isPersonAssistant(a)) {
+          skipped++
+          continue
+        }
+        a.template = { ...family }
+        stamped.push(a.id)
+      }
+      if (!stamped.length) throw Object.assign(apiError(409, 'Every chat on this floor has a template already, or cannot have one: nothing to do.'), { code: 'template-nothing-to-do' })
+      // The way back first: the copy of the file, and the record of what is about to be stamped. If either cannot be made, nothing is changed.
+      const copy = keepFileCopy()
+      journal({ op: 'stamp', by: actorOf(as), floor: refOf(floor), template: family, agents: stamped, copy })
+      next.updatedAt = now()
+      const previousFloors = floors
+      floors = floors.map(f => (f.id === next.id ? next : f))
+      try { save() } catch (error) { floors = previousFloors; throw error }
+      report({ kind: 'template-stamped', by: actorOf(as), floor: refOf(floor), template: family, count: stamped.length })
+      return { floor: clone(next), stamped: stamped.length, skipped, copy }
+    },
+
+    unstampTemplate(floorId, templateId, as) {
+      assertWritable()
+      if (!isTemplateId(templateId)) throw apiError(400, 'Expected {id}: the id of the template')
+      const floor = find(floorId)
+      const last = lastStamp(floor.id, templateId)
+      if (!last) throw Object.assign(apiError(409, 'No stamping of this template on this floor is left to undo.'), { code: 'template-nothing-to-undo' })
+      const next = clone(floor)
+      let removed = 0
+      // Only the chats that stamping gave it, and only while they still have THAT template (one that has been given another since is left as it is).
+      for (const a of next.agents) {
+        if (last.agents.includes(a.id) && a.template?.id === templateId) {
+          delete a.template
+          removed++
+        }
+      }
+      const name = last.template.name
+      journal({ op: 'unstamp', by: actorOf(as), floor: refOf(floor), template: last.template, agents: next.agents.filter(a => last.agents.includes(a.id) && !a.template).map(a => a.id), undoes: last.id })
+      if (removed) {
+        next.updatedAt = now()
+        const previousFloors = floors
+        floors = floors.map(f => (f.id === next.id ? next : f))
+        try { save() } catch (error) { floors = previousFloors; throw error }
+        report({ kind: 'template-unstamped', by: actorOf(as), floor: refOf(floor), template: { id: templateId, name }, count: removed })
+      }
+      return { floor: clone(removed ? next : floor), removed }
+    },
+
     setShare(floorId, agentId, list, as) {
       assertWritable()
       const floor = find(floorId)
@@ -884,6 +1089,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (have) return { floor: clone(have), created: false, renamedFrom: null }
       for (const a of f.agents) {
         a.duty = null
+        // F-316: a template is the key into a notebook of THIS hub: a member PC's word never puts a chat into one.
+        delete a.template
         a.homePc = a.sessionId ? from.id : null
         a.homePcName = a.sessionId ? from.name.slice(0, NAME_MAX) : null
       }

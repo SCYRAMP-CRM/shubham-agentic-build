@@ -12,19 +12,27 @@ export const ACCESS_LOG_MAX_BYTES = 4 * 1024 * 1024
  * the change the line records already stands.
  */
 export function appendAccessLog(dir: string, entry: unknown, warn?: (message: string) => void): void {
-  const logFile = path.join(dir, 'access-log.jsonl')
   try {
-    mkdirSync(dir, { recursive: true })
-    try {
-      if (statSync(logFile).size > ACCESS_LOG_MAX_BYTES) {
-        writeAtomic(path.join(dir, 'access-log.old.jsonl'), readFileSync(logFile, 'utf8'))
-        writeAtomic(logFile, '')
-      }
-    } catch {
-      // No log yet.
-    }
-    appendFileSync(logFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
+    appendAccessLogOrThrow(dir, entry)
   } catch (e) {
     warn?.(`the access change could not be logged: ${e instanceof Error ? e.message : String(e)}`)
   }
+}
+
+/**
+ * The same line, but a failure to write it THROWS. For the one caller whose action must not happen without its line (a person's Update press: the wall it passes is the owner's own, so "no record, no press");
+ * every other caller keeps appendAccessLog, whose change already stands.
+ */
+export function appendAccessLogOrThrow(dir: string, entry: unknown): void {
+  const logFile = path.join(dir, 'access-log.jsonl')
+  mkdirSync(dir, { recursive: true })
+  try {
+    if (statSync(logFile).size > ACCESS_LOG_MAX_BYTES) {
+      writeAtomic(path.join(dir, 'access-log.old.jsonl'), readFileSync(logFile, 'utf8'))
+      writeAtomic(logFile, '')
+    }
+  } catch {
+    // No log yet.
+  }
+  appendFileSync(logFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
 }

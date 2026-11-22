@@ -84,7 +84,7 @@ export const FEATURES: readonly Feature[] = [
   { key: 'goals', group: 'pages', label: 'Goals', blurb: 'Their own CRM goals and today’s tasks, on their own CRM sign-in (the CRM decides what they see).', pages: ['/goals'] },
   { key: 'crm', group: 'pages', label: 'CRM', blurb: 'The CRM in the app, full window, on their own CRM sign-in (the CRM decides what they see).', pages: ['/crm'] },
   { key: 'accounts', group: 'pages', label: 'Accounts', blurb: 'Email accounts, platforms and codebases.', pages: ['/accounts'], locked: 'It holds your passwords and keys.' },
-  { key: 'build', group: 'pages', label: 'Build', blurb: 'Which build runs, updates and publishing.', pages: ['/build'], locked: 'Publishing and updating the app is Shubham\'s alone, by his own id.' },
+  { key: 'build', group: 'pages', label: 'Build', blurb: 'Which build runs, whether a newer one is out, and an Update button (it restarts the app for everyone on the Server). Publishing a new build stays Shubham\'s alone, and so does Update while its switch on the Build page is off.\n\nOnly me does NOT stop a second owner (an administrator): he can press Update whatever this row says; only the switch on the Build page stops him.', pages: ['/build'] },
   { key: 'dependencies', group: 'pages', label: 'Dependencies', blurb: 'What Codex in Claude needs on each PC.', pages: ['/dependencies'], locked: 'It changes what is installed on your PCs.' },
   { key: 'mcps', group: 'pages', label: 'MCPs', blurb: 'The chats’ tools, across engines.', pages: ['/mcps'], locked: 'It installs tools for the chats on your PCs.' },
   { key: 'setup', group: 'pages', label: 'Setup', blurb: 'A new PC, step by step.', pages: ['/setup'], locked: 'It joins PCs to your app.' },
@@ -190,6 +190,7 @@ export const ROUTES: readonly RouteRule[] = [
   r('PATCH', FLOOR, ['agents'], true),
   r('DELETE', FLOOR, ['agents'], true),
   r('POST', `${FLOOR}\\/agents`, ['agents'], true),
+  r('POST', `${FLOOR}\\/agents\\/copy`, ['agents'], true),
   r('GET', `${FLOOR}\\/transcripts`, ['agents'], true),
   r('GET', `${FLOOR}\\/memory`, ['agents'], true),
   r('POST', `${FLOOR}\\/memory`, ['agents'], true),
@@ -226,6 +227,10 @@ export const ROUTES: readonly RouteRule[] = [
   r('GET', '\\/pc-ports\\/pcs\\/[^/]+', ['pc-ports']),
   r('GET', '\\/pc-resources\\/pcs\\/[^/]+', ['pc-resources']),
   r('GET', '\\/pc-deps\\/pcs\\/[^/]+', ['pc-deps']),
+  // Shubham's order ob12b: the Build page for every signed-in person: what they may READ (an allow-list, never /build/info) and the Update press (the agent's own rights and guards decide who and when).
+  // NOTHING else under /build has a rule: /build/info, /build/check, /build/publish, /build/update-cancel and /build/update-policy stay the owner's.
+  r('GET', '\\/build\\/status', ['build']),
+  r('POST', '\\/build\\/update', ['build']),
   // Tasks (his one list), the old-app reader's page, the phone apps, voice typing.
   r('GET', `${A}\\/tasks`, ['tasks']),
   r('POST', `${A}\\/tasks`, ['tasks']),

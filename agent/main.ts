@@ -29,7 +29,8 @@ import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
 import { createBuild, findDevDir, type Build, type ChatHostGate, type UpdateGuard } from './build.ts'
-import { authError, mayPublish } from './auth/types.ts'
+import { updateRights } from './auth/types.ts'
+import { createUpdatePolicy } from './build-update-policy.ts'
 import { createCoordinator, type Coordinator } from './update/coordinator.ts'
 import { createUpdateState } from './update/state.ts'
 import { createBridge } from './claude/bridge.ts'
@@ -121,6 +122,8 @@ export interface Agent {
   state(): AgentState
   /** The API's port (the configured one, or the one picked for port 0). */
   apiPort: number
+  /** F-312: true while the WhatsApp backend process runs, so a stop knows it may have to wait for the numbers' Chromes to close properly. */
+  whatsappBackendRunning?(): boolean
   stop(): Promise<void>
 }
 
@@ -445,7 +448,19 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // is OFF), and even then the backend sends only against a ticket made for each message after that request was a person's own (whatsapp-backend/sends.ts, send-ticket.ts).
   // The key for the tickets is made new each time it is switched ON, handed to the backend over the supervisor's private channel, and taken away when it is switched OFF.
   // Order oWA S6: the person's private notes about chats (notes.json beside the backend's state): on the hub, where the page is served; never sent to WhatsApp, the CRM or a cloud.
-  const waNotes = role === 'hub' && agentic ? createNotes(path.join(waBackendDir, 'notes.json'), log.child('wa-notes')) : undefined
+  // F-312: each NUMBER has its own notes (a chat id is a different chat in each): the first number's are the notes.json it has always had, untouched; every other number's are notes-<id>.json beside it.
+  const waNotesByAcct = new Map<string, ReturnType<typeof createNotes>>()
+  const waNotes =
+    role === 'hub' && agentic
+      ? (acct: string) => {
+          let n = waNotesByAcct.get(acct)
+          if (!n) {
+            n = createNotes(path.join(waBackendDir, acct === 'main' ? 'notes.json' : `notes-${acct}.json`), log.child('wa-notes'))
+            waNotesByAcct.set(acct, n)
+          }
+          return n
+        }
+      : undefined
   const waSends = waBackend && agentic ? createSends({ sw: createSendSwitch(path.join(waBackendDir, 'sending.json'), log.child('wa-backend')), backend: waBackend, human: req => agentic.humanProof('wa-send', [], undefined, req) }) : undefined
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
@@ -1311,6 +1326,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   return {
     state,
     apiPort: api.port,
+    whatsappBackendRunning: () => waBackend?.view().state === 'running',
     stop: () =>
       (stopping ??= (async () => {
         await api?.close()
@@ -1345,6 +1361,9 @@ if (import.meta.main) {
       clearTimeout(timer)
     }
   }
+  /** F-312: while the WhatsApp backend runs, "stopping the agent" may take its 25 s to close every number's Chrome properly (the login is kept), and the outside watchdog waits a few seconds longer than that. */
+  const WA_STOP_AGENT_MS = 28_000
+  const WA_STOP_WATCHDOG_MS = 34_000
   const shutdown = async (why: string, code = 0) => {
     // A second Ctrl+C: don't wait any longer.
     if (exiting) process.exit(1)
@@ -1353,7 +1372,8 @@ if (import.meta.main) {
     // Under Start.cmd or the guard, a stop that hangs where nothing in here can run any more is ended
     // from outside with the same code, so an update still runs and the app starts again.
     if (process.env.SAD_SUPERVISED === '1') {
-      armExitWatchdog({ pid: process.pid, startedAt: processStartedAt(), code, ms: 20_000, logFile: logsDir ? path.join(logsDir, 'exit-watchdog.log') : undefined })
+      // F-312: the WhatsApp backend closes every number's Chrome at the same time and may take up to its 25 s: the outside watchdog and the "stopping the agent" step below give it that (and no more) while it runs; otherwise as they were.
+      armExitWatchdog({ pid: process.pid, startedAt: processStartedAt(), code, ms: agent?.whatsappBackendRunning?.() ? WA_STOP_WATCHDOG_MS : 20_000, logFile: logsDir ? path.join(logsDir, 'exit-watchdog.log') : undefined })
     }
     try {
       build?.close()
@@ -1361,7 +1381,7 @@ if (import.meta.main) {
       await within('letting the PC voice go', pcVoice?.stop(), 3000)
       await within('closing the page', ui?.close(), 3000)
       await within('closing the tailnet page', uiTailnet?.close(), 3000)
-      await within('stopping the agent', agent?.stop(), 10_000)
+      await within('stopping the agent', agent?.stop(), agent?.whatsappBackendRunning?.() ? WA_STOP_AGENT_MS : 10_000)
     } catch (e) {
       log.error(`while stopping: ${message(e)}`)
       code ||= 1
@@ -1399,6 +1419,8 @@ if (import.meta.main) {
     // Order o7e6d S1: supplied from the start and empty until the agent sets it (startAgent), so no Update goes before it can be asked.
     const updateGuard: { current: UpdateGuard | null } = { current: null }
     const updateCoordinator: { current: Coordinator | null } = { current: null }
+    // Shubham's order ob12b (22 Nov 2026): the first owner's switch "people may press Update" (default ON) and the last person's press, in update-people.json beside auth.json; read fresh at every look.
+    const updatePolicy = createUpdatePolicy(path.join(statePaths().agent, 'update-people.json'), log.child('build'))
     build = createBuild({
       chatHostGate: hostGate,
       updateGuard,
@@ -1409,10 +1431,11 @@ if (import.meta.main) {
       log: log.child('build'),
       restart: code => void shutdown('updating to the newer build', code),
       supervised: process.env.SAD_SUPERVISED === '1',
-      // F-173a: F-119's rule (mayPublish), which Publish no longer follows (obcbd narrowed Publish to the owner): from a page, only a signed-in administrator; a program on this PC with the machine token and no page headers is as before.
-      authorizeUpdate: r => {
-        if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only the first owner of this app, signed in, presses Update from a page.', 'admin-only')
-      },
+      policy: updatePolicy,
+      auditDir: statePaths().agent,
+      // F-173a + Shubham's orders o2f32 and ob12b: who presses Update, decided in ONE place (auth/types.ts updateRights): the first owner by id (and a program on this PC with the machine token) as before; any other signed-in person, a second owner
+      // included, under the build's guards while the switch is on; anyone else is refused in plain words.
+      authorizeUpdate: r => updateRights(r.headers, r.caller, () => updatePolicy.read().peopleMayUpdate),
       onUpdateCancel: () => updateCoordinator.current?.cancel(),
     })
     // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).

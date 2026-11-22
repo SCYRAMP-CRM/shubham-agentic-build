@@ -36,6 +36,32 @@ export const WA_CHATS_LOADING = 'wa-chats-loading'
 /** How long WhatsApp stays open after its last use, unless it is set to stay on. */
 export const WA_IDLE_MS = 10 * 60_000
 
+// F-312 (Shubham, 22 Nov 2026: "link multiple WhatsApp"): more than one NUMBER, each its own WhatsApp login with its own Chrome. A number is an ACCOUNT: `main` is the first one (the login he already
+// linked; its folder and its notes are exactly where they always were and nothing here writes to its profile), every other one has an id made here (WA_ACCOUNT_RE) and its own folder.
+// A chat id is only a chat of ONE account: the same person chatting with two of his numbers has the same id in both, so wherever an id is a key, the account is part of it.
+/** The first number, the one linked before accounts existed. Never listed in accounts.json, never moved. */
+export const WA_MAIN_ACCOUNT = 'main'
+/** An account id: `main`, or one this app made (a letter, then lowercase letters and digits). Nothing a client types is ever a path. */
+export const WA_ACCOUNT_RE = /^(main|a[0-9a-f]{5,11})$/
+/** The most numbers one Server holds (each is its own Chrome, about 0.6 to 1 GB while open: see agent/whatsapp-backend/accounts.ts). */
+export const WA_ACCOUNTS_MAX = 4
+/** A name he gives a number ("Work"). */
+export const WA_ACCOUNT_LABEL_MAX = 40
+/** An extra number's Chrome opens only while the Server has this much memory free (bytes): below it, "not enough memory right now", never an out-of-memory Server. */
+export const WA_ACCOUNT_MIN_FREE_BYTES = 1_200 * 1024 * 1024
+
+/** One number, as the page's switcher shows it (agent/whatsapp-backend/accounts.ts). */
+export interface WaAccount {
+  id: string
+  label: string
+  /** A login is saved for it (the next open needs no QR). */
+  linked: boolean
+  /** Whether its Chrome runs now. */
+  open: boolean
+  /** WhatsApp's name for the number's owner, once known. */
+  name: string | null
+}
+
 /** The Assistant's drafts: how many may wait at once, how long one lasts, and how many may be sent in an hour. */
 export const WA_DRAFTS_MAX = 5
 export const WA_DRAFT_MS = 15 * 60_000
@@ -99,6 +125,10 @@ export interface WaStatus {
   closesAt: string | null
   /** The Assistant's drafts waiting for his tap. */
   drafts: WaDraft[]
+  /** F-312: when this number was last CONNECTED (ISO), as this Server saw it; absent until it has been (and for a number that was last connected before this was kept). */
+  lastConnectedAt?: string | null
+  /** F-312: how it last stopped being connected, in plain words, with when (ISO): WhatsApp logged the device out, asked for a new scan, it was closed for being idle or by a way-out change, or it could not open. Absent until it has. */
+  lastEnd?: { at: string; why: string } | null
   /** How many of the Assistant's drafts were sent in the last hour (at most WA_ASSISTANT_SENDS_PER_HOUR). */
   assistantSentLastHour: number
   /**

@@ -165,6 +165,7 @@ import { validatePreparedConversation, type ConversationBinding } from './prepar
 import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
+import { templateName } from '../../shared/agent-template.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
@@ -1123,6 +1124,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     reorder: order => pickFloors().reorder(order),
     moveAgent: (from, agent, to, before, as) => storeFor(from).moveAgent(from, agent, to, before, as),
     addAgent: (f, req, as, via) => storeFor(f).addAgent(f, req, as, via),
+    // F-316 T2: a copy lands in the store of the floor it lands on; the stamping and its undo in the store of the floor they are for.
+    copyAgent: (f, req, as, via) => storeFor(f).copyAgent(f, req, as, via),
+    stampTemplate: (f, template, as) => storeFor(f).stampTemplate(f, template, as),
+    unstampTemplate: (f, id, as) => storeFor(f).unstampTemplate(f, id, as),
     bindSession: (f, a, s) => storeFor(f).bindSession(f, a, s),
     setCodexThread: (f, a, t) => storeFor(f).setCodexThread(f, a, t),
     setHome: (f, a, h) => storeFor(f).setHome(f, a, h),
@@ -5696,6 +5701,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const nb = notebooks.forChat(floor, agent)
     return joinSections(memorySection, nb.ok ? nb.chat.brief() : '')
   }
+  /**
+   * F-316 T2: the first owner's own click on a floor's template: not a chat's tool (an agent calling these routes itself) and not a second owner. A template is the key into a notebook that every
+   * instance reads, so who STARTS a family, or puts a chat into one, is the first owner's choice by id. There are two doors for it and both ask here: the stamping and its undo, and the copy route
+   * when it starts a family (a source with no template and a template name sent: it would stamp the source). Copying a chat that is ALREADY in a family asks nothing more of the caller than the
+   * copy does: it only makes another instance of a family that exists.
+   */
+  function templateOwner(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, "Only the first owner of this app gives a floor's chats a template.")
+  }
   function notebookOwner(r: MountRequest) {
     if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
@@ -8650,6 +8665,44 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // R1b: an add to a personal Assistant's floor is refused the same as agent_hire's.
         refuseAssistantFloorChange(callerOf(r), floorOf(id))
         return floors.addAgent(id, b as NewAgent, access.ownerOf(callerOf(r)))
+      },
+    ],
+    [
+      // F-316 T2: a new chat that is a COPY of another and an instance of its template (shared/agentic.ts CopyAgentRequest). The floor it lands on is ruled like an add (POLICY floor('manage')) and by R1b;
+      // the SOURCE must be the caller's own chat (an administrator's, any): the copy takes its brief. One write or none (floors.ts copyAgent).
+      'POST',
+      /^\/floors\/([^/]+)\/agents\/copy$/,
+      ([id], r) => {
+        const c = callerOf(r)
+        const b = isObject(r.body) ? r.body : {}
+        refuseAssistantFloorChange(c, floorOf(id))
+        const from = isObject(b.from) ? b.from : null
+        if (from && typeof from.floorId === 'string' && typeof from.agentId === 'string') {
+          const source = floorOf(from.floorId)
+          if (isPcControl(source)) throw immutablePcControl()
+          const chat = agentOf(source, from.agentId)
+          access.needChat(c, chat, 'owner', 'POST /floors/:id/agents/copy')
+          // Agent 14's T2-1: a template name on a source that is in no family STARTS one and stamps the source: the first owner's door (a chat's key and a second owner are refused), before anything is written.
+          if (!chat.template && typeof b.templateName === 'string' && templateName(b.templateName) !== '') templateOwner(r)
+        }
+        return floors.copyAgent(id, b, access.ownerOf(c))
+      },
+    ],
+    [
+      // F-316 T2: the first owner's one click that gives a floor's chats a template, with a copy of floors.json kept first; and its undo (exactly those chats).
+      'POST',
+      /^\/floors\/([^/]+)\/template$/,
+      ([id], r) => {
+        templateOwner(r)
+        return floors.stampTemplate(id, r.body, access.ownerOf(callerOf(r)))
+      },
+    ],
+    [
+      'POST',
+      /^\/floors\/([^/]+)\/template\/undo$/,
+      ([id], r) => {
+        templateOwner(r)
+        return floors.unstampTemplate(id, isObject(r.body) ? r.body.id : undefined, access.ownerOf(callerOf(r)))
       },
     ],
     [

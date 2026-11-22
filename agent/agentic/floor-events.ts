@@ -30,6 +30,10 @@ export type FloorEventKind =
   | 'share-changed'
   | 'owners-assigned'
   | 'assistant-made'
+  // F-316: a chat added as a copy of another (the family it joins, and which chat it was copied from), and the owner's one click that gave a floor's chats a template, and took it away again.
+  | 'agent-copied'
+  | 'template-stamped'
+  | 'template-unstamped'
 
 export interface FloorEventRef {
   id: string
@@ -68,8 +72,13 @@ export interface FloorEvent {
   restamped?: { makers: number; owners: number; sharees: number }
   /** share-changed: the list as it is AFTER the change (ids and levels only). */
   sharedWith?: { id: string; can: string }[]
-  /** owners-assigned: how many rows were given an owner. */
+  /** owners-assigned: how many rows were given an owner. template-stamped / template-unstamped: how many chats. */
   count?: number
+  /** F-316, agent-copied / template-stamped / template-unstamped: the template (its id and its name). */
+  template?: FloorEventRef
+  /** F-316, agent-copied: the chat it was copied from, and its floor. */
+  source?: FloorEventRef
+  sourceFloor?: FloorEventRef
 }
 
 export type FloorEventInput = Omit<FloorEvent, 'at'>
@@ -114,6 +123,9 @@ export function floorEventOf(e: FloorEventInput, at: string): FloorEvent {
   if (typeof e.restamped === 'object' && e.restamped !== null) set('restamped', { makers: count(e.restamped.makers) ?? 0, owners: count(e.restamped.owners) ?? 0, sharees: count(e.restamped.sharees) ?? 0 })
   set('sharedWith', Array.isArray(e.sharedWith) ? e.sharedWith.slice(0, LIST_CAP).map(s => ({ id: text(s.id, 64), can: text(s.can, 8) })) : undefined)
   set('count', count(e.count))
+  set('template', ref(e.template))
+  set('source', ref(e.source))
+  set('sourceFloor', ref(e.sourceFloor))
   return out
 }
 
@@ -141,6 +153,9 @@ export function describeFloorEvent(e: FloorEventInput): string {
     case 'share-changed': return `${who} changed who "${e.agent?.name ?? '?'}" on ${on} is shared with (${e.sharedWith?.length ?? 0} people now)${through}`
     case 'owners-assigned': return `${who} gave ${e.count ?? '?'} floors and chats that had no owner an owner`
     case 'assistant-made': return `${who} made "${e.agent?.name ?? '?'}" on ${on} that person's own Assistant${through}`
+    case 'agent-copied': return `${who} added "${e.agent?.name ?? '?'}" to ${on} as a copy of "${e.source?.name ?? '?'}" on floor "${e.sourceFloor?.name ?? '?'}", an instance of template "${e.template?.name ?? '?'}"${through}`
+    case 'template-stamped': return `${who} made ${e.count ?? '?'} chats on ${on} instances of template "${e.template?.name ?? '?'}"`
+    case 'template-unstamped': return `${who} took ${e.count ?? '?'} chats on ${on} out of template "${e.template?.name ?? '?'}"`
   }
 }
 

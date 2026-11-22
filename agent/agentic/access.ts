@@ -203,6 +203,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // F-297: what a person's own Assistant sent and where, never the text (staff-sends.ts). The owner's only; no ROUTES rule opens it, and the route is humanOnly as well.
   ['GET', /^\/staff-sends$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents$/, floor('manage')],
+  // F-316 T2: a copy of a chat lands on a floor like an add does (the floor's 'manage'); the route itself asks that the caller owns the SOURCE chat. Stamping a floor's chats with a template, and its undo:
+  // the owner's only (the route asks for the FIRST owner by id and refuses a chat's key); no ROUTES rule opens them.
+  ['POST', /^\/floors\/([^/]+)\/agents\/copy$/, floor('manage')],
+  ['POST', /^\/floors\/([^/]+)\/template$/, OWNER],
+  ['POST', /^\/floors\/([^/]+)\/template\/undo$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
   // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).
   ['POST', /^\/floors\/([^/]+)\/import$/, OWNER],

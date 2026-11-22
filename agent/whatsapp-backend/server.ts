@@ -1,15 +1,17 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
-import { WA_PREFIX } from '../../shared/whatsapp.ts'
+import { WA_ACCOUNT_MIN_FREE_BYTES, WA_ACCOUNT_RE, WA_MAIN_ACCOUNT, WA_PREFIX, type WaAccount } from '../../shared/whatsapp.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { listProcesses } from '../proc-tree.ts'
 import { clean } from '../whatsapp/engine.ts'
 import { createWhatsApp, type WhatsApp, type WhatsAppOptions } from '../whatsapp/index.ts'
 import { cleanType } from '../whatsapp/media.ts'
+import { createAccounts } from './accounts.ts'
 import { createTicketVerifier, SEND_TICKET_HEADER } from './send-ticket.ts'
 
 // Order o8d7e (F-223): WhatsApp's backend as its own server, on this Server only.
@@ -46,6 +48,8 @@ export interface BackendOptions {
   sendKey?: string | null
   /** Tests: the WhatsApp part's options (script, ready, install, chrome...). */
   whatsapp?: Partial<WhatsAppOptions>
+  /** F-312: how much memory is free on this Server now, in bytes (tests; default os.freemem). An extra number's Chrome opens only above WA_ACCOUNT_MIN_FREE_BYTES. */
+  memory?: () => number
   /** Tests: what runs as a PID now (name and start), to tell a live backend from a PID reused by another program. */
   processOf?: (pid: number) => Promise<{ name: string; created: number } | null>
 }
@@ -54,7 +58,10 @@ export interface Backend {
   port: number
   token: string
   server: Server
+  /** The first number's WhatsApp (F-312: every other number is in `numbers`). */
   wa: WhatsApp
+  /** F-312: every number's WhatsApp, by id (`main` first). */
+  numbers(): ReadonlyMap<string, WhatsApp>
   /** Order obf15: sending ON hands it a key (every ticket made with an older one is worthless); sending OFF takes it away, and nothing can be sent until the next key. */
   setSendKey(key: string | null): void
   /** Whether it holds a key now (never the key itself). */
@@ -218,21 +225,74 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
   if (ports.length === 0) throw new Error('the WhatsApp backend was given no ports')
   const unlock = await takeLock(o.dir, o.processOf ?? processOfDefault)
   let wa: WhatsApp | null = null
+  /** F-312: every number's WhatsApp, the first first. Each is its own login, its own Chrome, its own settings and drafts. */
+  const numbers = new Map<string, WhatsApp>()
   try {
     const token = backendToken(o.dir)
-    wa = createWhatsApp({
-      dir: path.join(o.dir, 'whatsapp'),
-      log: o.log.child('whatsapp'),
-      // Order o55b6: its Chrome may go out through the Z800 (tunnel.json, kept by Agent 6's tunnel; checked in agent/whatsapp/tunnel.ts).
-      tunnel: { file: path.join(o.dir, 'tunnel.json') },
-      // A send is this backend's only against the agent's ticket for exactly it (send-ticket.ts); with no key, whatever is asked of it is refused.
-      human: (_kind, fields, _sig, r) => tickets.verify(r?.headers?.[SEND_TICKET_HEADER], { chatId: String(fields[0] ?? ''), textSha: String(fields[1] ?? ''), draft: String(fields[2] ?? '') }),
-      ...o.whatsapp,
+    const whatsappDir = path.join(o.dir, 'whatsapp')
+    const accounts = createAccounts(o.dir, o.log, {
+      folders: () => {
+        try {
+          return readdirSync(path.join(whatsappDir, 'accounts'))
+        } catch {
+          return []
+        }
+      },
     })
-    const live = wa
-    let hosts = new Set<string>()
+    const freeBytes = o.memory ?? (() => os.freemem())
     const tickets = createTicketVerifier()
     tickets.setKey(o.sendKey ?? null)
+    /**
+     * One number's WhatsApp. The first is made exactly as it always was (its folder is <dir>\whatsapp, its log is "whatsapp"); an extra one has its own folder under it, shares the installed packages,
+     * and is refused its Chrome in plain words while the Server has less than WA_ACCOUNT_MIN_FREE_BYTES free. A send is this backend's only against the agent's ticket for exactly it, and since F-312 for
+     * exactly that NUMBER (the same chat id is a different chat in each).
+     */
+    const make = (id: string): WhatsApp =>
+      createWhatsApp({
+        dir: accounts.dirOf(whatsappDir, id),
+        ...(id === WA_MAIN_ACCOUNT
+          ? { log: o.log.child('whatsapp') }
+          : {
+              log: o.log.child(`whatsapp-${id}`),
+              lib: path.join(whatsappDir, 'lib'),
+              // His rule: an extra number opens on use and closes after idle. "Stay open" is the first number's only.
+              neverStayOpen: true,
+              beforeOpen: () => {
+                if (freeBytes() < WA_ACCOUNT_MIN_FREE_BYTES) throw Object.assign(new Error('There is not enough memory free on this Server to open another WhatsApp number right now. Close one, or try again in a few minutes.'), { status: 409, code: 'wa-low-memory' })
+              },
+            }),
+        // Order o55b6: its Chrome may go out through the Z800 (tunnel.json, kept by Agent 6's tunnel; checked in agent/whatsapp/tunnel.ts).
+        tunnel: { file: path.join(o.dir, 'tunnel.json') },
+        human: (_kind, fields, _sig, r) => tickets.verify(r?.headers?.[SEND_TICKET_HEADER], { chatId: String(fields[0] ?? ''), textSha: String(fields[1] ?? ''), draft: String(fields[2] ?? ''), acct: id }),
+        ...o.whatsapp,
+      })
+    wa = make(WA_MAIN_ACCOUNT)
+    numbers.set(WA_MAIN_ACCOUNT, wa)
+    for (const a of accounts.list()) if (a.id !== WA_MAIN_ACCOUNT) numbers.set(a.id, make(a.id))
+    let hosts = new Set<string>()
+    /** The numbers as the page's switcher shows them: who is linked, whose Chrome runs now. */
+    const listing = (): WaAccount[] =>
+      accounts.list().map(a => {
+        const st = numbers.get(a.id)?.status()
+        return { id: a.id, label: a.label, linked: st?.linked ?? false, open: st !== undefined && st.state !== 'off', name: st?.me?.name ?? null }
+      })
+    /** The numbers themselves: the list, a new one, a name. */
+    function accountsRoute(method: string, rest: string, body: unknown): unknown {
+      const b = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+      if (method === 'GET' && rest === '/accounts') return listing()
+      if (method === 'POST' && rest === '/accounts') {
+        const a = accounts.add(b.label as string)
+        numbers.set(a.id, make(a.id))
+        return { account: listing().find(x => x.id === a.id), accounts: listing() }
+      }
+      const one = /^\/accounts\/([^/]+)$/.exec(rest)
+      if (method === 'PATCH' && one) {
+        if (!WA_ACCOUNT_RE.test(one[1])) throw Object.assign(new Error('that is not a WhatsApp number of this app'), { status: 400, code: 'wa-bad-account' })
+        accounts.rename(one[1], b.label as string)
+        return { accounts: listing() }
+      }
+      throw Object.assign(new Error('no such path'), { status: 404 })
+    }
 
     const server = createServer(async (req, res) => {
       try {
@@ -245,12 +305,24 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
         const rest = url.pathname.slice(WA_PREFIX.length) || '/'
         const method = (req.method ?? 'GET').toUpperCase()
         const body = method === 'GET' || method === 'HEAD' ? undefined : await readBody(req)
+        // F-312: the numbers themselves, then which number a request is for: ?acct= (left out: the first, so every older caller is unchanged).
+        if (rest === '/accounts' || rest.startsWith('/accounts/')) {
+          const answer = accountsRoute(method, rest, body)
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          return void res.end(JSON.stringify(answer))
+        }
+        const acct = url.searchParams.get('acct') ?? WA_MAIN_ACCOUNT
+        if (!WA_ACCOUNT_RE.test(acct)) return fail(res, 400, 'that is not a WhatsApp number of this app', 'wa-bad-account')
+        const live = numbers.get(acct)
+        if (!live) return fail(res, 404, 'there is no such WhatsApp number', 'wa-no-such-account')
         // Order oWA S3: a message's file, as bytes (not JSON). Only the agent's proxy asks (behind the token); what a browser is told about its kind is the proxy's (agent/whatsapp/media.ts).
         if (method === 'GET' && rest === '/media') {
           const f = await live.media(url.searchParams.get('chat') ?? '', url.searchParams.get('msg') ?? '')
           res.writeHead(200, { 'content-type': cleanType(f.mimetype) ?? 'application/octet-stream', 'content-length': f.bytes.length, 'x-wa-media-name': encodeURIComponent(f.filename ?? ''), 'cache-control': 'no-store' })
           return void res.end(f.bytes)
         }
+        // The overlay Assistant's tools are the first number's only (the other numbers are the page's, until he says otherwise).
+        if (rest.startsWith('/assistant/') && acct !== WA_MAIN_ACCOUNT) return fail(res, 404, 'the Assistant uses the first number only', 'wa-no-such-account')
         const answer = rest.startsWith('/assistant/') ? await assistant(live, method, rest, url.searchParams, body) : await live.mount.http({ method, rest, query: url.searchParams, body, headers: req.headers })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(JSON.stringify(answer ?? { ok: true }))
@@ -273,13 +345,15 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
       port,
       token,
       server,
-      wa: live,
+      wa,
+      numbers: () => numbers,
       setSendKey: k => tickets.setKey(k),
       sendKeyHeld: () => tickets.hasKey(),
       close() {
         closed ??= (async () => {
           try {
-            await live.close()
+            // F-312: every number closes its own Chrome AT THE SAME TIME (each gets the whole of its time, not what the one before left): one after the other, a slow one would be cut off and killed with the app.
+            await Promise.all([...numbers.values()].map(w => w.close().catch(e => o.log.warn(`a WhatsApp number did not close cleanly: ${e instanceof Error ? e.message : String(e)}`))))
             await new Promise<void>(r => server.close(() => r()))
           } finally {
             try {
@@ -294,7 +368,7 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
       },
     }
   } catch (e) {
-    await wa?.close().catch(() => {})
+    await Promise.all([...numbers.values()].map(w => w.close().catch(() => {})))
     unlock()
     throw e
   }

@@ -865,7 +865,16 @@ export function startApi(o: ApiOptions): Promise<Api> {
       if (!res.headersSent && code === 409 && execution && typeof why === 'string' && (EXECUTION_ERROR_CODES as readonly string[]).includes(why)) {
         const safe = publicExecutionFailure(e, execution.phase, execution.intentId)
         send(res, 409, { error: safe.message, ...safe })
-      } else if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}), ...hubSignInHint(code, why, (e as { hubOrigin?: unknown }).hubOrigin) })
+      } else if (!res.headersSent) {
+        // Shubham's order ob12b: a refused Update press names WHY as a short code (UPDATE_WHY_WORDS in shared/build.ts), so the Build page can say it; only a short lowercase code passes, nothing else of an error.
+        const reason = (e as { why?: unknown }).why
+        send(res, code, {
+          error: e instanceof Error ? e.message : String(e),
+          ...(typeof why === 'string' && code !== 500 ? { code: why } : {}),
+          ...(typeof reason === 'string' && /^[a-z-]{1,40}$/.test(reason) && code !== 500 ? { why: reason } : {}),
+          ...hubSignInHint(code, why, (e as { hubOrigin?: unknown }).hubOrigin),
+        })
+      }
       else res.destroy()
     })
   })

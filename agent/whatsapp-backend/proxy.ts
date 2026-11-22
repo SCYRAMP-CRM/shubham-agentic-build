@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { WA_BACKEND_PREFIX, WA_MEDIA_MAX_BYTES, WA_MEDIA_TOO_BIG, WA_PREFIX, type WaBackendCode } from '../../shared/whatsapp.ts'
+import { WA_ACCOUNT_RE, WA_BACKEND_PREFIX, WA_MAIN_ACCOUNT, WA_MEDIA_MAX_BYTES, WA_MEDIA_TOO_BIG, WA_PREFIX, type WaBackendCode } from '../../shared/whatsapp.ts'
 import { apiError, type ApiMount, type MountRequest } from '../api.ts'
 import { mediaHeaders } from '../whatsapp/media.ts'
 import type { AssistantTools } from './assistant-tools.ts'
@@ -30,6 +30,10 @@ const ROUTES: Route[] = [
   { method: 'POST', pattern: /^\/pair-code$/ },
   { method: 'POST', pattern: /^\/unlink$/ },
   { method: 'PATCH', pattern: /^\/settings$/ },
+  // F-312: the numbers: the list (a read), a new one and a name (a person's own request, below).
+  { method: 'GET', pattern: /^\/accounts$/ },
+  { method: 'POST', pattern: /^\/accounts$/ },
+  { method: 'PATCH', pattern: /^\/accounts\/[^/]+$/ },
   { method: 'GET', pattern: /^\/chats$/ },
   { method: 'GET', pattern: /^\/messages$/ },
   // Order oWA S7: what is new since a position (a message, a tick), waiting a few seconds when there is nothing: the new page follows WhatsApp live with it. A read.
@@ -46,6 +50,13 @@ const ROUTES: Route[] = [
 const CHANGES = /^\/(seen|archive|pin|new-chat)$/
 
 export const allowedRoute = (method: string, rest: string): boolean => ROUTES.some(r => r.method === method && r.pattern.test(rest))
+
+/** F-312: the number a request is for: `?acct=` (left out: the first, so every older caller is unchanged). Anything that is not an id this app makes is a 400. */
+export function acctOf(query: URLSearchParams): string {
+  const a = query.get('acct') ?? WA_MAIN_ACCOUNT
+  if (!WA_ACCOUNT_RE.test(a)) throw Object.assign(apiError(400, 'That is not a WhatsApp number of this app.'), { code: 'wa-bad-account' })
+  return a
+}
 
 /**
  * Order obf15 (oWA S2, Lead's design approval): the agent's gates for a send. A send reaches the backend only after: (1) human(): a person's own signed-in request
@@ -72,8 +83,13 @@ export interface ProxyOptions {
   assistantTools?: () => AssistantTools | null
   /** Order obf15: the gates for sending. Without them (a hand-run backend, a test) a send is passed on as it was and the backend itself refuses it. */
   sends?: SendsOptions
-  /** Order oWA S6: the person's own notes about chats (kept here on the Server, never sent to the backend, WhatsApp or the CRM). Without it those paths do not exist. */
-  notes?: NotesStore
+  /** Order oWA S6: the person's own notes about chats (kept here on the Server, never sent to the backend, WhatsApp or the CRM). Without it those paths do not exist. F-312: or a function that gives each NUMBER its own (a chat id is a different chat in each number, so its notes are too). */
+  notes?: NotesStore | ((acct: string) => NotesStore)
+  /**
+   * F-312: the seam for a rule about WHO may use WHICH number (F-313, a later yes): asked with every request and the number it is for; it throws (a 403) to refuse. Not given: every owner may use every number, as the
+   * first number has always been the owner's alone. Nothing is decided here: the place for it is.
+   */
+  mayUse?(req: MountRequest, acct: string): void
   /** Tests: a backend on a known port, with no supervisor. */
   port?: number
   /** Tests: a fetch to use in place of the network. */
@@ -97,6 +113,9 @@ export function backendPort(view: BackendView | null): number {
   if (view.state === 'stopped') throw down('wa-backend-stopped', `The WhatsApp backend is stopped: ${view.why ?? 'no reason was given'}.`)
   throw down('wa-backend-off', view.why ? `The WhatsApp backend is not running on this Server: ${view.why}.` : 'The WhatsApp backend is not running on this Server.')
 }
+
+/** The request behind a raw route, shaped for the seam (a raw route has no body and no parsed query of its own). */
+const mediaReq = (req: { headers: MountRequest['headers'] }): MountRequest => ({ method: 'GET', rest: '/media', query: new URLSearchParams(), body: undefined, headers: req.headers }) as MountRequest
 
 export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
   const doFetch = o.fetchImpl ?? fetch
@@ -123,11 +142,13 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         if (req.method !== 'GET') throw apiError(405, 'A file is read with GET')
         const chat = url.searchParams.get('chat') ?? ''
         const msg = url.searchParams.get('msg') ?? ''
+        const acct = acctOf(url.searchParams)
+        o.mayUse?.(mediaReq(req), acct)
         if (!chat || chat.length > 100 || !msg || msg.length > 200) throw apiError(400, 'Expected ?chat=<chat id>&msg=<message id>')
         const port = o.port ?? backendPort(o.backend?.() ?? null)
         let up: Response
         try {
-          up = await doFetch(`http://127.0.0.1:${port}${WA_PREFIX}/media?chat=${encodeURIComponent(chat)}&msg=${encodeURIComponent(msg)}`, {
+          up = await doFetch(`http://127.0.0.1:${port}${WA_PREFIX}/media?chat=${encodeURIComponent(chat)}&msg=${encodeURIComponent(msg)}${acct === WA_MAIN_ACCOUNT ? '' : `&acct=${acct}`}`, {
             method: 'GET',
             cache: 'no-store',
             headers: { 'x-sad-token': token() },
@@ -158,6 +179,8 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
     },
     async http(req: MountRequest): Promise<unknown> {
       const { method, rest, query, body } = req
+      const acct = acctOf(query)
+      o.mayUse?.(req, acct)
       // Order of5a0 (A2): his choice of the Assistant's login is the agent's own, not the backend's.
       if (method === 'PATCH' && rest === '/assistant-tools') {
         const at = o.assistantTools?.() ?? null
@@ -166,7 +189,7 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         return at.choose(b?.use, b?.by)
       }
       // Order oWA S6: the notes are the agent's own (never forwarded). Reading is the owner's (this mount); writing is a person's own request.
-      const notes = o.notes
+      const notes = typeof o.notes === 'function' ? o.notes(acct) : o.notes
       if (notes) {
         if (method === 'GET' && rest === '/note-index') return notes.index()
         if (rest === '/notes') {
@@ -196,6 +219,8 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         return { on: sends.on(), confirmed }
       }
       if (!allowedRoute(method, rest)) throw apiError(404, `No such WhatsApp path: ${method} ${rest}`)
+      // F-312: a new number or a new name is a person's own request (a CRM session; a chat's key is refused) before it reaches the backend. The list is a read.
+      if (sends && method !== 'GET' && rest.startsWith('/accounts')) sends.human(req)
       // Order oWA S4: a person's own request (a CRM session; a chat's key is refused) before anything reaches the backend. No ticket and no switch: it sends no message.
       if (sends && method === 'POST' && CHANGES.test(rest)) sends.human(req)
       if (sends && method === 'POST' && rest === '/send') {
@@ -206,7 +231,7 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         const text = typeof b.text === 'string' ? b.text : ''
         const draft = b.draft === undefined ? '' : typeof b.draft === 'string' ? b.draft : null
         if (!chatId || chatId.length > 200 || !text.trim() || draft === null || draft.length > 64) throw apiError(400, 'Expected {chatId, text, draft?}')
-        ticket = sends.ticket({ chatId, textSha: createHash('sha256').update(text, 'utf8').digest('hex'), draft }, by)
+        ticket = sends.ticket({ chatId, textSha: createHash('sha256').update(text, 'utf8').digest('hex'), draft, acct }, by)
         if (ticket === null) throw apiError(503, 'Sending is not available right now: the WhatsApp backend holds no send key yet (it may be starting). Try again in a moment.')
       }
       const port = o.port ?? backendPort(o.backend?.() ?? null)
@@ -231,7 +256,8 @@ export function createWhatsAppBackendProxy(o: ProxyOptions): ApiMount {
         throw Object.assign(apiError(res.status, typeof (data as { error?: unknown })?.error === 'string' ? (data as { error: string }).error : `The WhatsApp backend answered ${res.status}`), typeof why === 'string' ? { code: why } : {})
       }
       const isStatus = method === 'GET' && rest === '/status'
-      const at = isStatus ? (o.assistantTools?.() ?? null) : null
+      // The Assistant's login choice is about the first number only (F-312).
+      const at = isStatus && acct === WA_MAIN_ACCOUNT ? (o.assistantTools?.() ?? null) : null
       const extra = { ...(at ? { assistantTools: at.state() } : {}), ...(isStatus && sends ? { sends: { on: sends.on() } } : {}) }
       return data !== null && typeof data === 'object' && Object.keys(extra).length > 0 ? { ...(data as Record<string, unknown>), ...extra } : data
     },

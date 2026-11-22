@@ -8,6 +8,7 @@ import type { AuthEnded, ChatAccess, ChatCan, ChatOwner, ChatShare } from './aut
 import type { OpenCodeProvider } from './opencode.ts'
 import type { AgentEngine, CodexEffort } from './codex.ts'
 import type { ExecutionIdentity, ExecutionProfile, ExecutionSnapshot } from './chat-execution.ts'
+import type { AgentTemplate } from './agent-template.ts'
 
 export const AGENTIC_PREFIX = '/agentic'
 
@@ -156,6 +157,11 @@ export interface FloorAgent {
   owner?: ChatOwner | null
   /** F-118: who it is shared with, and how. Sent to its owner and sbskrrt only; empty for everyone else. */
   sharedWith?: ChatShare[]
+  /**
+   * F-316 (design B): the template, the family of chats this one is an instance of ("Agentic Platform"), written on the chat. The hub's own, like sessionId and homePc: a page's copy of the chart never
+   * sets or clears it (floors.ts patch() puts the old one back), and adopt() drops it. ABSENT when there is none (never null): a chat with none is its own template. shared/agent-template.ts.
+   */
+  template?: AgentTemplate
   /** F-118: computed per connection (shared/auth.ts chatRights): why this viewer sees it, and what they may do. Absent when stored. */
   access?: ChatAccess
   can?: ChatCan
@@ -299,6 +305,40 @@ export interface NewAgent {
   opencodeModel?: string
   codexModel?: string
   codexEffort?: CodexEffort
+}
+
+/**
+ * F-316 T2, POST /agentic/floors/:floorId/agents/copy: a new chat that is a COPY of another and an instance of its template. `floorId` (the path) is the floor the copy lands on.
+ * The copy takes the source's role, brief, model, effort, ultracode, engine, the OpenCode and Codex model and effort, skills and MCP servers; it starts a fresh chat (no conversation, no PC), is owned
+ * by the caller and shared with nobody. One write or none. Errors: 400 a bad body; 403 'not-yours' (the caller must own the source or be an administrator, because the copy takes its brief), 403
+ * 'admin-only' (a personal Assistant's floor, R1b); 404 no such floor or agent; 409 the floor is full, the name is taken, 'pc-control-immutable', 'copy-source-refused' (a person's own Assistant),
+ * 'template-name-required' (the source has no template and no `templateName` was sent).
+ */
+export interface CopyAgentRequest {
+  from: { floorId: string; agentId: string }
+  /** Omitted: "<the source's name> 2" (the next free number on the floor). */
+  name?: string
+  /** Only for a source with no template: what to call the family it starts. A template that already has the id this name gives is joined, under its own name. */
+  templateName?: string
+}
+/** The floor the copy landed on, as the hub has it now, and the copy (its `template` set). A source that was stamped by this call arrives on the floors push. */
+export interface CopyAgentAnswer {
+  floor: Floor
+  agent: FloorAgent
+}
+/** F-316 T2, POST /agentic/floors/:floorId/template {id, name} (the first owner's one click): every chat of the floor that has no template becomes an instance of it. */
+export interface StampTemplateAnswer {
+  floor: Floor
+  /** How many chats were stamped, and how many were left alone (they had a template already, or are PC Control or a person's Assistant). */
+  stamped: number
+  skipped: number
+  /** The copy of floors.json kept first (its file name, beside floors.json): the way back. */
+  copy: string | null
+}
+/** POST /agentic/floors/:floorId/template/undo {id}: takes the template away from exactly the chats the last stamping of it on this floor gave it. */
+export interface UnstampTemplateAnswer {
+  floor: Floor
+  removed: number
 }
 
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */

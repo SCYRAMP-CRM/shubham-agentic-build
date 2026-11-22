@@ -29,6 +29,20 @@ import { checkTunnel, type TunnelCheck } from './tunnel.ts'
 export interface WhatsAppOptions {
   /** The state folder's WhatsApp part: %LOCALAPPDATA%\shubham-agentic\whatsapp. */
   dir: string
+  /**
+   * F-312: where WhatsApp's packages are (the shared install). Left out: `<dir>\lib`, as it always was. An extra number keeps its own login folder in its own `dir` and shares these packages with the first.
+   */
+  lib?: string
+  /**
+   * F-312: asked just before this WhatsApp's Chrome would start; it throws (a 409 in plain words) to refuse. Given only to the extra numbers (agent/whatsapp-backend/accounts.ts: not enough memory free
+   * right now); the first number is not given one and opens exactly as before.
+   */
+  beforeOpen?(): void
+  /**
+   * F-312 (his rule: an extra number opens on use and closes after idle): this number never stays open. A saved "Stay open" on it is ignored (it is not shown as on, it does not keep the number from closing, and it
+   * does not open the number again at the next start), and a request to turn it on is refused. Given only to the extra numbers; the first number is not given it and stays open when set to, exactly as before.
+   */
+  neverStayOpen?: boolean
   log: Logger
   /** His approval device's signature over a WhatsApp send (agentic's humanProof): who it was, or it throws 401/403. */
   human(kind: 'wa-send', fields: (string | number | boolean)[], sig: unknown, r?: ProofRequest): string
@@ -87,13 +101,16 @@ interface Settings {
   name: string | null
   /** Order o55b6: the way out he chose; null: not chosen (through the Z800 where there is a tunnel to choose). */
   route: WaRoute | null
+  /** F-312: when it was last connected (ISO), and how it last stopped being (plain words, with when). Written only once there is something to say: until then the file keeps its old shape. */
+  lastConnectedAt: string | null
+  lastEnd: { at: string; why: string } | null
 }
 
 export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   const now = o.now ?? Date.now
   const log = o.log
   const authDir = path.join(o.dir, 'auth')
-  const libDir = path.join(o.dir, 'lib')
+  const libDir = o.lib ?? path.join(o.dir, 'lib')
   const profile = path.join(authDir, `session-${LOGIN_ID}`)
   const settingsFile = path.join(o.dir, 'settings.json')
   const chrome = o.chrome !== undefined ? o.chrome : findChrome()
@@ -105,6 +122,8 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   const events = createEventRing()
 
   let settings = readSettings()
+  /** F-312: whether this number is kept open: what it was set to, except an extra number (never). */
+  const stays = (): boolean => settings.alwaysOn && o.neverStayOpen !== true
   let engine: EngineStatus = { state: 'off', qr: null, pairingCode: null, me: null, reason: null, loading: null, linked: null }
   let setup: { state: WaSetup; note: string | null } = { state: isReady() ? 'ready' : 'missing', note: null }
   let idle: ReturnType<typeof setTimeout> | null = null
@@ -116,9 +135,17 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   function readSettings(): Settings {
     try {
       const raw = JSON.parse(readFileSync(settingsFile, 'utf8')) as Record<string, unknown>
-      return { alwaysOn: raw.alwaysOn === true, linked: raw.linked === true, name: typeof raw.name === 'string' ? raw.name : null, route: raw.route === 'direct' || raw.route === 'z800' ? raw.route : null }
+      const end = raw.lastEnd as { at?: unknown; why?: unknown } | null | undefined
+      return {
+        alwaysOn: raw.alwaysOn === true,
+        linked: raw.linked === true,
+        name: typeof raw.name === 'string' ? raw.name : null,
+        route: raw.route === 'direct' || raw.route === 'z800' ? raw.route : null,
+        lastConnectedAt: typeof raw.lastConnectedAt === 'string' ? raw.lastConnectedAt : null,
+        lastEnd: end && typeof end.at === 'string' && typeof end.why === 'string' ? { at: end.at, why: end.why } : null,
+      }
     } catch {
-      return { alwaysOn: false, linked: false, name: null, route: null }
+      return { alwaysOn: false, linked: false, name: null, route: null, lastConnectedAt: null, lastEnd: null }
     }
   }
   function saveSettings(patch: Partial<Settings>) {
@@ -126,8 +153,9 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     try {
       mkdirSync(o.dir, { recursive: true })
       // Order o55b6: the way out is written only once he has chosen one; until then the file keeps its old shape.
-      const { route: chosen, ...rest } = settings
-      writeAtomic(settingsFile, `${JSON.stringify(chosen ? { ...rest, route: chosen } : rest, null, 2)}\n`)
+      // F-312: and the same for the two things he is told about how it last connected and ended (written once there is something to say).
+      const { route: chosen, lastConnectedAt, lastEnd, ...rest } = settings
+      writeAtomic(settingsFile, `${JSON.stringify({ ...rest, ...(chosen ? { route: chosen } : {}), ...(lastConnectedAt ? { lastConnectedAt } : {}), ...(lastEnd ? { lastEnd } : {}) }, null, 2)}\n`)
     } catch (e) {
       log.warn(`could not save the WhatsApp settings: ${message(e)}`)
     }
@@ -175,11 +203,24 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     ...o.host,
   })
 
+  /**
+   * F-312: what he is told about each number: when it was last connected, and why it stopped being. On 19 Nov the first number was logged out by WhatsApp 32 s after a restart and nothing said so
+   * (the logs had to be read): a connected session that ends for ANY reason is written down in the words the engine gave (LOGOUT, a conflict, a dropped link), and a saved login that WhatsApp
+   * refuses (it shows a QR instead) is too. A number that was never linked asking for its first scan is not an end.
+   */
+  function noteEnds(was: EngineStatus['state'], next: EngineStatus, wasLinked: boolean) {
+    const at = new Date(now()).toISOString()
+    if (next.state === 'ready' && was !== 'ready') saveSettings({ lastConnectedAt: at })
+    else if ((was === 'ready' || was === 'linking') && (next.state === 'off' || next.state === 'failed')) saveSettings({ lastEnd: { at, why: next.reason ?? 'It disconnected.' } })
+    else if (next.state === 'qr' && was !== 'qr' && wasLinked) saveSettings({ lastEnd: { at, why: 'WhatsApp asked for a new scan: the login saved here was not accepted.' } })
+  }
+
   function onWorker(e: WorkerEvent) {
     if (e.t === 'status') {
       const was = engine.state
       engine = e.status
       if (was !== engine.state) log.info(`WhatsApp: ${engine.state}`)
+      noteEnds(was, engine, settings.linked)
       if (engine.linked === true && (!settings.linked || (engine.me?.name && engine.me.name !== settings.name))) saveSettings({ linked: true, name: engine.me?.name ?? settings.name })
       if (engine.linked === false && settings.linked) saveSettings({ linked: false })
       changed()
@@ -205,8 +246,10 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       pairingCode: state === 'qr' ? engine.pairingCode : null,
       loading: open ? engine.loading : null,
       reason: engine.reason,
-      alwaysOn: settings.alwaysOn,
+      alwaysOn: stays(),
       closesAt,
+      lastConnectedAt: settings.lastConnectedAt,
+      lastEnd: settings.lastEnd,
       drafts: drafts.list(),
       assistantSentLastHour: drafts.sentLastHour(),
       ...(route() ? { route: route()!, tunnel: tunnelSeen } : {}),
@@ -248,7 +291,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   /** It was used: it closes WA_IDLE_MS from now, unless it stays on or a WhatsApp page is open. */
   function touch() {
     clearIdle()
-    if (host.running() && !settings.alwaysOn && sockets.size === 0) {
+    if (host.running() && !stays() && sockets.size === 0) {
       const ms = o.idleMs ?? WA_IDLE_MS
       closesAt = new Date(now() + ms).toISOString()
       idle = setTimeout(() => {
@@ -275,6 +318,8 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   async function open(): Promise<void> {
     if (!isReady()) throw apiError(409, 'WhatsApp is not set up on this PC yet. Set it up on the WhatsApp page first.')
     if (!chrome) throw apiError(409, 'There is no Chrome on this PC: WhatsApp runs in Google Chrome. Install it, then try again.')
+    // F-312: an extra number is refused here, in plain words, when the Server has no memory to spare (the first number is given no such check).
+    if (!(host.running() && engine.state !== 'off' && engine.state !== 'failed')) o.beforeOpen?.()
     lockAuth()
     if (host.running() && engine.state !== 'off' && engine.state !== 'failed') return touch()
     // Order o55b6: through the Z800, Chrome starts only with a tunnel checked just now (its note, its listener's PID, a SOCKS5 greeting). If it is
@@ -286,6 +331,8 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
         const why = `WhatsApp goes out through the Z800 here, and that way is not ready: ${t.why}. It does not go out directly instead; to go directly, choose "Directly" on the WhatsApp page.`
         engine = { ...engine, state: 'failed', qr: null, pairingCode: null, loading: null, reason: why }
         log.warn(`WhatsApp not opened: ${t.why}`)
+        // F-312: the first time it could not open is the time to keep (18 Nov: three starts in a row said so and nothing was kept); a later one says the same and leaves it.
+        if (!settings.lastEnd?.why.startsWith('Could not open')) saveSettings({ lastEnd: { at: new Date(now()).toISOString(), why: `Could not open: ${t.why}.` } })
         changed()
         throw apiError(503, why)
       }
@@ -318,7 +365,9 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
   async function shut(reason: string | null) {
     clearIdle()
     proxyInUse = null
+    const wasReady = engine.state === 'ready'
     await host.quit()
+    if (wasReady) saveSettings({ lastEnd: { at: new Date(now()).toISOString(), why: reason ?? 'Closed.' } })
     engine = { ...engine, state: 'off', qr: null, pairingCode: null, loading: null, reason }
     changed()
   }
@@ -520,6 +569,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
       case 'PATCH /settings': {
         if (isObject(body) && body.route !== undefined && body.alwaysOn === undefined) return setRoute(body.route)
         if (!isObject(body) || typeof body.alwaysOn !== 'boolean') throw apiError(400, 'Expected {alwaysOn} or {route}')
+        if (body.alwaysOn && o.neverStayOpen) throw apiError(400, 'Only the first number can stay open. This one opens when it is used and closes after a while without use.')
         saveSettings({ alwaysOn: body.alwaysOn })
         if (body.alwaysOn && linked()) await open()
         else touch()
@@ -589,7 +639,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
 
   // A crash may have left the last run's Chrome holding the login: end exactly that. Then, if it stays on, open it.
   void host.sweep().then(() => {
-    if (settings.alwaysOn && linked() && isReady()) open().catch(e => log.warn(`WhatsApp did not open at start: ${message(e)}`))
+    if (stays() && linked() && isReady()) open().catch(e => log.warn(`WhatsApp did not open at start: ${message(e)}`))
   })
 
   return {

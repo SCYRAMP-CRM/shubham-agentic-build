@@ -47,6 +47,29 @@ export function mayPublish(headers: Record<string, string | string[] | undefined
   return !isPageRequest(headers) || caller?.person?.id === SBSKRRT_ID
 }
 
+/** What a caller may do about Update (Shubham's order ob12b): the OWNER (the first owner by id, or the PC's own program) presses as before, with force and cancel; a PERSON presses under the guards, while the switch is on. */
+export type UpdateRights = { kind: 'owner'; by?: { id: string; name: string } } | { kind: 'person'; by: { id: string; name: string } }
+
+/**
+ * Who presses Update, decided in ONE place (main.ts wires it into POST /update, /update-cancel, /update-policy and GET /status):
+ *  - the first owner (Shubham, by id) on a page, and a program on this PC with the machine token and no person: the OWNER, as before;
+ *  - any other signed-in person (a second owner, an administrator, is a person for this), while `peopleMayUpdate()` is true: a PERSON;
+ *  - anyone else: refused, with the reason as `why` (a code of shared/build.ts UPDATE_WHY_WORDS) so the Build page can say it in words.
+ * A request WITH a person is judged by the person, never by "looks like a program" (a cookie sent without page headers is not the machine channel).
+ */
+export function updateRights(headers: Record<string, string | string[] | undefined>, caller: Caller | undefined, peopleMayUpdate: () => boolean): UpdateRights {
+  const person = caller?.person
+  if (!person) {
+    if (isPageRequest(headers)) throw Object.assign(authError(401, 'Sign in to update.', 'sign-in'), { why: 'not-signed-in' })
+    return { kind: 'owner' }
+  }
+  // The name goes into the audit line: cut at 120, no line end or other control character in it (no regex: oxlint's no-control-regex).
+  const by = { id: person.id, name: [...(person.name || person.username || '').slice(0, 120)].map(c => (c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 ? ' ' : c)).join('') }
+  if (person.id.toLowerCase() === SBSKRRT_ID) return { kind: 'owner', by }
+  if (!peopleMayUpdate()) throw Object.assign(authError(403, 'The owner has switched off Update for everyone else.', 'admin-only'), { why: 'people-off' })
+  return { kind: 'person', by }
+}
+
 /** An error the API answers with this status, message and the contract's code. */
 export function authError(status: number, message: string, code: AuthErrorCode): Error & { status: number; code: AuthErrorCode } {
   return Object.assign(new Error(message), { status, code })
