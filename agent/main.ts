@@ -32,6 +32,7 @@ import { createBuild, findDevDir, type Build, type ChatHostGate, type UpdateGuar
 import { updateRights } from './auth/types.ts'
 import { createUpdatePolicy } from './build-update-policy.ts'
 import { createCoordinator, type Coordinator } from './update/coordinator.ts'
+import { createStrayAbortGuard, trackAbortTimeouts } from './stray-abort.ts'
 import { createUpdateState } from './update/state.ts'
 import { createBridge } from './claude/bridge.ts'
 import { createAuth } from './auth/index.ts'
@@ -1401,11 +1402,19 @@ if (import.meta.main) {
     if ((msg as { t?: unknown } | null)?.t === 'stop') void shutdown('asked by the parent process')
   })
   process.on('disconnect', () => void shutdown('the parent process went away'))
+  // 23 Nov 2026 (the hub stopped itself 39 times in a day on one stray TimeoutError): a stray TimeoutError/AbortError that reaches the top is the cancelling of one piece of work, not a broken
+  // app. It is logged (once a minute, with the call that made the timeout: agent/stray-abort.ts) and the app goes on; more than a few a minute is a loop and stops it as before.
+  // Every other error still stops it, exactly as it did.
+  const strayAborts = createStrayAbortGuard({ log, sites: trackAbortTimeouts() })
   process.on('uncaughtException', e => {
+    if (strayAborts.uncaught(e) === 'go-on') return
     log.error(`internal error: ${e.stack ?? e.message}`)
     void shutdown('internal error', 1)
   })
-  process.on('unhandledRejection', e => log.error(`internal error (unhandled rejection): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`))
+  process.on('unhandledRejection', e => {
+    if (strayAborts.rejected(e)) return
+    log.error(`internal error (unhandled rejection): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
+  })
 
   try {
     const config = loadConfig({ argv: process.argv.slice(2) })

@@ -1180,7 +1180,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const crm = createCrmStore(path.join(o.dir, 'crm.json'))
   let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
-  const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json') })
+  const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log })
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
   const crmGoals = createCrmGoals({ proxy: crmProxy })
   const crmReads = createCrmReads({ proxy: crmProxy })

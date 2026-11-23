@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import type { CrmSessionInfo } from '../../shared/crm.ts'
 import { apiError } from '../api.ts'
 import { SESSION_MS, trimUrl } from '../claude/crm.ts'
+import type { Logger } from '../log.ts'
 
 // F-054: the CRM built into the page talks to the CRM's backend through this. The backend allows
 // only the CRM's own sites as origins, so a call from this app's address would be refused by CORS;
@@ -78,6 +80,10 @@ export interface CrmProxyOptions {
   file: string
   fetch?: typeof fetch
   now?: () => number
+  /** Only for what ended early (the path, never the query, a cookie or a token). Left out (a test, the accounts script), nothing is logged. */
+  log?: Pick<Logger, 'warn'>
+  /** How long one request to the CRM may take in all (default 120 s). A test makes it short. */
+  timeoutMs?: number
 }
 
 export interface CrmProxy {
@@ -176,7 +182,7 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
           h['x-csrf-token'] = token
         }
       }
-      return fetchFn(target, { method, headers: h, body, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS) })
+      return fetchFn(target, { method, headers: h, body, redirect: 'manual', signal: AbortSignal.timeout(o.timeoutMs ?? TIMEOUT_MS) })
     }
 
     let upstream: Response
@@ -200,11 +206,18 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
     })
     res.writeHead(upstream.status, out)
     if (!upstream.body || method === 'HEAD') return void res.end()
-    Readable.fromWeb(upstream.body as never).pipe(res)
-    await new Promise<void>(resolve => {
-      res.once('close', resolve)
-      res.once('finish', resolve)
-    })
+    // 23 Nov 2026 (his hub stopped itself 39 times in a day on "TimeoutError: The operation was aborted due to timeout"): this line was `Readable.fromWeb(body).pipe(res)`.
+    // `.pipe` puts no error listener on the SOURCE, so when the fetch's own AbortSignal.timeout fired while the answer was still coming (the CRM slow, or the page
+    // gone and the body left unread: the timer kept running either way), the Readable's 'error' event had nobody to go to and Node threw it as an UNCAUGHT exception, which
+    // the app answers by stopping itself (and every chat). pipeline() listens to both ends: an error ends the answer here (the page sees a cut connection, never a
+    // half answer passed off as whole), and a page that hangs up lets the CRM's body go at once instead of holding it until the timer fires.
+    try {
+      await pipeline(Readable.fromWeb(upstream.body as never), res)
+    } catch (e) {
+      const why = (e as { code?: string }).code === 'ERR_STREAM_PREMATURE_CLOSE' ? 'the page hung up' : ((e as { name?: string }).name ?? 'error')
+      // pipeline has already destroyed both ends (the page's connection is cut, the CRM's body is cancelled): all that is left is to say so.
+      o.log?.warn(`crm proxy: ${method} ${target.pathname}: the answer ended early (${why})`)
+    }
   }
 
   return {
@@ -229,7 +242,7 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
             h['x-csrf-token'] = token
           }
         }
-        return fetchFn(target, { method: m, headers: h, body, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(TIMEOUT_MS) })
+        return fetchFn(target, { method: m, headers: h, body, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(o.timeoutMs ?? TIMEOUT_MS) })
       }
       let r = await send(false)
       if (MUTATES.has(m) && r.status === 403) {
