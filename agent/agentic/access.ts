@@ -66,6 +66,10 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PUT', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
   ['POST', /^\/accounts\/platforms\/([^/]+)\/disable$/, OWNER],
   ['POST', /^\/accounts\/platforms\/([^/]+)\/enable$/, OWNER],
+  // F-293 (his decision "A"): the platform account's password: Reveal, Disable password, Enable password (the owner's only; the routes are humanOnly as well). There is no remove.
+  ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/reveal$/, OWNER],
+  ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/disable$/, OWNER],
+  ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/enable$/, OWNER],
   // Order o8ebe: the password reveal (the owner's only).
   ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, OWNER],
   // Order ofd53: the email edit modal (the owner's only).

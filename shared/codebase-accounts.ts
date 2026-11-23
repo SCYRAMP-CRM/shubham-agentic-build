@@ -68,24 +68,80 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 
 // ---- secrets ---------------------------------------------------------------------------------------------------------------------------------------------
 
-/** Text that holds, or looks like it holds, a secret: a password or token written out, a key, a connection string with a login, a known token shape, a private key block. */
-const SECRET_TEXT: RegExp[] = [
-  /\b(pass(word|wd|code|phrase)?|pwd|secret|token|bearer|api[-_ ]?key|access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|credential)s?\b\s*(is|are)?\s*[:=]/i,
-  /\b(pass(word|wd)?|pwd|secret|token|api[-_ ]?key)\b/i,
-  /\b(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?|redis|rediss|amqps?|mssql|sqlserver):\/\//i,
-  /[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}/,
-  /\bsk[-_](live|test|proj|ant)?[-_]?[A-Za-z0-9]{16,}/,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
-]
+/**
+ * ONE rule of the secret-shape veto: text that holds, or looks like it holds, a secret (a password or token written out, a key, a connection string with a login, a known token shape, a private key block).
+ * `what` is how a refusal NAMES it in plain words ("This looks like an AWS access key"), so a person can reword the text. `kind`: 'shape' looks at the SHAPE of a value; 'word' is the bare mention of a password or token,
+ * which is right for a VALUE that may be shown and wrong for prose (a sentence may talk about a password without holding one), so free text asks for shapes only. `inPath`: the rule also applies to the path of an address
+ * (a long repository or branch name is not a secret, so the long-run rules do not). One table, one place to improve and one place to be wrong: the Env masking, the codebase text and the Description fields all read it.
+ */
+export interface SecretRule {
+  id: string
+  what: string
+  kind: 'shape' | 'word'
+  inPath: boolean
+  test: (text: string) => boolean
+}
+export interface SecretHit {
+  id: string
+  what: string
+}
+
+const rx = (re: RegExp) => (text: string) => re.test(text)
+
+/** "the password is Abc123!x": a label, "is", and a value that LOOKS like a value (a digit, a symbol, or two capitals). "The password is stored in the Email tab" is not one. */
+const LABEL_IS = /\b(?:pass(?:word|wd|code|phrase)?|pwd|secret|token|api[-_ ]?key|access[-_ ]?key|secret[-_ ]?key|private[-_ ]?key)s?\s+(?:is|are|was)\s+["'`(]?([^\s"'`),;]{6,})/gi
+function labelIsValue(text: string): boolean {
+  for (const m of text.matchAll(LABEL_IS)) {
+    const v = m[1]
+    if (/\d/.test(v) || /[^A-Za-z0-9]/.test(v) || (v.match(/[A-Z]/g) ?? []).length >= 2) return true
+  }
+  return false
+}
+
+/** An AWS secret access key: exactly 40 of letters, digits, "+" and "/" on its own, with a capital, a small letter and a digit (so a plain word or a path is not one). */
+function awsSecretKey(text: string): boolean {
+  for (const raw of text.split(/\s+/)) {
+    const t = raw.replace(/^[^A-Za-z0-9/+]+/, '').replace(/[^A-Za-z0-9/+=]+$/, '').replace(/=+$/, '')
+    if (t.length === 40 && /^[A-Za-z0-9/+]{40}$/.test(t) && !t.startsWith('/') && /[A-Z]/.test(t) && /[a-z]/.test(t) && /\d/.test(t)) return true
+  }
+  return false
+}
+
 /** A long run of letters and digits on its own (40+): an API key or token pasted bare. Not applied to the path of an address (a long repository or branch name is not a secret). */
 const BARE_BLOB = /(?<![\w/.-])[A-Za-z0-9+_-]{40,}={0,2}(?![\w/.-])/
 
-export const looksSecret = (text: string): boolean => SECRET_TEXT.some(re => re.test(text)) || BARE_BLOB.test(text)
-const looksSecretInPath = (text: string): boolean => SECRET_TEXT.some(re => re.test(text))
+export const SECRET_RULES: readonly SecretRule[] = [
+  { id: 'labelled', what: 'a password or key written out ("password: …", "secret = …")', kind: 'shape', inPath: true, test: rx(/\b(pass(word|wd|code|phrase)?|pwd|secret|token|bearer|api[-_ ]?key|access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|credential)s?\b\s*(is|are)?\s*[:=]/i) },
+  { id: 'labelled-is', what: 'a password or key written out ("the password is …")', kind: 'shape', inPath: false, test: labelIsValue },
+  { id: 'word', what: 'the word password, token, secret or API key', kind: 'word', inPath: true, test: rx(/\b(pass(word|wd)?|pwd|secret|token|api[-_ ]?key)\b/i) },
+  { id: 'database-address', what: 'a database connection address, which carries a login', kind: 'shape', inPath: true, test: rx(/\b(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?|redis|rediss|amqps?|mssql|sqlserver):\/\//i) },
+  { id: 'login-in-address', what: 'an address with a login inside it (name:secret@host)', kind: 'shape', inPath: true, test: rx(/[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i) },
+  { id: 'private-key', what: 'a private key', kind: 'shape', inPath: true, test: rx(/-----BEGIN [A-Z ]*PRIVATE KEY-----/) },
+  { id: 'github-token', what: 'a GitHub token', kind: 'shape', inPath: true, test: rx(/\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}/) },
+  { id: 'api-key', what: 'an API key (sk-…)', kind: 'shape', inPath: true, test: rx(/\bsk[-_](live|test|proj|ant)?[-_]?[A-Za-z0-9]{16,}/) },
+  { id: 'slack-token', what: 'a Slack token', kind: 'shape', inPath: true, test: rx(/\bxox[abprs]-[A-Za-z0-9-]{10,}/) },
+  { id: 'aws-access-key', what: 'an AWS access key (AKIA… or ASIA…)', kind: 'shape', inPath: true, test: rx(/\b(AKIA|ASIA)[0-9A-Z]{16}\b/) },
+  { id: 'jwt', what: 'a signed token (a JWT)', kind: 'shape', inPath: true, test: rx(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/) },
+  { id: 'google-key', what: 'a Google API key', kind: 'shape', inPath: true, test: rx(/\bAIza[0-9A-Za-z_-]{30,}/) },
+  { id: 'supabase-token', what: 'a Supabase access token', kind: 'shape', inPath: true, test: rx(/\bsbp_[0-9a-f]{30,}/) },
+  { id: 'npm-token', what: 'an npm token', kind: 'shape', inPath: true, test: rx(/\bnpm_[A-Za-z0-9]{30,}/) },
+  { id: 'gitlab-token', what: 'a GitLab token', kind: 'shape', inPath: true, test: rx(/\bglpat-[A-Za-z0-9_-]{16,}/) },
+  { id: 'aws-secret-key', what: 'an AWS secret access key (40 letters, digits, + and /)', kind: 'shape', inPath: false, test: awsSecretKey },
+  { id: 'long-run', what: 'a long run of letters and digits (40 or more), which is how a key looks', kind: 'shape', inPath: false, test: rx(BARE_BLOB) },
+]
+
+/** The FIRST rule the text hits, or null. A bare WORD rule is asked only when `words` is true; `path` limits it to the rules that apply to the path of an address. */
+export function whichSecret(text: string, o: { words?: boolean; path?: boolean } = {}): SecretHit | null {
+  for (const rule of SECRET_RULES) {
+    if (rule.kind === 'word' && o.words !== true) continue
+    if (o.path === true && !rule.inPath) continue
+    if (rule.test(text)) return { id: rule.id, what: rule.what }
+  }
+  return null
+}
+
+export const looksSecret = (text: string): boolean => whichSecret(text, { words: true }) !== null
+const looksSecretInPath = (text: string): boolean => whichSecret(text, { words: true, path: true }) !== null
 
 const MAX_TEXT = 5000
 const MAX_URL = 500

@@ -22,7 +22,9 @@ export const AGENTS_NEW_ROUTE = '/agents-new'
 export const MEMORY_ROUTE = '/memory'
 
 export const AGENTS_NEW: BlankPage = { route: AGENTS_NEW_ROUTE, label: 'Agents (new)', blurb: 'The new Agents page, blank for now', key: 'agents-new', access: 'The new Agents page: blank for now, redesigned step by step.' }
-export const MEMORY: BlankPage = { route: MEMORY_ROUTE, label: 'Memory', blurb: 'A new page, blank for now', key: 'memory', access: 'The new Memory page: blank for now, built step by step.' }
+// F-328 (his order o23ce): the Memory page is NOT blank any more (src/pages/MemoryPage.tsx, shared/memory-page.ts). Its address, label and Access key stay as F-320 made them, so the router, the chooser,
+// Settings > Access and the owner's list still name it from this one place; only its two sentences changed. This file keeps its name for now.
+export const MEMORY: BlankPage = { route: MEMORY_ROUTE, label: 'Memory', blurb: 'What the app has kept about you', key: 'memory', access: 'The Memory page: your own memory, read only. Other people’s memory comes later.' }
 
-/** In the order the chooser lists them: right after "Agents". */
-export const BLANK_PAGES: readonly BlankPage[] = [AGENTS_NEW, MEMORY]
+/** The pages that are still blank (F-328 built the Memory page). */
+export const BLANK_PAGES: readonly BlankPage[] = [AGENTS_NEW]

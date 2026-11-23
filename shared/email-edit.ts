@@ -1,7 +1,9 @@
 // Order ofd53 (slice 1 of o45c0): the email edit modal's fields. The rules the agent and the page both use: the address, the recovery email, the phone, the
 // note, the switched-off flag, and the password (write only: it is checked for length here, sealed by the agent, and never given back). Pure: no network.
 
-export const EMAIL_EDIT_LIMITS = { address: 200, recovery: 200, phone: 60, note: 5000, password: 500 } as const
+import { checkDescription, DESCRIPTION_LIMITS } from './account-description.ts'
+
+export const EMAIL_EDIT_LIMITS = { address: 200, recovery: 200, phone: 60, note: DESCRIPTION_LIMITS.email, password: 500 } as const
 
 export type Checked<T> = { ok: true; value: T } | { ok: false; message: string }
 
@@ -41,11 +43,9 @@ export function checkPhone(v: unknown): Checked<string | null> {
   return { ok: true, value: t }
 }
 
+/** The note: the SAME guard as the platform account's Description (order obf7c, the Lead's ruling: a guarded field beside an unguarded one is a false sense of safety). A text that looks like a secret is refused, by name. */
 export function checkNote(v: unknown): Checked<string | null> {
-  const t = typeof v === 'string' ? v.trim() : ''
-  if (!t) return { ok: true, value: null }
-  if (t.length > EMAIL_EDIT_LIMITS.note) return { ok: false, message: `The note is longer than ${EMAIL_EDIT_LIMITS.note} characters.` }
-  return { ok: true, value: t }
+  return checkDescription(v, EMAIL_EDIT_LIMITS.note, 'note')
 }
 
 /** The password: null or empty keeps the stored one. Only its length is checked; it is never trimmed or shown. */

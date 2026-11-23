@@ -8970,10 +8970,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, ([id], r) => (humanOnly(r), accountsEmailWrite.reveal(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Accounts edit slice: the platform accounts (owner only; soft delete).
     // Add account (order oc35dc): a platform account made in the app, with its codebases (the owner's only; nothing is written to the CRM).
-    ['POST', /^\/accounts\/platforms$/, (_, r) => accountsPlatformWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
-    ['PUT', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
-    ['POST', /^\/accounts\/platforms\/([^/]+)\/disable$/, ([id], r) => accountsPlatformWrite.disable(access.ownerOf(callerOf(r)).id, id), 'local'],
-    ['POST', /^\/accounts\/platforms\/([^/]+)\/enable$/, ([id], r) => accountsPlatformWrite.enable(access.ownerOf(callerOf(r)).id, id), 'local'],
+    // F-293 (his decision "A", 18 Nov 2026): a platform account's password is typed by HIM and sealed here, exactly as the email passwords are. The module now seals and opens a secret, so EVERY route that calls it is humanOnly (as the
+    // email routes are): a chat's key or a program that holds only the app's token can no longer create, edit, disable or enable a platform account at all, not only its password. The three password routes (Reveal, Disable password, Enable
+    // password) are new. There is no remove and no delete: the password is disabled and enabled again.
+    ['POST', /^\/accounts\/platforms$/, (_, r) => (humanOnly(r), accountsPlatformWrite.create(access.ownerOf(callerOf(r)).id, r.body)), 'local'],
+    ['PUT', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.update(access.ownerOf(callerOf(r)).id, id, r.body)), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/disable$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.disable(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/enable$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.enable(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/reveal$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.reveal(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/disable$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.passwordDisable(access.ownerOf(callerOf(r)).id, id)), 'local'],
+    ['POST', /^\/accounts\/platforms\/([^/]+)\/password\/enable$/, ([id], r) => (humanOnly(r), accountsPlatformWrite.passwordEnable(access.ownerOf(callerOf(r)).id, id)), 'local'],
     // Codebase details slice: the codebase's details (owner only).
     ['PUT', /^\/accounts\/codebases\/([^/]+)$/, ([id], r) => accountsCodebaseWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     // Add codebase: a codebase made in the app (the owner's only; nothing is written to the CRM).
@@ -8985,7 +8991,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // The two imports read the CRM on THIS PC's saved sign-in (Shubham's): the first owner's by id, a second owner does not (his order o2f32).
     ['POST', /^\/accounts\/email\/import$/, (_, r) => (humanOnly(r), firstOwnerOnly(callerOf(r), 'POST /accounts/email/import', "This is for the first owner of this app only: it reads the CRM on the PC's sign-in."), accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true })), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).
-    // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; no password, only that one is stored. The owner's (POLICY).
+    // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; F-293: never a password, only WHETHER one is stored here (the sealed one is read only by the owner's Reveal). The owner's (POLICY).
     ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id, { disabled: r.query.get('disabled') === '1' }), 'local'],
     ['GET', /^\/accounts\/codebases$/, (_, r) => accountsCodebases.list(access.ownerOf(callerOf(r)).id), 'local'],
     // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).

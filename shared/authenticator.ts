@@ -3,6 +3,7 @@
 // the checks below accept only these three, and a long or secret-looking note is refused. Pure: no network.
 
 import type { Checked } from './platform-edit.ts'
+import { fieldRefusal } from './platform-password.ts'
 
 export const AUTHENTICATOR_APPS = ['Google Authenticator', 'Microsoft Authenticator', 'Authy', 'Other'] as const
 export const AUTHENTICATOR_LIMITS = { email: 200, note: 200 } as const
@@ -30,6 +31,10 @@ export function checkAuthenticator(raw: unknown): Checked<AuthenticatorInput> {
   const note = typeof r.authenticatorNote === 'string' ? r.authenticatorNote.trim() : ''
   if (note.length > AUTHENTICATOR_LIMITS.note) return { ok: false, message: `The authenticator note is longer than ${AUTHENTICATOR_LIMITS.note} characters.` }
   if (note && SECRET_LOOKING.test(note)) return { ok: false, message: 'The note looks like it holds a code or a key. Write only the device (for example "Shubham\'s phone"); never a code or a secret.' }
+  // F-293 slice 3 (Agent 14's finding 2): the note is a free-text box like the others, so the SAME shape veto as the platform form's other boxes (a password, an access key, a token ...) covers it too; the sentence names what it looked like
+  // and never repeats the text. The older, narrower guard above (codes, seeds, base32 runs) stays.
+  const shape = fieldRefusal('authenticator note', note)
+  if (shape !== null) return { ok: false, message: shape }
   return { ok: true, value: { authenticatorEmail: email || null, authenticatorApp: app || null, authenticatorNote: note || null } }
 }
 

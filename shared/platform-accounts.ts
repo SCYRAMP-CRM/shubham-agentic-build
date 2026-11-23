@@ -1,4 +1,6 @@
 import { looksSecret } from './codebase-accounts.ts'
+import { safeDescription } from './account-description.ts'
+import { passwordStateOf, type PasswordState } from './platform-password.ts'
 
 // order o4029: the Accounts page's "Accounts" tab: the SAME page as the CRM's Code > Accounts (the platform accounts: Vercel, Supabase, GitHub...), kept in the NEW Supabase project (db/accounts/0004 and
 // 0005) and reached through the agent. The pure part: the shape the page gets (a whitelist; there is no password or token in it, only that a password is stored), the platform names the CRM shows, and the
@@ -21,7 +23,7 @@ export interface PlatformCodebaseLink {
   parts: ('be' | 'fe')[]
 }
 
-/** One platform account as the page sees it. No password, no token, no key: only THAT a password is stored. */
+/** One platform account as the page sees it. F-293 (his decision "A", 18 Nov 2026): a password he typed is kept SEALED on the Server and is never in a row: the row says only WHETHER one is stored here (`passwordState`) and when it was last changed. No token, no key. */
 export interface PlatformAccountRow {
   id: string
   /** The platform's key as the CRM keeps it ("vercel") and the words for it ("Vercel"). */
@@ -43,7 +45,12 @@ export interface PlatformAccountRow {
   /** The number is linked to a contact (else "Not in Contacts"), and that contact is switched off ("Contact disabled"). */
   contactLinked: boolean
   contactDisabled: boolean
+  /** The CRM says a password exists for this account (copied from the CRM; the app never imports the password itself). */
   hasPassword: boolean
+  /** F-293: what this app holds: 'stored' (a sealed password is here), 'disabled' (here but switched off), 'crm-only' (the CRM has one, this app has none), 'none'. Never the password. */
+  passwordState: PasswordState
+  /** F-293: when the stored password was last set, replaced, disabled or enabled (an ISO time); null when there is none. The person who did it is in the database and the agent's log, never on the page. */
+  passwordChangedAt: string | null
   disabled: boolean
   /** Slice D (disable, never delete): when it was disabled (an ISO time), for "disabled <date>"; absent when it is not disabled or the time is not known. */
   disabledAt?: string
@@ -53,6 +60,9 @@ export interface PlatformAccountRow {
   authenticatorEmail: string | null
   authenticatorApp: string | null
   authenticatorNote: string | null
+  /** Order obf7c: the account's Description (the `note` column). Shown on the row and in the modal; null when empty OR when it looks like a secret (then `descriptionHidden` is true and the page says so: the stored text is kept as it is). */
+  description: string | null
+  descriptionHidden: boolean
 }
 
 import type { NotConnected } from './email-accounts.ts'
@@ -90,6 +100,7 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
     codebases.sort((a, b) => a.name.localeCompare(b.name))
     // Slice D: the time it was disabled, only for a disabled row and only when the time is known (computed once, so the type is string, never string | null).
     const disabledAt = r.disabled === true ? isoOf(r.disabledAt) : null
+    const described = safeDescription(r.description)
     rows.push({
       id,
       platform,
@@ -106,6 +117,8 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
       contactLinked: r.contactLinked === true,
       contactDisabled: r.contactDisabled === true,
       hasPassword: r.hasPassword === true,
+      passwordState: passwordStateOf({ hasAppPassword: r.hasAppPassword === true, passwordDisabled: r.passwordDisabled === true, hasPassword: r.hasPassword === true }),
+      passwordChangedAt: r.hasAppPassword === true ? isoOf(r.passwordChangedAt) : null,
       disabled: r.disabled === true,
       ...(disabledAt === null ? {} : { disabledAt }),
       updatedAt: isoOf(r.updatedAt),
@@ -113,6 +126,8 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
       authenticatorEmail: clean(r.authenticatorEmail, 200),
       authenticatorApp: clean(r.authenticatorApp, 40),
       authenticatorNote: clean(r.authenticatorNote, 200),
+      description: described.text,
+      descriptionHidden: described.hidden,
     })
   }
   return rows.sort((a, b) => Number(a.disabled) - Number(b.disabled) || a.platformName.localeCompare(b.platformName) || (a.name ?? a.signInEmail ?? '').localeCompare(b.name ?? b.signInEmail ?? ''))
@@ -176,6 +191,7 @@ export function filterPlatformRows(rows: readonly PlatformAccountRow[], f: Platf
       (r.signInEmail ?? '').toLowerCase().includes(q) ||
       (r.phone ?? '').toLowerCase().includes(q) ||
       (r.contactName ?? '').toLowerCase().includes(q) ||
+      (r.description ?? '').toLowerCase().includes(q) ||
       r.codebases.some(c => c.name.toLowerCase().includes(q))
     )
   })
