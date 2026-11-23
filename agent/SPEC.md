@@ -3496,7 +3496,9 @@ agent, on HTTP, on every WebSocket and in the chats' tools, never only hidden in
   sbskrrt's (idempotent, logged by count). What the open app makes is sbskrrt's; a chat's tools act as its owner; a member passes its
   page's person to the hub (`by`) and the hub decides as for a page of its own.
 - **Rights** (`agentic/access.ts`): owner = everything; shared `type` = read and type into a RUNNING chat; `view` = read; sbskrrt =
-  everything. Start, stop, restart, move, rename, tune and share are the owner's or sbskrrt's; a floor is changed by its maker (or
+  everything. An administrator (the first owner, or a second one in owners.json) who is named in a chat's share list sees that chat under
+  Shared AND All, with owner powers (`chatRights` gives `{access:'shared', can:'owner'}`: only the label changes); a chat that does not
+  name him stays `all`. It holds for the first owner too when someone else's chat names him. Start, stop, restart, move, rename, tune and share are the owner's or sbskrrt's; a floor is changed by its maker (or
   sbskrrt), deleted only by someone who owns every chat on it. `POLICY` lists every route of the agentic table with its rule; a route
   not listed is for sbskrrt only, and `access.test.ts` holds POLICY and the table equal. Lists, `/events`, previews, runs, transcripts
   and the live states are filtered per connection; floors with nothing visible are hidden; a share taken back closes the sharee's open

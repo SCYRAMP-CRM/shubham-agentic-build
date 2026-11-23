@@ -4689,6 +4689,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-321",
+    "title": "An owner who is named in a chat's share list sees that chat under Shared as well as All (Akash's Shared tab shows 0 today)",
+    "said": "(The owners, typed in the overlay on 23 Nov, relayed by the overlay Assistant as order o20ec; HIS WORDS, exactly as relayed:) \"urgent basis please share the agentic platform to aksh\" and \"he can see it in his chats in All tab but he should also see in Shared, don't use my UI\". (Akash Kambli, typed in the Lead's chat the same day:) \"i have logged in as Akash kambli but i ma seeing shubhams chat also in live assistant. Please fix it so i can work on it also let me know if update is needed so i will do that\"",
+    "added": "2026-11-23",
+    "notes": [
+      "2026-11-23 (Lead): ORDER o20ec, logged 2026-11-23 14:44 IST (observed 09:14:58Z). FOUND (checked in the code and the live data, nothing changed): sharing is PER CHAT (FloorAgent.sharedWith, POST /floors/:fid/agents/:aid/share); there is no floor-level share. All 19 chats of the floor \"Agentic Platform\" are ALREADY shared to akash_k (can type; also to Akki). The Shared tab filters by the access label the agent puts on each chat, and chatRights (shared/auth.ts) labels any ADMINISTRATOR (both owners) \"all\" with can \"owner\" BEFORE it reads the share list, so the second owner's Shared tab is always 0 whatever is shared. Proven with the app's own function: admin named in the list -> {access:\"all\", can:\"owner\"}; not an admin -> {access:\"shared\", can:\"view\"}. He chose, asked by the Lead, \"Let me work in them\" (Shubham's chats under Shared for him AND he can type in them: as an owner he already types in them under All; the change keeps can \"owner\"). THE LEAD'S PLAN: one small server change in chatRights: an administrator who is not the chat's owner but is named in its share list gets {access:\"shared\", can:\"owner\"}; All still lists every chat; no data change. OWNER: Agent 3 (worktree wt/f-admin-sharee-shared, brief C:/saw/f-admin-sharee-shared-20261123-BRIEF.md), Agent 14 reads. NEEDS A NEW PUBLISH (Shubham's separate yes) and then an Update; build 2026.11.23-0844 is already published without it. STATUS: logged; in work; nothing ticked."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

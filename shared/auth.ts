@@ -147,8 +147,8 @@ export interface ShareRequest {
 }
 
 /**
- * Why this viewer sees a chat: 'mine' it is theirs; 'shared' someone shared it with them; 'all'
- * they see it only because they see everything (sbskrrt), or because the app is open as before
+ * Why this viewer sees a chat: 'mine' it is theirs; 'shared' someone shared it with them (an administrator named in the share list too: he keeps his 'owner' power, only the label says shared); 'all'
+ * they see it only because they see everything (sbskrrt, a second owner), or because the app is open as before
  * (require 'off' and not signed in: every chat 'all').
  */
 export type ChatAccess = 'mine' | 'shared' | 'all'
@@ -190,7 +190,9 @@ export function chatRights(
 ): { access: ChatAccess; can: ChatCan } | null {
   if (!person) return { access: 'all', can: 'owner' }
   if (owner && owner.id === person.id) return { access: 'mine', can: 'owner' }
-  if (admins.includes(person.id)) return { access: 'all', can: 'owner' }
+  // An administrator (the first owner, or a second one in owners.json) keeps every owner power on every chat. If he is ALSO named in this chat's share list (Akash's request, 23 Nov 2026: "he can see it in his chats in All tab but he
+  // should also see in Shared"), only the LABEL changes: it is under Shared as well as All (All lists everything), so his Shared tab counts the chats shared with him. Not named: 'all', as before.
+  if (admins.includes(person.id)) return sharedWith.some(s => s.id === person.id) ? { access: 'shared', can: 'owner' } : { access: 'all', can: 'owner' }
   const share = sharedWith.find(s => s.id === person.id)
   if (share) return { access: 'shared', can: share.can === 'type' ? 'type' : 'view' }
   return null
