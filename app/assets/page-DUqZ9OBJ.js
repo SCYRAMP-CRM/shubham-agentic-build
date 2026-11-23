@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-Cnl_1TZk.js";function t(){e(`/wpages`)}export{t as default};

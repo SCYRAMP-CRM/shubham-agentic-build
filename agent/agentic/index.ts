@@ -83,7 +83,7 @@ import { createChatPool, findClaude, type ChatInfo, type ChatPool, type ChatPool
 import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
-import { createUiBridge, type UiWho } from './ui-bridge.ts'
+import { createUiBridge, uiWhoOf, type UiWho } from './ui-bridge.ts'
 import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
 import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, untappedMark, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress, type Untapped } from './orders.ts'
 import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
@@ -985,8 +985,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   o.featureAccess?.useShares(c => !!c.person && !access.isAdmin(c) && allFloors().some(f => access.floorSeen(c, f)))
   // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
   const ui = createUiBridge()
-  /** Order o355e (+ oe3b1): whose page or call it is, for the screen bridge: the signed-in person (or nobody), and an administrator or not. */
-  const uiWho = (c: Caller): UiWho => ({ person: c.person?.id ? c.person.id.toLowerCase() : null, admin: access.isAdmin(c) })
+  /**
+   * Order o355e (+ oe3b1): whose page or call it is, for the screen bridge: the signed-in person (or nobody), and whether it is the owner of the app's. F-322 (F322-1): the owner of the app's scope is the FIRST
+   * owner by id (and the open app, and the PC's own program: access.ownerOf), not every administrator: a second owner's pages and his own Assistant are his own scope (ui-bridge.ts uiWhoOf).
+   */
+  const uiWho = (c: Caller): UiWho => uiWhoOf(c.person?.id, access.isAdmin(c), isFirstOwner(c))
   /** One event as this caller may see it, as text; null when it is not theirs at all. */
   function eventFor(e: AgenticEvent, c: Caller): string | null {
     // Order o9465: the task list's changes also go to someone it is open to (Settings › Access).
@@ -5693,6 +5696,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     o.auth?.deny(c, 403, 'admin-only', where)
     throw authError(403, words, 'admin-only')
   }
+  /** F-322: what a second owner is told by the heartbeat's routes (they wake the hub's Assistant, which is the first owner's). */
+  const HEARTBEAT_WORDS = "The heartbeat is for the first owner of this app: it wakes his Assistant. Your own Assistant is My Assistant."
   /**
    * F-309 N1: the owner's view of the agent notebooks, and THE ONLY place `notebooks.asOwner(` is called. A chat's key (an agent calling these routes itself) is refused, and so is every
    * administrator who is not the first owner by id: the notebooks hold what an agent was told, a second owner included does not read or erase them. The six /notebooks routes call this.
@@ -8507,17 +8512,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-078: the heartbeat's setting and its last and next beat (the overlay shows them); a beat now.
     ['GET', /^\/heartbeat$/, () => heartbeat.state()],
     // F-078: the overlay was opened: the morning summary goes now when it is the first time after 06:00 today.
-    ['POST', /^\/heartbeat\/morning$/, async () => ({ sent: await heartbeat.morning({ atOpen: true }) })],
+    // F-322: the heartbeat and the morning summary wake the hub's Assistant, which is the FIRST owner's (a second owner has his own My Assistant): his switch, his interval, a beat now and the summary are the first owner's
+    // by his id, the same 403 a second owner gets for Quick and live talk. Reading its state (GET) stays the owners'.
+    ['POST', /^\/heartbeat\/morning$/, async (_, r) => (firstOwnerOnly(callerOf(r), 'POST /heartbeat/morning', HEARTBEAT_WORDS), { sent: await heartbeat.morning({ atOpen: true }) })],
     [
       'PATCH',
       /^\/heartbeat$/,
       (_, r) => {
+        firstOwnerOnly(callerOf(r), 'PATCH /heartbeat', HEARTBEAT_WORDS)
         if (!isObject(r.body)) throw apiError(400, 'Expected {enabled?, intervalMin?}')
         if (r.body.intervalMin !== undefined && !Number.isInteger(r.body.intervalMin)) throw apiError(400, 'intervalMin is a whole number of minutes (1 to 120)')
         return heartbeat.set({ enabled: typeof r.body.enabled === 'boolean' ? r.body.enabled : undefined, intervalMin: typeof r.body.intervalMin === 'number' ? r.body.intervalMin : undefined })
       },
     ],
-    ['POST', /^\/heartbeat\/beat$/, async () => {
+    ['POST', /^\/heartbeat\/beat$/, async (_, r) => {
+        firstOwnerOnly(callerOf(r), 'POST /heartbeat/beat', HEARTBEAT_WORDS)
         await heartbeat.beat()
         return heartbeat.state()
       }],
@@ -8559,7 +8568,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined, access.ownerOf(callerOf(r))) })],
     // Order oa09e: the overlay asks for its Assistant here (a member passes it on: the hub decides, from its whole list). His only (POLICY).
-    ['POST', /^\/assistant$/, (_, r) => ensureHubAssistant(r.body, access.ownerOf(callerOf(r)))],
+    // F-322 (Akash's request, 23 Nov 2026): the hub's Assistant is the FIRST owner's by his id. A second owner opens his own My Assistant (POST /own-assistant), so this route gives him the usual 403 words and never hands
+    // him Shubham's chat, nor makes a hub Assistant as him. The open app and the PC's own program are the first owner (access.ownerOf): unchanged.
+    ['POST', /^\/assistant$/, (_, r) => (firstOwnerOnly(callerOf(r), 'POST /assistant', "The hub's Assistant is for the first owner of this app. Your own Assistant is My Assistant."), ensureHubAssistant(r.body, access.ownerOf(callerOf(r))))],
     // oc65c: the caller chooses a saved binding of their OWN Assistant, never a filesystem path or another person.
     ['GET', /^\/assistant-history$/, (_, r) => {
       const index = assistantHistory(callerOf(r))

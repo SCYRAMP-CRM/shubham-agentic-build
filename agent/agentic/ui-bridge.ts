@@ -13,10 +13,14 @@ import { apiError, type WsSocket } from '../api.ts'
 // Order o355e (+ o2c59, oe3b1; Shubham: "When people use their screen they will be using localhost"): pages from EVERY origin reach this bridge (a
 // member PC passes its own pages' sockets on to the Server's, index.ts 'ui-page'), and every page and every call belongs to a PERSON. A page is
 // tagged with whoever is signed in on it; a call with its chat's owner. A call drives only pages in its own scope: a person's own pages, never
-// another person's; the owner of the app (an administrator, and a chat with no owner, which is his) shares one scope with the unsigned pages of
-// his own PCs. F-219's device choice (order od371) is kept per scope: two of HIS devices open asks HIM, never because of someone else's page.
+// another person's; the owner of the app (the FIRST owner by id, and a chat with no owner, which is his) shares one scope with the unsigned pages of
+// his own PCs. F-322 (F322-1, Agent 14's finding): a SECOND owner is an administrator but not the owner of the app: he is a person here like any other, so his pages and
+// his own Assistant meet only each other and never Shubham's. F-219's device choice (order od371) is kept per scope: two of HIS devices open asks HIM, never because of someone else's page.
 
-/** Whose page or call this is: the signed-in person's id (null: nobody signed in, the open app on one of his PCs), and an administrator or not. */
+/**
+ * Whose page or call this is: the signed-in person's id (null: nobody signed in, the open app on one of his PCs), and whether it is the OWNER OF THE APP's (`admin`: the first
+ * owner by id, the open app, the PC's own program; NOT every administrator: a second owner is a person, see uiWhoOf).
+ */
 export interface UiWho {
   person: string | null
   admin: boolean
@@ -25,7 +29,16 @@ export interface UiWho {
 /** The owner of the app: a page or a call that says no person (the open app, tests, the chats there were before people). */
 export const UI_OWNER: UiWho = { person: null, admin: true }
 
-/** The scope a page or a call is in: the owner's (every administrator, and the open app) or one person's. Null: none (refused). */
+/**
+ * F-322 (F322-1): who a caller is for the screen bridge. THE ONE PLACE this is decided (agentic/index.ts uiWho calls it for every page's sign-in and every chat's owner): the owner of the app's scope is for
+ * the FIRST owner by id, the open app (nobody signed in) and the PC's own program (`isFirstOwner`: access.ownerOf is Shubham); any other administrator, a second owner, is a person with his own scope
+ * (`person:<id>`), exactly as staff are. `isAdmin` alone never gives the owner's scope.
+ */
+export function uiWhoOf(personId: string | null | undefined, isAdmin: boolean, isFirstOwner: boolean): UiWho {
+  return { person: personId ? personId.toLowerCase() : null, admin: isAdmin && isFirstOwner }
+}
+
+/** The scope a page or a call is in: the owner of the app's (the first owner, and the open app) or one person's. Null: none (refused). */
 export function uiScope(w: UiWho): string | null {
   if (w.admin) return '@owner'
   return w.person ? `person:${w.person.toLowerCase()}` : null

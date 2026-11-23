@@ -4700,6 +4700,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-322",
+    "title": "The floating (live) Assistant has its own chat and history for each login: a second owner no longer opens Shubham's Assistant",
+    "said": "(Akash Kambli, second owner, typed in the Lead's chat on 23 Nov; his words exactly, spelling as typed:) \"i am still seeing the chat of Shubham. i want the Live Assistant to have idiividual chat history and chat for each login not shared with all.\" (his earlier line the same day, which the Lead first read as a Shared-tab question, see F-321:) \"i have logged in as Akash kambli but i ma seeing shubhams chat also in live assistant. Please fix it so i can work on it also let me know if update is needed so i will do that\"",
+    "added": "2026-11-23",
+    "notes": [
+      "2026-11-23 (Lead): logged 2026-11-23 15:55 IST (observed 10:25:38Z). THE LEAD'S MISREADING, SAID PLAINLY: his first line was read as \"show the shared chats under Shared\" and answered with F-321 (the Shared-tab label; correct, live in build 2026.11.23-1514, 19 chats listed for akash_k by data); his second line shows he meant the floating Assistant itself. FOUND (code read, nothing changed): on the page `useIsOwner()` is true for BOTH owners (src/auth/session.ts), so the full overlay mounts AssistantHost, whose chat is found by `POST /assistant` as the hub's ONE Orchestrator (\"Assistant\" floor, owner sbskrrt): a second owner opens Shubham's Assistant and its whole history. Everyone who is not an owner already has an individual Assistant (F-162 / F-300: floor \"My Assistant\", duty person-assistant, POST /own-assistant, src/overlay/own-assistant.ts + PersonAssistant.tsx). The server ALREADY supports an owner's own \"My Assistant\" (index.ts: an administrator's own is an owner's chat and keeps the owner's launch and tools; isStaffAssistant is false for admins), and Akash ALREADY has one (floor \"My Assistant\", made 21 Nov, engine claude, with a session). The page never opens it for owners (person-assistant-availability.ts excludes canSeeAll). HIS CHOICE, asked by the Lead (single choice): \"My own Assistant, full powers\" (his own chat and history with owner tools; Shubham's Assistant not shown to him there; Quick/live talk stays Shubham's by id). THE LEAD'S PLAN: (1) the overlay for a second owner (an owner who is not the first owner, `useIsFirstOwner` false) opens his own My Assistant (pickOwnAssistant + ensureOwnAssistant) instead of the Orchestrator; the first owner and the open app are unchanged; (2) the server refuses a second owner the hub-Assistant find (POST /assistant) so the page and any other caller cannot hand him Shubham's chat; (3) tests and mutants; one read by Agent 14. OPEN, NOT DECIDED (for Shubham): a second owner still sees every chat, Shubham's Assistant included, on the Agents page under All (his own earlier order o4e4e/o2f32: second owner is an owner); hiding it there is a separate access choice. OWNER: Agent 7 (overlay) with Agent 3 if the server part is separate. NEEDS a new publish (Shubham's separate yes) and an Update. STATUS: logged; in work; nothing ticked."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
