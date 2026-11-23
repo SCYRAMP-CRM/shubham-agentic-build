@@ -87,6 +87,8 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   app_send_to_chat: 'relay',
   // Everything that acts: refused.
   broadcast_to_chats: 'refuse',
+  // F-316 T4: a message to another instance names no session id, so it cannot wait as a card with its exact target: while a spoken order holds the chat it is refused, like a broadcast.
+  message_instance: 'refuse',
   crm_write: 'refuse',
   crm_goal_add: 'refuse',
   crm_goal_update: 'refuse',

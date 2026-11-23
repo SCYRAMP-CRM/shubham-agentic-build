@@ -166,6 +166,8 @@ import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { templateName } from '../../shared/agent-template.ts'
+import { INSTANCE_TEXT_MAX, instanceHeader } from '../../shared/instance-message.ts'
+import { createInstanceMessages, instanceTextProblem } from './instance-messages.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
@@ -311,6 +313,8 @@ const NEEDS_SERVER = new Set([
   'notebook_add',
   'notebook_search',
   'notebook_read',
+  // F-316 T4: messages between instances are found by the notebook table, which lives on the Server.
+  'message_instance',
   'prepare_send',
   'crm_whoami',
   'crm_members',
@@ -4105,6 +4109,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const pairLast = new Map<string, number>()
   const targetHits = new Map<string, number[]>()
   const broadcastLast = new Map<string, number>()
+  /** F-316 T4: the hops and the per-minute counts of messages between instances of a template (instance-messages.ts); in memory, so a restart forgets them. */
+  const instanceMessages = createInstanceMessages()
   /**
    * F-297: the checks a STAFF send asks again while it is delivered (its person's switch, its policy, the person's right on the target), kept by the Caller object THAT send passes as `actor`; deliveryAcl and typeInto read
    * them. A WeakMap, so nothing is kept after the send, and only staffSendToChat ever registers one: every other caller is asked nothing more than before.
@@ -6596,6 +6602,66 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const nb = notebooks.forChat(floor, agent)
         if (!nb.ok) throw apiError(409, nb.why)
         return nb.chat.read(typeof args.ref === 'string' ? args.ref : '')
+      }
+      // F-316 T4 (Shubham's order o1103): an instance messages ANOTHER instance of the SAME template. Both ends are found by the notebook's table (the one function templateOf), never by the call: the caller is
+      // this chat, the receiver is named by its agent name (and floor, when two floors have that name) among the instances of the caller's own template. OFF until the owner switches messages on for that template.
+      // The typing path is send_to_chat's own (the owner's right to type, a prompt or a draft on the screen, the pair and target cooldowns, typeInto and its F-302 doors); the hop count, the per-minute counts and
+      // the minimum of three words are instance-messages.ts; one `instance-message` floor event says who wrote to whom, the hop and the number of characters, never a word.
+      case 'message_instance': {
+        // notebook-door: K13
+        const nb = notebooks.forChat(floor, agent)
+        if (!nb.ok) throw apiError(409, "This chat is not an instance of a template whose notebook the owner has switched on, so it has no instances to message. Nothing was sent.")
+        const group = nb.chat.messaging()
+        if (!group) throw apiError(409, `The owner has not switched on messages between the instances of ${nb.chat.template.name}. Nothing was sent.`)
+        const wantName = typeof args.to === 'string' ? args.to.trim().toLowerCase() : ''
+        if (!wantName) throw apiError(400, `to is missing: the name of the instance (${group.peers.slice(0, 30).map(p => p.agent.name).join(', ') || 'there is none running'}).`)
+        const body = text(args.text, 'text', INSTANCE_TEXT_MAX)
+        const tooShort = instanceTextProblem(body)
+        if (tooShort) throw apiError(400, tooShort)
+        const wantFloor = typeof args.floor === 'string' ? args.floor.trim().toLowerCase() : ''
+        const named = group.peers.filter(p => p.agent.name.trim().toLowerCase() === wantName && (!wantFloor || p.floorId === args.floor || p.floorName.trim().toLowerCase() === wantFloor))
+        if (!named.length) throw apiError(404, `No instance of ${group.template.name} called "${String(args.to).slice(0, 60)}"${wantFloor ? ` on floor "${String(args.floor).slice(0, 60)}"` : ''}. The instances: ${group.peers.slice(0, 30).map(p => p.agent.name).join(', ') || 'none'}.`)
+        if (named.length > 1) throw apiError(409, `${named.length} instances of ${group.template.name} are called "${named[0].agent.name}": on floors ${named.slice(0, 10).map(p => `"${p.floorName}"`).join(', ')}. Say which with floor.`)
+        const peer = named[0]
+        const toSid = peer.agent.sessionId
+        const here = toSid ? whereAll()[toSid] : undefined
+        if (!toSid || !here) throw apiError(409, `${peer.agent.name} (floor "${peer.floorName}") is not running right now. Nothing was sent.`)
+        // Never a person's own Assistant or a chat held to a staff policy: those chats are closed to every sibling's words (F-297, o7e6d).
+        if (isPersonAssistant(peer.agent) || chats.info(toSid)?.policy) throw apiError(403, `${peer.agent.name} is a closed chat: nothing is typed into it by another chat. Nothing was sent.`)
+        mayOn(toSid, 'type')
+        // M1: a chat at a prompt is not pressed Enter on, and a refusal here starts no count.
+        if (atPrompt(toSid)) throw apiError(409, promptWords(toSid))
+        if (!joinsDraft(toSid) && hasDraft(toSid)) throw apiError(409, draftWords(toSid))
+        const gate = instanceMessages.take(sid, toSid, group.template.id)
+        if (!gate.ok) throw apiError(429, gate.words)
+        let undoPair: () => void
+        try {
+          undoPair = relayAllowed(sid, toSid)
+        } catch (e) {
+          gate.undo()
+          throw e
+        }
+        const undo = () => {
+          gate.undo()
+          undoPair()
+        }
+        const header = instanceHeader({ agent: agent.name, template: group.template.name, floor: floor.name, hop: gate.hop })
+        if (!(await typeIntoOrUndo(undo, { sessionId: toSid, id: here.id }, neutralizeMarks(`${header} ${body}`), undefined, me))) throw apiError(409, atPrompt(toSid) ? promptWords(toSid) : 'That chat stopped before the message reached it')
+        gate.landed()
+        recordFloorEvent({
+          kind: 'instance-message',
+          by: me.person ? { id: me.person.id, name: me.person.name } : null,
+          chat: sid.slice(0, 8),
+          floor: { id: floor.id, name: floor.name },
+          agent: { id: agent.id, name: agent.name },
+          peer: { id: peer.agent.id, name: peer.agent.name },
+          peerFloor: { id: peer.floorId, name: peer.floorName },
+          template: { id: group.template.id, name: group.template.name },
+          hop: gate.hop,
+          chars: body.length,
+        })
+        log?.info(`${agent.name} → ${peer.agent.name} (instances of ${group.template.name}), hop ${gate.hop}: a message`)
+        return `Sent to ${peer.agent.name} (floor "${peer.floorName}") as hop ${gate.hop} of at most 3. Do not wait for an answer and do not ask it to answer: what comes back arrives as its own message, and only if it has something new.`
       }
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
       case 'memory_recall': {

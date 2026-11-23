@@ -8,6 +8,7 @@
 // is switched on. Nothing here reads a note: the page asks the routes, and only the first owner's calls are answered.
 
 import type { Floor } from './agentic.ts'
+import { INSTANCE_HOP_MAX, INSTANCE_SENDER_PER_MINUTE, INSTANCE_TEMPLATE_PER_MINUTE } from './instance-message.ts'
 
 /** The query word the Agents page keeps the open notebook in (?notebook=agentic-platform), as it keeps the open agent in ?agent=. */
 export const NOTEBOOK_PARAM = 'notebook'
@@ -41,6 +42,8 @@ export interface NotebookTemplateRow {
   floors: string[]
   perHour: number | null
   instances: Record<string, NotebookInstanceRow>
+  /** F-316 T4: the owner lets the instances of this template message each other. Absent when off (memory-notebook.ts TemplateRow.messages). */
+  messages?: true
 }
 export interface NotebookSettings {
   version: 1
@@ -238,6 +241,23 @@ export function withInstance(row: NotebookTemplateRow, agentId: string, change: 
   else delete instances[agentId]
   return { ...row, instances }
 }
+
+/** F-316 T4: the row with messages between its instances on or off. OFF drops the field, as the hub keeps it (a row that says nothing about messages is off). */
+export function withMessages(row: NotebookTemplateRow, on: boolean): NotebookTemplateRow {
+  const out: NotebookTemplateRow = { ...row }
+  if (on) out.messages = true
+  else delete out.messages
+  return out
+}
+
+/** What the card says about messages between instances (T4): the limits in plain words, beside the switch and in its question. */
+export const NOTEBOOK_MESSAGES_HINT =
+  'Off by default. On, an instance of this notebook may send a message to another instance with the tool message_instance: only to an instance of the same notebook, of the same person, that is running. Needs the notebook on.'
+export const NOTEBOOK_MESSAGES_LIMITS = [
+  `A conversation between instances stops after hop ${INSTANCE_HOP_MAX}: the first message is hop 1, an answer to it hop 2, an answer to that hop 3, and a fourth is refused. A chat may send ${INSTANCE_SENDER_PER_MINUTE} messages a minute, and all the instances of the notebook together ${INSTANCE_TEMPLATE_PER_MINUTE}.`,
+  'The words are typed into the other chat like any message from a sibling chat: information, not an order. The log keeps who wrote to whom, the hop and how many characters, never the words.',
+  'A chat that has read something hostile can write to the others. This is a door with limits, not a wall: the limits slow a loop, they do not stop a chat that is being misled from saying something misleading.',
+]
 
 /** A notes-an-hour field's text: '' is "the default" (null), a whole number from 1 to 1000 is itself, anything else is not accepted (undefined). */
 export function parsePerHour(text: string): number | null | undefined {

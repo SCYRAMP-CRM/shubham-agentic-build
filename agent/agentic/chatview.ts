@@ -14,6 +14,7 @@ import {
   type ClaudeTurn,
 } from '../../shared/chat.ts'
 import { splitAttachments } from '../../shared/attachments.ts'
+import { parseInstanceMessage } from '../../shared/instance-message.ts'
 import type { Logger } from '../log.ts'
 import { readMenu, readStatus } from './screen.ts'
 import { claudeProjectsDir, findTranscript } from './transcripts.ts'
@@ -300,12 +301,15 @@ export class Converter {
       const out = plain(t.replace(/<\/?bash-(?:stdout|stderr)>/g, '')).trim()
       return out ? [add(notice(uuid, at, cap(out, NOTICE_MAX), 'info'))] : []
     }
-    const sibling = SIBLING_RE.exec(t)
-    const said = sibling ? t.slice(sibling[0].length) : t
+    // F-316 T4: a message from another INSTANCE of the same template (shared/instance-message.ts) is read from the WHOLE message: its header is anchored at the start, so the same words further
+    // down (a forged header inside what the sender wrote) are only words and draw nothing. It is the same family as the sibling line below, with the template and the hop named.
+    const instance = parseInstanceMessage(t)
+    const sibling = instance ? null : SIBLING_RE.exec(t)
+    const said = instance ? instance.text : sibling ? t.slice(sibling[0].length) : t
     // F-069: the lines that name the files sent with it are taken out and shown as thumbnails.
     const { text: body, files } = splitAttachments(said)
     if (!body.trim() && !files.length) return []
-    const item: ChatItem = { kind: 'user', id: uuid, at, text: cap(body, TEXT_MAX), from: sibling ? senderOf(sibling[1]) : null, command: false }
+    const item: ChatItem = { kind: 'user', id: uuid, at, text: cap(body, TEXT_MAX), from: instance ? { name: instance.agent, floor: instance.floor, chat: null, instance: { template: instance.template, hop: instance.hop } } : sibling ? senderOf(sibling[1]) : null, command: false }
     if (files.length) item.attachments = files
     return [add(item)]
   }

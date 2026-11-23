@@ -17,7 +17,9 @@ import { createAuditFile } from './audit-file.ts'
 // WHERE ITS BOUNDARY IS (so nobody reads it as more): it records a floor's STRUCTURE (made, removed, adopted, an agent added, dropped or moved, a share changed,
 // an Assistant made). It does NOT record what happens INSIDE a chat: an interactive menu answered on a chat's own screen (a model changed that way, found on
 // 18 Nov by Agent 18, is not here), a chat's tools, what was typed, an engine switch, a floor's rename or its preamble; and it is this PC's own log (a member PC
-// keeps its own for the floors it holds itself).
+// keeps its own for the floors it holds itself). ONE exception, on purpose (F-316 T4, Shubham's order o1103): a message from one instance of a template to another
+// (the tool message_instance) writes one `instance-message` line, because it is the one tool that lets a chat that has read something hostile write to up to nineteen others, and the owner
+// must be able to see who wrote to whom: the two chats, their floors, the template, the hop and the number of characters, NEVER a word of the message.
 
 export type FloorEventKind =
   | 'floor-created'
@@ -34,6 +36,8 @@ export type FloorEventKind =
   | 'agent-copied'
   | 'template-stamped'
   | 'template-unstamped'
+  // F-316 T4: one instance of a template messaged another (who to whom, the hop, how many characters; NEVER the words).
+  | 'instance-message'
 
 export interface FloorEventRef {
   id: string
@@ -79,6 +83,11 @@ export interface FloorEvent {
   /** F-316, agent-copied: the chat it was copied from, and its floor. */
   source?: FloorEventRef
   sourceFloor?: FloorEventRef
+  /** F-316 T4, instance-message: the instance that received it and its floor (the sender is `agent` on `floor`), the hop it went out at, and how many characters it had. Never the words. */
+  peer?: FloorEventRef
+  peerFloor?: FloorEventRef
+  hop?: number
+  chars?: number
 }
 
 export type FloorEventInput = Omit<FloorEvent, 'at'>
@@ -126,6 +135,10 @@ export function floorEventOf(e: FloorEventInput, at: string): FloorEvent {
   set('template', ref(e.template))
   set('source', ref(e.source))
   set('sourceFloor', ref(e.sourceFloor))
+  set('peer', ref(e.peer))
+  set('peerFloor', ref(e.peerFloor))
+  set('hop', count(e.hop))
+  set('chars', count(e.chars))
   return out
 }
 
@@ -156,6 +169,7 @@ export function describeFloorEvent(e: FloorEventInput): string {
     case 'agent-copied': return `${who} added "${e.agent?.name ?? '?'}" to ${on} as a copy of "${e.source?.name ?? '?'}" on floor "${e.sourceFloor?.name ?? '?'}", an instance of template "${e.template?.name ?? '?'}"${through}`
     case 'template-stamped': return `${who} made ${e.count ?? '?'} chats on ${on} instances of template "${e.template?.name ?? '?'}"`
     case 'template-unstamped': return `${who} took ${e.count ?? '?'} chats on ${on} out of template "${e.template?.name ?? '?'}"`
+    case 'instance-message': return `${who}'s chat "${e.agent?.name ?? '?'}" on ${on} sent a message to "${e.peer?.name ?? '?'}" on floor "${e.peerFloor?.name ?? '?'}", both instances of template "${e.template?.name ?? '?'}" (hop ${e.hop ?? '?'}, ${e.chars ?? '?'} characters; the words are not recorded)${through}`
   }
 }
 

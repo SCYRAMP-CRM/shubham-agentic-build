@@ -13,6 +13,7 @@
  */
 
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
+import { AGENTS_NEW, MEMORY } from './blank-pages.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 import { QUICK_ROUTE } from './quick-page.ts'
 
@@ -74,6 +75,9 @@ export const FEATURES: readonly Feature[] = [
   // Order obb81 (goal "Agents tab", step 1): every agent's definition, notes, memory files and last replies. Starts as Only me like every row; its
   // look at an agent's memory and replies (the brain route) stays the owner's even when the page is opened to someone (it is in no rule below).
   { key: 'agent-directory', group: 'pages', label: 'Agents', blurb: 'Every agent: what it does, edited here; its notes, memory files and last replies stay yours.', pages: [AGENT_DIRECTORY_ROUTE] },
+  // F-320 (his orders ofe1f, o67e8): two BLANK pages, a row each, Only me like every page.
+  { key: AGENTS_NEW.key, group: 'pages', label: AGENTS_NEW.label, blurb: AGENTS_NEW.access, pages: [AGENTS_NEW.route] },
+  { key: MEMORY.key, group: 'pages', label: MEMORY.label, blurb: MEMORY.access, pages: [MEMORY.route] },
   { key: 'old-reader', group: 'pages', label: 'Live talking', blurb: 'Questions about the old app, answered in seconds (both Live talking pages).', pages: [OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE] },
   { key: 'pc-control', group: 'pages', label: 'PC control', blurb: 'The PCs and their tabs (each tab below is chosen on its own).', pages: ['/pc-control'] },
   { key: 'browser', group: 'pages', label: 'Browser', blurb: 'A browser on the Server.', pages: ['/browser'], locked: 'It is your browser on the Server, with your sign-ins.' },
@@ -228,8 +232,10 @@ export const ROUTES: readonly RouteRule[] = [
   r('GET', '\\/pc-resources\\/pcs\\/[^/]+', ['pc-resources']),
   r('GET', '\\/pc-deps\\/pcs\\/[^/]+', ['pc-deps']),
   // Shubham's order ob12b: the Build page for every signed-in person: what they may READ (an allow-list, never /build/info) and the Update press (the agent's own rights and guards decide who and when).
-  // NOTHING else under /build has a rule: /build/info, /build/check, /build/publish, /build/update-cancel and /build/update-policy stay the owner's.
+  // F-318 (Shubham's orders oa668 and oa79a): and the History tab's read, which is itself an allow-list (a person gets four fields per published build; the owner's commit titles are the agent's own owner-or-person decision, not this row's).
+  // NOTHING else under /build has a rule: /build/info, /build/check, /build/publish, /build/update-cancel, /build/update-policy and the edit of a build's note (PUT /build/history/:id/note) stay the owner's.
   r('GET', '\\/build\\/status', ['build']),
+  r('GET', '\\/build\\/history', ['build']),
   r('POST', '\\/build\\/update', ['build']),
   // Tasks (his one list), the old-app reader's page, the phone apps, voice typing.
   r('GET', `${A}\\/tasks`, ['tasks']),

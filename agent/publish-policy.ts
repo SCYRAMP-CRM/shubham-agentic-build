@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { SBSKRRT_ID } from '../shared/auth.ts'
-import type { PublishActor, PublishAudit, PublishChecks, PublishRequest } from '../shared/build.ts'
+import { parseBuildNote, type PublishActor, type PublishAudit, type PublishChecks, type PublishRequest } from '../shared/build.ts'
 import { isPageRequest, type Caller } from './auth/types.ts'
 
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -39,14 +39,21 @@ export const maySkipTests = (actor: PublishActor): boolean => actor.kind === 'ow
 
 export function publishRequest(body: unknown): PublishRequest {
   if (!object(body)) throw new Error('Publish expects an object.')
-  if (Object.keys(body).some(k => !['checks', 'confirmSkipTests', 'skipChecks'].includes(k))) throw new Error('Unknown publish setting (the caller supplies the audit identity).')
+  if (Object.keys(body).some(k => !['checks', 'confirmSkipTests', 'skipChecks', 'note'].includes(k))) throw new Error('Unknown publish setting (the caller supplies the audit identity).')
   if (body.skipChecks !== undefined && body.skipChecks !== false) throw new Error('Use Skip tests and publish with its explicit confirmation, not skipChecks.')
   const checks = body.checks ?? 'full'
   if (checks !== 'full' && checks !== 'skip') throw new Error('Choose Test and publish or Skip tests and publish.')
   if (body.confirmSkipTests !== undefined && typeof body.confirmSkipTests !== 'boolean') throw new Error('Invalid skip confirmation.')
   if (checks === 'skip' && body.confirmSkipTests !== true) throw new Error('Confirm that no tests will run before publishing without tests.')
   if (checks === 'full' && body.confirmSkipTests === true) throw new Error('Skip confirmation does not belong to Test and publish.')
-  return checks === 'skip' ? { checks, confirmSkipTests: true } : { checks }
+  // F-318: what this build gives, in plain words, for the History tab. Over the limits it is REFUSED (never cut); the words never repeat the text. What is kept is the cleaned note.
+  let note: string | undefined
+  if (body.note !== undefined && body.note !== null) {
+    const parsed = parseBuildNote(body.note)
+    if ('error' in parsed) throw new Error(parsed.error)
+    if (parsed.lines.length) note = parsed.lines.join('\n')
+  }
+  return { checks, ...(checks === 'skip' ? { confirmSkipTests: true as const } : {}), ...(note ? { note } : {}) }
 }
 
 const SKIP_IS_HUMAN = 'Skip tests and publish is the owner’s own choice, made and confirmed by hand on the Build page.'

@@ -45,6 +45,14 @@ export interface PublishRecord {
   outcome: 'running' | 'published' | 'unchanged' | 'failed'
   version: string | null
   error: string | null
+  /** F-318: what this build gave, in the owner's own plain words (the note written at Publish, or edited after): one entry per line; absent when none was written. */
+  gave?: string[]
+  /** F-318: the commit titles that went into this build, collected by the publish from Dev (git log previous..this, no merges): at most 60 of at most 160 characters, no author, no body; absent when it could not be told. Never sent to a person. */
+  changes?: string[]
+  /** F-318: Dev's commit (short hash) this build was made from; absent in records from before. */
+  commit?: string
+  /** F-318 follow-up (Agent 14): TRUE when Dev had changes that were not committed when this build was made (they were published as they were, so the commit titles do not tell the whole story); absent otherwise and in records from before. */
+  dirty?: true
 }
 export const SKIP_TESTS_WARNING = 'No tests will run. Types, lint, themes, frontend, backend and try-it smoke checks will all be skipped. The app must still compile before it can be published.'
 
@@ -120,6 +128,8 @@ export interface PublishRequest {
   confirmSkipTests?: boolean
   /** Old full-check clients can still send false; true is refused, never a bypass. */
   skipChecks?: boolean
+  /** F-318: what this build gives, in plain words, for the History tab's Simple view: lines separated by \n, at most BUILD_NOTE_MAX_LINES of BUILD_NOTE_MAX_CHARS. Optional; refused (400) when over the limits, never cut. */
+  note?: string
 }
 
 // ---- Shubham's order ob12b (22 Nov 2026): the Build page for every signed-in person, with an Update button. What such a person may READ is this ALLOW-LIST, built field by field
@@ -255,4 +265,136 @@ export interface UpdateRefusal {
 /** GET and PUT /build/update-policy: the first owner's only (by id; a second owner is refused). Default ON; a file that cannot be read means OFF. */
 export interface UpdatePolicy {
   peopleMayUpdate: boolean
+}
+
+// ---- F-318 (Shubham's orders oa668 and oa79a, 22 Nov 2026): the Build page's History tab, "what each build update gave", as two inner tabs: SIMPLE (a plain note per published build, for everyone who can open the Build page)
+// and COMPLEX (the automatic commit titles, the owner only). Honest limits, kept in the open: the note is plain text the owner or Lead wrote (nothing here can judge its words, so it must hold no secret and no person's name);
+// the commit titles are what the developers typed; neither is checked against what the build really does.
+
+/** The note's limits: at most this many lines, of at most this many characters each. A note over them is REFUSED (400), never silently cut. */
+export const BUILD_NOTE_MAX_LINES = 12
+export const BUILD_NOTE_MAX_CHARS = 200
+/** The commit titles kept per build, and a title's length (a longer one is cut with "…"). */
+export const BUILD_CHANGES_MAX = 60
+export const BUILD_CHANGE_MAX_CHARS = 160
+/** The History tab shows at most this many PUBLISHED builds (failed and unchanged attempts are not in it). */
+export const BUILD_HISTORY_MAX_ROWS = 100
+
+/**
+ * One line of a note or a commit title, made safe to store and to show: any control character (a tab, an escape, a line end) becomes a space, `<` and `>` become the look-alike quotes ‹ › (no HTML, whatever draws it), and a "[" that begins
+ * a sibling-chat style mark ("[message from", "[broadcast from", "[heartbeat", "[staff send", "[order") becomes "(" so a note can never pose as a message from the app. Cut to `max` characters with "…" when longer.
+ * The mark list is the set the app's chat relays PREPEND to a line they type into a chat, and it is not meant to be every mark that exists: "[reply from", "[tapped" and "[spoken" are not in it because nothing types a note or a commit title into a chat
+ * (they are stored and drawn on the Build page, as text, and go nowhere else). If a note is ever to be typed into a chat, the list must be revisited then, with that chat's own marks.
+ */
+export function cleanNoteLine(text: string, max = BUILD_NOTE_MAX_CHARS): string {
+  const spaced = [...text].map(c => (c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159) || c === '\u2028' || c === '\u2029' ? ' ' : c)).join('')
+  const plain = spaced
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/\[(?=\s*(?:message from|broadcast from|heartbeat|staff send|order\b))/gi, '(')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+  const chars = [...plain]
+  return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : plain
+}
+
+/**
+ * A note as the owner writes it: lines separated by a line end. Each line is trimmed and made safe (cleanNoteLine), empty lines go; more than BUILD_NOTE_MAX_LINES lines or a line over BUILD_NOTE_MAX_CHARS characters is an error
+ * (in words that never repeat the text). A note of nothing means "no note" (`lines` is empty).
+ */
+export function parseBuildNote(raw: unknown): { lines: string[] } | { error: string } {
+  if (typeof raw !== 'string') return { error: 'The note must be text.' }
+  const lines: string[] = []
+  let n = 0
+  for (const part of raw.split(/\r\n|\r|\n/)) {
+    n += 1
+    const trimmed = part.trim()
+    if (!trimmed) continue
+    if ([...trimmed].length > BUILD_NOTE_MAX_CHARS) return { error: `A note line is at most ${BUILD_NOTE_MAX_CHARS} characters (line ${n} is ${[...trimmed].length}).` }
+    const clean = cleanNoteLine(trimmed)
+    if (clean) lines.push(clean)
+  }
+  if (lines.length > BUILD_NOTE_MAX_LINES) return { error: `A note is at most ${BUILD_NOTE_MAX_LINES} lines (this one has ${lines.length}).` }
+  return { lines }
+}
+
+/** The commit titles git printed (one per line), as the record keeps them: each made safe and cut to BUILD_CHANGE_MAX_CHARS, empty ones gone, at most BUILD_CHANGES_MAX. */
+export function cleanCommitTitles(raw: readonly string[]): string[] {
+  const out: string[] = []
+  for (const title of raw) {
+    const clean = cleanNoteLine(title, BUILD_CHANGE_MAX_CHARS)
+    if (clean) out.push(clean)
+    if (out.length >= BUILD_CHANGES_MAX) break
+  }
+  return out
+}
+
+/** "2026.11.22-1249" as an ISO time, to the minute, read as the hub's local time (the stamp is made from the hub's own clock in agent/scripts/publish.ts); null for anything that is not a real stamp. */
+export function builtAtOf(version: unknown): string | null {
+  const m = typeof version === 'string' ? /^(\d{4})\.(\d{2})\.(\d{2})-(\d{2})(\d{2})$/.exec(version) : null
+  if (!m) return null
+  const [y, mo, d, h, mi] = [m[1], m[2], m[3], m[4], m[5]].map(Number) as [number, number, number, number, number]
+  const t = new Date(y, mo - 1, d, h, mi)
+  return t.getFullYear() === y && t.getMonth() === mo - 1 && t.getDate() === d && t.getHours() === h && t.getMinutes() === mi ? t.toISOString() : null
+}
+
+/** One PUBLISHED build in the History tab, as every signed-in person who can open the Build page reads it. No author, no id, no commit, no error, no path: only these four fields. */
+export interface BuildHistoryRow {
+  /** The build's version stamp, "2026.11.22-1249". */
+  version: string
+  /** When it was built (ISO, to the minute); null if the stamp cannot be read as a time. */
+  builtAt: string | null
+  /** When its publish finished (ISO). */
+  publishedAt: string | null
+  /** What this build gave, in plain words: one entry per line the owner wrote. EMPTY when no note was written (the page says "No note was written for this build"). */
+  gave: string[]
+}
+/** The same row as the OWNER reads it (the first owner by id, or the PC's own program): plus the record's id, Dev's commit, and the automatic commit titles. */
+export interface BuildHistoryOwnerRow extends BuildHistoryRow {
+  /** The publish record's id: PUT /build/history/:id/note names it. */
+  id: string
+  /** Dev's commit it was built from (short hash); null when it was not recorded. */
+  commit: string | null
+  /** The commit titles that went into this build (newest first, as git prints them); null = NOT RECORDED (the page says so); an empty list = recorded, nothing new. */
+  changes: string[] | null
+  /** Present (true) only when Dev had changes that were NOT committed when this build was made: the page says "plus changes not committed" beside the titles. Absent for a clean Dev and for records that do not say. Never in a person's row. */
+  dirty?: true
+}
+/** GET /build/history: `view` says which rows these are, so the page never guesses from a missing key. A person's rows NEVER carry id, commit or changes (the keys are absent). Newest published build first, at most BUILD_HISTORY_MAX_ROWS. */
+export type BuildHistory = { view: 'person'; rows: BuildHistoryRow[] } | { view: 'owner'; rows: BuildHistoryOwnerRow[] }
+/** PUT /build/history/:id/note (the first owner, or the PC's own program): replaces a PUBLISHED build's note; an empty `note` clears it. The answer is the edited row, in the owner's shape. 400 over the limits, 403 for anyone else, 404 for a build that is not a published record. */
+export interface BuildNoteRequest {
+  note: string
+}
+
+const strings = (v: unknown, maxLines: number, maxChars: number): string[] | null =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').slice(0, maxLines).map(x => [...x].slice(0, maxChars).join('')) : null
+
+/**
+ * The History tab's allow-list: builds the answer from the publish records one field at a time, so a field that is not named here (the actor, the checks, the error, a path) cannot reach anyone. Only PUBLISHED records with a real
+ * version stamp, newest first, at most BUILD_HISTORY_MAX_ROWS; the person's view has four fields per row, the owner's seven. Records written before F-318 have no note, no titles and no commit, and read fine (`gave` empty, `changes` and `commit` null).
+ */
+export function buildHistoryOf(records: readonly PublishRecord[], view: 'person' | 'owner'): BuildHistory {
+  const rows = records
+    .filter(r => r.outcome === 'published' && stamp(r.version) !== null)
+    .map(r => ({ r, at: when(r.endedAt ?? r.startedAt) }))
+    .sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''))
+    .slice(0, BUILD_HISTORY_MAX_ROWS)
+  const person = ({ r, at }: (typeof rows)[number]): BuildHistoryRow => ({
+    version: stamp(r.version)!,
+    builtAt: builtAtOf(r.version),
+    publishedAt: at,
+    gave: strings(r.gave, BUILD_NOTE_MAX_LINES, BUILD_NOTE_MAX_CHARS) ?? [],
+  })
+  if (view === 'person') return { view: 'person', rows: rows.map(person) }
+  return {
+    view: 'owner',
+    rows: rows.map(x => ({
+      ...person(x),
+      id: typeof x.r.id === 'string' && /^[a-f0-9]{32}$/.test(x.r.id) ? x.r.id : '',
+      commit: typeof x.r.commit === 'string' && /^[0-9a-f]{7,40}$/.test(x.r.commit) ? x.r.commit : null,
+      changes: strings(x.r.changes, BUILD_CHANGES_MAX, BUILD_CHANGE_MAX_CHARS),
+      ...(x.r.dirty === true ? { dirty: true as const } : {}),
+    })),
+  }
 }

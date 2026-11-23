@@ -2,7 +2,6 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import {
-  AUTH_COOKIE,
   AUTH_IDLE_HOURS,
   AUTH_REQUIRE,
   AUTH_SESSION_DAYS,
@@ -22,6 +21,7 @@ import { apiError } from '../api.ts'
 import { CrmError, listMembers, signIn as crmSignIn, type CrmMember, type CrmSession } from '../claude/crm.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
+import { authCookieName } from './cookie-name.ts'
 import { createOwners, ownersFileBeside } from './owners.ts'
 import { authError, type Caller } from './types.ts'
 
@@ -193,6 +193,9 @@ export function createAuth(o: AuthOptions): Auth {
   const now = o.now ?? Date.now
   const log = o.log
   const crm = o.crm ?? { signIn: crmSignIn, listMembers }
+  // Order off76: the sign-in cookie's name, `sad_session` unless SAD_AUTH_COOKIE names another (the Dev copy runs beside the live app on the same host name, so it must not share its cookie). ONE name for every read
+  // (cookieOf) and every write (cookieHeader: the sign-in and the one that ends a session); a cookie with any other name is never this agent's session.
+  const cookieName = authCookieName(env, m => log?.warn(m))
 
   let f = load()
   const viewerSessions = new Map<string, CrmSession>()
@@ -262,7 +265,7 @@ export function createAuth(o: AuthOptions): Auth {
     if (!line) return null
     for (const part of line.split(';')) {
       const i = part.indexOf('=')
-      if (i > 0 && part.slice(0, i).trim() === AUTH_COOKIE) return part.slice(i + 1).trim() || null
+      if (i > 0 && part.slice(0, i).trim() === cookieName) return part.slice(i + 1).trim() || null
     }
     return null
   }
@@ -418,7 +421,7 @@ export function createAuth(o: AuthOptions): Auth {
   }
 
   function cookieHeader(value: string, maxAgeSeconds: number, secure: boolean) {
-    return `${AUTH_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.round(maxAgeSeconds)}${secure ? '; Secure' : ''}`
+    return `${cookieName}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.round(maxAgeSeconds)}${secure ? '; Secure' : ''}`
   }
 
   function signOut(c: Caller) {

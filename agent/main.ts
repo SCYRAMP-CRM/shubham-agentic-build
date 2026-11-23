@@ -1436,6 +1436,8 @@ if (import.meta.main) {
       // F-173a + Shubham's orders o2f32 and ob12b: who presses Update, decided in ONE place (auth/types.ts updateRights): the first owner by id (and a program on this PC with the machine token) as before; any other signed-in person, a second owner
       // included, under the build's guards while the switch is on; anyone else is refused in plain words.
       authorizeUpdate: r => updateRights(r.headers, r.caller, () => updatePolicy.read().peopleMayUpdate),
+      // F-318: who reads the History tab: the same owner-or-person rule, WITHOUT the Update switch (switching Update off for everyone else must not hide what each build gave).
+      authorizeHistory: r => updateRights(r.headers, r.caller, () => true),
       onUpdateCancel: () => updateCoordinator.current?.cancel(),
     })
     // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).

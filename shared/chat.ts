@@ -17,6 +17,11 @@ export interface ChatSender {
   floor: string | null
   /** The first 8 characters of its chat id. */
   chat: string | null
+  /**
+   * F-316 T4: the message came from another INSTANCE of a template ("[message from <agent> of <template> (floor <floor>), hop <n>. ...] <words>", shared/instance-message.ts): which template, and which hop of
+   * the conversation between instances it is. Set only by the feed's converter, from the WHOLE received message (the header is anchored at its start); absent for every other sender.
+   */
+  instance?: { template: string; hop: number }
 }
 
 interface ChatItemBase {

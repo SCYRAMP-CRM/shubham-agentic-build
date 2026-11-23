@@ -4,7 +4,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
-import { buildStatusOf, UPDATE_EXIT_CODE, UPDATE_WHY_WORDS, type BuildInfo, type BuildVersion, type PublishRequest, type UpdateWhyNot } from '../shared/build.ts'
+import { buildHistoryOf, buildStatusOf, parseBuildNote, UPDATE_EXIT_CODE, UPDATE_WHY_WORDS, type BuildHistory, type BuildHistoryOwnerRow, type BuildInfo, type BuildVersion, type PublishRecord, type PublishRequest, type UpdateWhyNot } from '../shared/build.ts'
 import { apiError, type ApiMount, type MountRequest } from './api.ts'
 import { appendAccessLog, appendAccessLogOrThrow } from './auth/access-log.ts'
 import { createRefusalAudit } from './build-update-refusals.ts'
@@ -12,7 +12,7 @@ import { authError, type UpdateRights } from './auth/types.ts'
 import type { UpdatePolicyStore } from './build-update-policy.ts'
 import type { Logger } from './log.ts'
 import { cleanPublishActor, maySkipTests, PUBLISH_READY, publishActor, publishDecision, publishRequest, samePublishAudit, type PublishDecision } from './publish-policy.ts'
-import { beginPublishRecord, finishPublishRecord, publishHistory } from './publish-history.ts'
+import { beginPublishRecord, finishPublishRecord, NoSuchPublishedBuild, publishedHistory, publishHistory, setPublishNote } from './publish-history.ts'
 
 // F-020: what this PC runs, and getting a newer one (shared/build.ts).
 //   which     a build (RELEASE.json in the folder it runs from) or Dev (no RELEASE.json)
@@ -126,6 +126,11 @@ export interface BuildOptions {
    */
   authorizeUpdate: (r: MountRequest) => UpdateRights | void
   /**
+   * F-318: what the caller of GET /build/history is: the OWNER (the first owner by id, or the PC's own program) reads the History's owner view (commit titles and short hashes); any other signed-in PERSON (a second owner too) reads the person's four fields;
+   * not signed in throws. It is the same rule as authorizeUpdate WITHOUT the owner's Update switch (switching Update off for everyone else must not hide the History). Left out (tests), authorizeUpdate decides.
+   */
+  authorizeHistory?: (r: MountRequest) => UpdateRights | void
+  /**
    * Shubham's order ob12b: the first owner's switch ("people may press Update") and the time of the last person's press, in a small file that survives the restart an Update causes. Left out (tests; a caller that does not
    * integrate it): no switch routes, and the cooldown is kept in memory only.
    */
@@ -181,6 +186,12 @@ export interface Build {
 const PERMIT_MS = 15_000
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+/** F-318: the owner's /build/info keeps the attempts list light: a record's commit titles (up to 60 x 160 characters, 30 records) are read from GET /build/history, not carried in every info. */
+const withoutChanges = (r: PublishRecord): PublishRecord => {
+  const copy = { ...r }
+  delete copy.changes
+  return copy
+}
 
 /** A RELEASE.json's contents, checked; null when it isn't one. */
 export function parseVersion(text: string): BuildVersion | null {
@@ -293,7 +304,7 @@ export function createBuild(o: BuildOptions): Build {
     root: o.root,
     current,
     update: { ...update, hostWait: hostWait ? { since: new Date(hostWait.since).toISOString(), busy: o.chatHostGate?.current?.busy() ?? 0, ask: hostWait.ask } : null },
-    publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log], history: publishHistory(historyDir) } : null,
+    publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log], history: publishHistory(historyDir).map(withoutChanges) } : null,
   })
 
   /** Dev against the newest build: published since (the last publish, or one on GitHub), or this one. */
@@ -365,8 +376,9 @@ export function createBuild(o: BuildOptions): Build {
     if (publish.state === 'running') throw apiError(409, 'A publish is already running')
     // obcbd: skipping every check is human-only (the owner's own page, by hand); the machine channel only tests and publishes.
     if (req.checks === 'skip' && !maySkipTests(actor)) throw authError(403, SKIP_REFUSED, 'admin-only')
-    // Fail closed BEFORE spawning if the decision cannot be recorded.
-    const attempt = beginPublishRecord(historyDir, req.checks ?? 'full', actor)
+    // Fail closed BEFORE spawning if the decision cannot be recorded. F-318: the note (already cleaned by publishRequest) is stored with the receipt, so the publish's own finish keeps it.
+    const note = req.note ? parseBuildNote(req.note) : null
+    const attempt = beginPublishRecord(historyDir, req.checks ?? 'full', actor, note && 'lines' in note ? note.lines : undefined)
     let decision: PublishDecision
     try {
       decision = publishDecision(req, actor, historyDir, attempt.id)
@@ -817,6 +829,13 @@ export function createBuild(o: BuildOptions): Build {
       audit({ id: rights.by?.id ?? 'local-machine', name: rights.by?.name ?? 'the PC\'s own program' }, { policy: { peopleMayUpdate: on } })
       return policyAnswer()
     },
+    // F-318 (Shubham's orders oa668 and oa79a): the Build page's History tab. A PERSON reads four fields per PUBLISHED build (shared buildHistoryOf, an allow-list, never /info); the OWNER also reads Dev's short commit and the commit titles.
+    // Open to whoever the API gate lets reach the Build page (the Access row 'build'); who is the owner is authorizeHistory's say (the first owner by id, or the PC's own program: a second owner reads the person's view).
+    'GET /history': r => {
+      const rights = (o.authorizeHistory ?? o.authorizeUpdate)(r) ?? { kind: 'owner' as const }
+      const answer: BuildHistory = buildHistoryOf(publishedHistory(historyDir), rights.kind === 'owner' ? 'owner' : 'person')
+      return answer
+    },
     'POST /publish': r => {
       // F-119: from a page, only a browser signed in as sbskrrt; a local tool with the machine token and no page headers is as before.
       const actor = publishActor(r.headers, r.caller)
@@ -829,6 +848,30 @@ export function createBuild(o: BuildOptions): Build {
     },
   }
 
+  /**
+   * F-318: PUT /build/history/:id/note {note}: replaces a PUBLISHED build's note (empty clears it). The first owner (signed in, by id) or the PC's own program, the same wall as /build/publish: a person, a second owner and anyone else is refused
+   * (403 admin-only) before the body is looked at. Over 12 lines of 200 characters is a 400 in words that never repeat the text; an id that is not a published record is a 404. The record is rewritten whole and renamed into place,
+   * and ONE line in access-log.jsonl says who, when and which build, never the text. The answer is the edited row in the owner's shape.
+   */
+  function putHistoryNote(r: MountRequest, id: string): BuildHistoryOwnerRow {
+    const actor = publishActor(r.headers, r.caller)
+    if (!actor) throw authError(403, 'Only the owner, signed in, or Lead on the local machine channel may edit what a build gave.', 'admin-only')
+    if (o.role() !== 'hub') throw apiError(404, 'The notes of builds are kept on the hub')
+    if (!isObject(r.body) || Object.keys(r.body).some(k => k !== 'note')) throw apiError(400, 'Expected {note: text}')
+    const parsed = parseBuildNote(r.body.note)
+    if ('error' in parsed) throw apiError(400, parsed.error)
+    let record: PublishRecord
+    try {
+      record = setPublishNote(historyDir, id, parsed.lines)
+    } catch (e) {
+      if (e instanceof NoSuchPublishedBuild) throw apiError(404, e.message)
+      throw e
+    }
+    audit({ id: actor.id, name: actor.name }, { history: { note: parsed.lines.length ? 'edited' : 'cleared', version: record.version } })
+    log?.info(`history: the note of build ${record.version ?? '?'} was ${parsed.lines.length ? 'edited' : 'cleared'}`)
+    return buildHistoryOf([record], 'owner').rows[0] as BuildHistoryOwnerRow
+  }
+
   return {
     requestUpdate: () => startUpdate(),
     issuePermit,
@@ -837,6 +880,9 @@ export function createBuild(o: BuildOptions): Build {
     mount: {
       prefix: '/build',
       async http(r) {
+        // F-318: the one route with a parameter in its path.
+        const noteOf = r.method === 'PUT' ? /^\/history\/([a-f0-9]{32})\/note$/.exec(r.rest) : null
+        if (noteOf) return putHistoryNote(r, noteOf[1]!)
         const run = routes[`${r.method} ${r.rest}`]
         if (!run) throw apiError(404, `No such path: /build${r.rest}`)
         return await run(r)

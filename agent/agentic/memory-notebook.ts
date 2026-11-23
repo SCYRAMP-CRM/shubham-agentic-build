@@ -116,6 +116,11 @@ export interface TemplateRow {
   perHour: number | null
   /** By agent id. */
   instances: Record<string, InstanceRow>
+  /**
+   * F-316 T4: the owner lets the instances of this template message each other (the tool message_instance, index.ts). ABSENT when off (never `false` on disk): OFF is what every row is until the owner
+   * switches it on, and a table with none of these is byte for byte what it was. Only for the instances this table finds (templateOf), so it needs the master switch and the row ON too.
+   */
+  messages?: true
 }
 export interface Settings {
   version: 1
@@ -185,6 +190,7 @@ function cleanRow(id: string, raw: unknown, appOwnerId: string, problems: string
       if (r && Object.keys(r).length) instances[agentId] = r
     }
   }
+  if (raw.messages !== undefined && raw.messages !== null && typeof raw.messages !== 'boolean') problems.push(`${id}: messages is true or false`)
   return {
     name: oneLine(raw.name, 60) || id,
     on: raw.on === true,
@@ -192,6 +198,7 @@ function cleanRow(id: string, raw: unknown, appOwnerId: string, problems: string
     floors,
     perHour: cleanPerHour(raw.perHour, id, problems),
     instances,
+    ...(raw.messages === true ? { messages: true as const } : {}),
   }
 }
 
@@ -466,6 +473,12 @@ export interface NotebookChat {
   brief(): string
   /** N2: what the notebook brings before this chat's prompt: up to RECALL_MAX notes that hold the prompt's words ('' for nothing). */
   recall(o: { sessionId: string; prompt: string }): string
+  /**
+   * F-316 T4: the other chats this one may message, or null while the owner has not switched messages on for its template. Found by the same one function as the notebook's own instances (templateOf), so
+   * a peer is an instance of THIS template (the same row), owned by the person the row is for, not a PC Control chat, not left out, and only while the master switch and the row are on. Read again
+   * from the table at every call: the switch takes effect at once. The caller decides what else a receiver must be (running, not a staff chat, a chat its owner may type into).
+   */
+  messaging(): { template: { id: string; name: string }; peers: { floorId: string; floorName: string; agent: FloorAgent }[] } | null
 }
 
 export type ForChat = { ok: true; chat: NotebookChat } | { ok: false; why: string }
@@ -985,6 +998,20 @@ export function createNotebooks(o: NotebooksOptions): Notebooks {
     return {
       template: { id: t, name: found.row.name },
       instance: { id: agent.id, name: agent.name, role: found.role },
+      messaging() {
+        const settings = readSettings()
+        const row = Object.hasOwn(settings.templates, t) ? settings.templates[t] : undefined
+        if (!settings.enabled || !row?.on || row.messages !== true) return null
+        const peers: { floorId: string; floorName: string; agent: FloorAgent }[] = []
+        for (const f of o.floors()) {
+          for (const a of f.agents) {
+            if (a.id === agent.id) continue
+            const other = templateOf(settings, f, a, o.appOwnerId)
+            if (other && other.id === t) peers.push({ floorId: f.id, floorName: f.name, agent: a })
+          }
+        }
+        return { template: { id: t, name: row.name }, peers }
+      },
       add: input => decide(t, draftOf(input, by, found.perHour)),
       search(query, so = {}) {
         const q = typeof query === 'string' ? query.trim().slice(0, 2000) : ''
