@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { CrmSessionInfo } from '../../shared/crm.ts'
 import { apiError } from '../api.ts'
-import { SESSION_MS, trimUrl } from '../claude/crm.ts'
+import { SESSION_MS, sameCrm, trimUrl } from '../claude/crm.ts'
 import type { Logger } from '../log.ts'
 
 // F-054: the CRM built into the page talks to the CRM's backend through this. The backend allows
@@ -57,8 +57,11 @@ export function crmLoginOf(s: { url: string; cookie: string; signedInAt: string;
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 
-/** This PC's CRM session, read as it is now (Settings › Devices signs in and out under it), or null. */
-export function readLogin(file: string, now = Date.now()): Login | null {
+/**
+ * This PC's CRM session, read as it is now (Settings › Devices signs in and out under it), or null. F-339: given `crmUrl` (the address this run talks to), a login made at ANY other address is ended: null, exactly as
+ * an expired one, so every reader says what it says for a login that has ended and nothing is ever sent to that other address. The file is left as it is. Left out, no address is checked (a test's own scratch file).
+ */
+export function readLogin(file: string, now = Date.now(), crmUrl?: string): Login | null {
   try {
     const raw: unknown = JSON.parse(readFileSync(file, 'utf8'))
     if (!isObject(raw)) return null
@@ -66,6 +69,7 @@ export function readLogin(file: string, now = Date.now()): Login | null {
     const cookie = text(raw.cookie)
     const signedIn = Date.parse(String(raw.signedInAt))
     if (!url || !cookie || !/^https?:\/\//.test(url) || !Number.isFinite(signedIn)) return null
+    if (crmUrl !== undefined && !sameCrm(url, crmUrl)) return null
     const expiresAt = signedIn + SESSION_MS
     if (now >= expiresAt) return null
     const user = isObject(raw.user) ? raw.user : {}
@@ -84,6 +88,8 @@ export interface CrmProxyOptions {
   log?: Pick<Logger, 'warn'>
   /** How long one request to the CRM may take in all (default 120 s). A test makes it short. */
   timeoutMs?: number
+  /** F-339: the CRM address of this run (crm.ts crmUrlOf). A login at any other address is ended: not read, never forwarded to. Left out (a test's scratch proxy), no address is checked. */
+  crmUrl?: string
 }
 
 export interface CrmProxy {
@@ -222,12 +228,14 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
 
   return {
     async request(method, sub, init = {}) {
-      const login = readLogin(o.file, now())
+      const login = readLogin(o.file, now(), o.crmUrl)
       if (!login) throw new CrmNotSignedIn()
       return this.requestAs(login, method, sub, init)
     },
 
     async requestAs(login, method, sub, init = {}) {
+      // F-339: a login at another address than this run's has ended: not one request goes there (not a CSRF ask either).
+      if (o.crmUrl !== undefined && !sameCrm(login.url, o.crmUrl)) throw apiError(401, 'Your CRM sign-in here has ended: sign in again.')
       const m = method.toUpperCase()
       const base = new URL(login.url)
       const target = new URL(`/${sub.replace(/^\/+/, '')}`, base)
@@ -253,20 +261,20 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
     },
 
     session() {
-      const login = readLogin(o.file, now())
+      const login = readLogin(o.file, now(), o.crmUrl)
       return login
         ? { signedIn: true, name: login.name, username: login.username, expiresAt: new Date(login.expiresAt).toISOString() }
         : { signedIn: false, name: null, username: null, expiresAt: null }
     },
 
     async handle(req, res, sub, search) {
-      const login = readLogin(o.file, now())
+      const login = readLogin(o.file, now(), o.crmUrl)
       if (!login) throw apiError(401, 'The CRM is not signed in on this PC: sign in from the CRM page, or Devices')
       return forward(login, req, res, sub, search)
     },
 
     async handleAs(login, req, res, sub, search) {
-      if (!/^https?:\/\//.test(login.url) || !login.cookie) throw apiError(401, 'Your CRM sign-in here has ended: sign in again.')
+      if (!/^https?:\/\//.test(login.url) || !login.cookie || (o.crmUrl !== undefined && !sameCrm(login.url, o.crmUrl))) throw apiError(401, 'Your CRM sign-in here has ended: sign in again.')
       return forward({ url: trimUrl(login.url), cookie: login.cookie }, req, res, sub, search)
     },
   }

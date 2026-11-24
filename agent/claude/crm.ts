@@ -13,8 +13,8 @@
 // latest (lib/christopherRelease.js), and this app is not one. The password is sent once, in
 // the sign-in, and kept nowhere; the cookie and the token are never logged.
 
-/** The CRM Christopher uses (its sealed build's prod backend). SAD_CRM_URL points elsewhere. */
-export const CRM_URL = 'https://crmbe.bhole.co'
+/** The CRM this app signs in to and talks to (its backend, behind CloudFront). SAD_CRM_URL points the app at another CRM (a test's stand-in). */
+export const CRM_URL = 'https://d3blj8n8yhvyjy.cloudfront.net'
 /** The CRM signs its session for 7 days (authController.js JWT_EXPIRY). */
 export const SESSION_MS = 7 * 24 * 60 * 60 * 1000
 const TIMEOUT_MS = 20_000
@@ -67,6 +67,20 @@ export const isObject = (v: unknown): v is Record<string, unknown> => typeof v =
 export const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 
 export const trimUrl = (url: string) => url.replace(/\/+$/, '')
+
+/** The ONE place that decides which CRM the app talks to: SAD_CRM_URL when it is set (another CRM: a test's stand-in), else CRM_URL. With no argument it reads this process's environment. */
+export const crmUrlOf = (env: Record<string, string | undefined> = process.env): string => trimUrl(env.SAD_CRM_URL || CRM_URL)
+
+/** Whether two addresses are the same CRM: the same scheme, host (any letter case), port and path. A stored login made at another address is ended, never used. */
+export function sameCrm(a: string, b: string): boolean {
+  try {
+    const x = new URL(trimUrl(a))
+    const y = new URL(trimUrl(b))
+    return x.origin === y.origin && x.pathname.replace(/\/+$/, '') === y.pathname.replace(/\/+$/, '')
+  } catch {
+    return false
+  }
+}
 
 export async function call(url: string, init: RequestInit): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> {
   let res: Response

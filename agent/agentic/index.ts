@@ -610,6 +610,8 @@ export interface AgenticOptions {
   resumeGapMs?: number
   /** F-054: this PC's CRM session (crm-session.json, beside the agentic folder); tests give a scratch one. */
   crmSession?: string
+  /** F-339: the CRM address of this run (claude/crm.ts crmUrlOf, given by main.ts). A stored CRM login made at any other address is ended: every reader of the login (the proxy, the owner checks) treats it as no login. Left out (a test's scratch app), no address is checked. */
+  crmUrl?: string
   /** order o4d14: how the Accounts page opens its database connection (accounts-db.ts); only tests give their own, so no test ever reaches a real database. */
   accountsDbOpen?: typeof import('./accounts-db.ts').openAccountsDb
   /**
@@ -1193,12 +1195,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const crm = createCrmStore(path.join(o.dir, 'crm.json'))
   let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
-  const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log })
+  const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log, ...(o.crmUrl !== undefined ? { crmUrl: o.crmUrl } : {}) })
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
   const crmGoals = createCrmGoals({ proxy: crmProxy })
   // F-334: which CRM goal was made by which floor's chat (the app's own small file; the CRM keeps no such field). Written only by the crm_goal_add case of toolFor, read only by GET /goal-floors.
   const goalFloors = createGoalFloors({ dir: o.dir, log: o.log, ...(o.goalFloorsTest?.readText ? { readText: o.goalFloorsTest.readText } : {}) })
-  // F-334 addendum: the order of a floor's goals in its curtain (ids and positions only, goal-order.json). Written only by PUT /floors/:id/goal-order, read only by GET /goal-floors. The CRM is never touched.
+  // F-334 addendum: the order of a floor's goals in its curtain (ids and positions only, in the order module's own file). Written only by PUT /floors/:id/goal-order, read only by GET /goal-floors. The CRM is never touched.
   const goalOrder = createGoalOrder({ dir: o.dir, log: o.log, ...(o.goalOrderTest?.readText ? { readText: o.goalOrderTest.readText } : {}) })
   const crmReads = createCrmReads({ proxy: crmProxy })
   const crmWrite = createCrmWrite({ proxy: crmProxy })
@@ -2084,7 +2086,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           const at = bySession(request.binding.sessionId!)
           if (!at || isPcControl(at.floor) || request.targetPcId !== self().id) return false
           assertExecutionCAS(request.binding, snapshotAgentExecution(at.agent, defaultsNow()))
-          return loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id === request.ownerId
+          return loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), o.crmUrl)?.user.id === request.ownerId
         } catch { return false }
       },
       actor: scope => {
@@ -2108,7 +2110,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
           if (request.signal.aborted || request.kind !== 'native' || request.binding.execution.profile !== 'codex-native-v1'
             || agent.owner?.id !== request.scope.ownerId || request.scope.targetPcId !== self().id
-            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
+            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), o.crmUrl)?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
         }
         guard()
         await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard, executable)
@@ -2124,7 +2126,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
           if (request.signal.aborted || request.kind !== 'native' || request.binding.execution.profile !== 'claude-native-v1' || isStaffAssistant(agent)
             || agent.owner?.id !== request.scope.ownerId || request.scope.targetPcId !== self().id
-            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
+            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), o.crmUrl)?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
         }
         guard()
         await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard, executable)
@@ -6782,7 +6784,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const out = await crmGoals.add(args)
         log?.info(`${agent.name} added a CRM goal`)
         // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.
-        goalFloors.link(goalIdOfAnswer(out), { floorId: floor.id, agentId: agent.id })
+        // Only the answer of the call that MADE the goal has an id here; a call that only found it already made (a duplicate) answers without one and links nothing (and logs nothing).
+        const madeId = goalIdOfAnswer(out)
+        if (madeId !== null) goalFloors.link(madeId, { floorId: floor.id, agentId: agent.id })
         return out
       }
       case 'crm_goal_update': {

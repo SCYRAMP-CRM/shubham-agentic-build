@@ -7,11 +7,11 @@ import type { Logger } from '../log.ts'
 import { buildChoices, previewSwitch as previewOf, seenCapOf, weekUsedUp } from './choices.ts'
 import * as crmApi from './crm.ts'
 import {
-  CRM_URL,
   CrmError,
   SESSION_MS,
   UUID,
-  trimUrl,
+  crmUrlOf,
+  sameCrm,
   type ClaudeKind,
   type CrmReadings,
   type CrmSession,
@@ -194,11 +194,16 @@ function readJson(file: string): unknown {
   }
 }
 
-export function loadSession(file: string): CrmSession | null {
+/**
+ * The CRM login kept on this PC, or null. F-339: given `crmUrl` (the address this run talks to), a login made at ANY other address is ended: null, never used for a request; the file is left as it is
+ * (the next sign-in overwrites it, a sign-out removes it). Left out, no address is checked (a test's own scratch file).
+ */
+export function loadSession(file: string, crmUrl?: string): CrmSession | null {
   const raw = readJson(file)
   if (!isObject(raw) || !str(raw.url) || !str(raw.cookie) || !str(raw.signedInAt) || !isObject(raw.user)) return null
   const u = raw.user
   if (!str(u.id) || !str(u.name)) return null
+  if (crmUrl !== undefined && !sameCrm(raw.url, crmUrl)) return null
   return {
     url: raw.url,
     cookie: raw.cookie,
@@ -222,13 +227,14 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   const now = o.now ?? Date.now
   const userEnv = o.userEnv !== undefined ? o.userEnv : loadUserEnv()
   const crm: CrmApi = o.crm ?? crmApi
-  const url = trimUrl(env.SAD_CRM_URL || CRM_URL)
+  const url = crmUrlOf(env)
   const build = `sad-${o.deviceId}`
   const store: SwitchStore = openSwitchStore(o.paths.claudeSwitch ?? null)
 
-  let session = loadSession(o.paths.crmSession)
+  let session = loadSession(o.paths.crmSession, url)
   let placed = loadPlaced(o.paths.claudeSubscription)
-  let lastCheck: ClaudeInfo['check'] = null
+  // F-339: a stored login made at another address than this run's is ENDED (not loaded, never used for a request, not deleted); the Devices page says so plainly through its error line.
+  let lastCheck: ClaudeInfo['check'] = !session && loadSession(o.paths.crmSession) ? { at: new Date(now()).toISOString(), result: 'error', message: 'The CRM sign-in saved on this PC was made at a different address and has ended. Sign in again.' } : null
   let busy = false
   let closed = false
   // One thing at a time: a sign-in, a check, a switch and a sign-out never interleave.

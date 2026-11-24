@@ -1051,7 +1051,9 @@ agent puts the token in **this Windows account's** `CLAUDE_CODE_OAUTH_TOKEN` (HK
 instead, and every Claude Code started on this PC afterwards runs on it. Sources and decisions:
 `design/features/F-007-claude-subscription.md`.
 
-- **The CRM** (`claude/crm.ts`): `https://crmbe.bhole.co`, or `SAD_CRM_URL`. Sign-in is
+- **The CRM** (`claude/crm.ts`): `https://d3blj8n8yhvyjy.cloudfront.net` (CloudFront, in front of the CRM backend), or `SAD_CRM_URL` (another CRM: the tests aim it at a fake one). `crmUrlOf(env)` is the ONE place that decides it
+  (main.ts and the Claude module both call it), and **a CRM login kept on this PC (`crm-session.json`) made at any OTHER address is ended** (F-339): `loadSession` and the proxy's `readLogin` read it as no login (the file is
+  left as it is, the next sign-in overwrites it), so nothing is ever sent to that other address and each reader says what it says for a login that has ended; the Devices page says so through its error line. Sign-in is
   `POST /v1/auth/login {username | email, password, portal: "crm"}`; the CRM answers with its
   session as the `crm_token` cookie (a 7-day JWT), then `GET /v1/auth/me` says who it is. The
   token is `GET /v1/org/claude-subscriptions/mine/credential` with that cookie and
@@ -2250,8 +2252,8 @@ mode, a setting the hub keeps. Types: `shared/crm.ts`. Shubham's words: the CRM 
   cancelled, 8 s) and a `CrmCheck` {ok, reason, status, message, header, ms}; reasons `dns`, `cert`, `refused`,
   `timeout`, `network`, by status 402 or `x-vercel-error: DEPLOYMENT_DISABLED` is `disabled`, 404 `notfound`, other
   4xx/5xx `status`, and `framing` when `X-Frame-Options` is DENY or SAMEORIGIN or a CSP `frame-ancestors` list leaves
-  the app out. Run against the real sites on 2026-10-31: scrm/sam/sam-crm-fe `disabled`, crm `dns`, bcrm `cert`, crmbe
-  `framing`.
+  the app out. Run against the real sites on 2026-10-31: scrm/sam/sam-crm-fe `disabled`, crm `dns`, bcrm `cert`, the
+  CRM backend `framing`.
 - **The page** (`src/crm/`): `CrmHost` (eager: Alt+B in the capture phase so the terminal can't stop it, and the
   keep-alive; two sizes of one overlay: on `/crm` the rectangle of `<main>` kept by a ResizeObserver, on `/crm?full=1`
   the window), `CrmFrame` (lazy: the modes, `SignInCard`, `AddressCard`, `Frame`, the corner `Pill`), `Bundled.tsx`

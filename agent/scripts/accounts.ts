@@ -13,9 +13,11 @@ import { createCodebaseImport } from '../agentic/accounts-codebase-import.ts'
 import { createAccountsPlatforms } from '../agentic/accounts-platforms.ts'
 import { runCli, type AdminLogin, type Io } from '../agentic/accounts-cli.ts'
 import { createCrmProxy } from '../agentic/crmproxy.ts'
+import { crmUrlOf } from '../claude/crm.ts'
 
 const paths = statePaths()
-const proxy = createCrmProxy({ file: paths.crmSession })
+// F-339: the same address the app talks to; a CRM login made at any other address has ended here too.
+const proxy = createCrmProxy({ file: paths.crmSession, crmUrl: crmUrlOf() })
 
 const prompter = createPrompter({ input: process.stdin, output: process.stdout })
 const io: Io = {

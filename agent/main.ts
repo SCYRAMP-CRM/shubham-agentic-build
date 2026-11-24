@@ -37,7 +37,7 @@ import { createUpdateState } from './update/state.ts'
 import { createBridge } from './claude/bridge.ts'
 import { createAuth } from './auth/index.ts'
 import { createFeatureAccess } from './auth/feature-access.ts'
-import { CRM_URL, CrmError, trimUrl } from './claude/crm.ts'
+import { CrmError, crmUrlOf } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
 import { findCodex, parseVersion } from './codex/find.ts'
@@ -308,10 +308,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let screen = false
   // Stable ports (order od91f): a member's hello says which block it has saved, so a Server that lost its table gives it the same one back.
   const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready, ...(role === 'member' ? { stableBlock: stable.mine() } : {}) })
+  // F-339: the ONE CRM address of this run (crm.ts crmUrlOf). The app's sign-in, the Devices sign-in and every reader of a stored CRM login use this one value; a stored login made at another address is ended.
+  const crmUrl = crmUrlOf(process.env)
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
   // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
   // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
-  const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), crmUrl: trimUrl(process.env.SAD_CRM_URL || CRM_URL), log: log.child('auth') })
+  const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), crmUrl, log: log.child('auth') })
   // Order o9465: Settings › Access (what is open to whom), beside auth.json; the agentic mount says who has shares once it is up.
   const featureAccess = createFeatureAccess({ dir: paths.agent, isAdmin: c => auth.isAdmin(c), directory: () => auth.directory(), log: log.child('access') })
   // F-008: other PCs' passwords remembered for Control (only as H1, never handed out).
@@ -342,7 +344,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     : createCodex({
         dir: path.join(paths.agent, 'codex'),
         deviceId: identity.id,
-        session: () => loadSession(paths.crmSession),
+        session: () => loadSession(paths.crmSession, crmUrl),
         find: () => findCodex(),
         log: log.child('codex'),
         // A newer login came while Codex chats ran: they hold the older one, so they restart on it (their conversations resume).
@@ -353,12 +355,13 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let member: { links: MemberLinks; discovery: DiscoveryClient } | null = null
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
+    crmUrl,
     // Order o68f0: the overlay Assistant's SSH tools use the Server's terminals (made further down; only called once the agent runs).
     ssh: () => (role === 'hub' ? sshTerm.assistant : null),
     pcControlDevices: () => [{ id: identity.id, name: config.name, online: true }, ...(role === 'hub' ? devices.members().map(p => ({ id: p.id, name: p.name, online: !!hub?.links.mux(p.id) })) : (() => { const h = devices.hub(); return h ? [{ id: h.id, name: h.name, online: !!member?.links.mux() }] : [] })())],
     codex,
-    openCodeCredential: provider => provider === 'opencode' ? Promise.resolve(FREE_CREDENTIAL) : openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
-    openCodeIdentity: () => { const s = loadSession(paths.crmSession); return s ? `${s.user.id}:${s.signedInAt}` : null },
+    openCodeCredential: provider => provider === 'opencode' ? Promise.resolve(FREE_CREDENTIAL) : openCodeCredential(loadSession(paths.crmSession, crmUrl), provider, `sad-${identity.id}`),
+    openCodeIdentity: () => { const s = loadSession(paths.crmSession, crmUrl); return s ? `${s.user.id}:${s.signedInAt}` : null },
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).
     // Order of130: with the id of the subscription it belongs to, from the same read (the chats file their usage under it); everything else reads name and value as before.
     credential: () => claude.credentialWithSubscription(),

@@ -43,6 +43,13 @@ export function capTitle(title: unknown): string {
   return t.length > TITLE_MAX ? `${t.slice(0, TITLE_MAX - 1).trimEnd()}…` : t
 }
 
+/** A person's name as the curtain shows it: the same invisible characters stripped as from a title (a name can hide or reorder text around it too), one line, at most NAME_MAX characters; "" when nothing is left. */
+export const NAME_MAX = 80
+export function capName(name: unknown): string {
+  const t = typeof name === 'string' ? name.replace(INVISIBLE, '').replace(/\s+/g, ' ').trim() : ''
+  return t.length > NAME_MAX ? `${t.slice(0, NAME_MAX - 1).trimEnd()}…` : t
+}
+
 const ORDER: Record<GoalStatus, number> = { todo: 0, done: 1, abandoned: 2 }
 
 /**
@@ -53,7 +60,7 @@ export function curtainOf(goals: readonly Goal[], members: readonly Member[], li
   const listed = new Map(goals.map(g => [g.id, g]))
   const on = goals.filter(g => !g.isDisabled)
   const here = on.filter(g => Object.hasOwn(links, g.id) && links[g.id] === floorId)
-  const named = (id: string) => members.find(m => m.userId === id)?.fullName ?? 'Someone'
+  const named = (id: string) => capName(members.find(m => m.userId === id)?.fullName) || 'Someone'
   const byDefault = rankGoals(here).sort((a, b) => ORDER[normaliseStatus(a.status)] - ORDER[normaliseStatus(b.status)])
   const ranked = order.length ? rankByOrderNewFirst(byDefault, order, g => (g.createdAt && Number.isFinite(Date.parse(g.createdAt)) ? Date.parse(g.createdAt) : null)) : byDefault
   const rows = ranked.map<CurtainRow>(g => {
