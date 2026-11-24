@@ -233,6 +233,7 @@ import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
+import { createMemoryDoor } from './memory-door.ts'
 import { createNotebooks, joinSections } from './memory-notebook.ts'
 import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, feedFloors, noteFloors, ownProjects, quickMayUseMemory, unfedFloors, type QuickTalker } from './memory-people.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
@@ -527,6 +528,8 @@ export interface AgenticOptions {
    * so the tests can prove two people's memories never mix; `main.ts` never sets it, and without it only the app owner has one.
    */
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[]; allowOthers?: boolean }
+  /** F-332, TESTS ONLY (main.ts never sets it): a stand-in for the new standalone memory's network, its two small files and its timeout (memory-door.ts). */
+  memoryDoorTest?: NonNullable<Parameters<typeof createMemoryDoor>[0]['test']>
   /** F-078: the heartbeat's timer runs unless this is false (tests) or SAD_HEARTBEAT=0 (the way it was). */
   heartbeat?: boolean
   /** F-083: the watchdog's checks run in the heartbeat's beat unless this is false (tests) or SAD_WATCHDOG=0 (the way it was). */
@@ -1170,6 +1173,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-309 N1: the agent notebooks (memory-notebook.ts), OFF until the owner switches them on and maps a floor to one (agent-notebooks/settings.json). Written by a chat's three notebook_* tools,
   // read by the owner through the /notebooks routes. Nothing in the F-051 layer flows into it; the F-051 guard (admins) only decides whether notes that record what a person said are served.
   const notebooks = createNotebooks({ dir: o.dir, floors: () => floors.list(), appOwnerId: SBSKRRT_OWNER.id, admins: () => o.auth?.admins() ?? [SBSKRRT_OWNER.id] })
+  // F-332 step 1: the client of the NEW standalone memory (its door and its key file are in <dir>/memory-door.json; memory-door.ts). It is used from one place only: memoryDoorOwner below.
+  const memoryDoor = createMemoryDoor({ dir: o.dir, admins: () => o.auth?.admins() ?? [SBSKRRT_OWNER.id], ownerId: SBSKRRT_OWNER.id, ...(log ? { log } : {}), ...(o.memoryDoorTest ? { test: o.memoryDoorTest } : {}) })
   // F-056: the task list (the Tasks tab, and the chats' task tools), kept on the hub like the floors.
   // Behind TaskStore (tasks.ts): a hosted database can take its place without anything else changing.
   const tasks = createFileTaskStore(path.join(o.dir, 'tasks.json'))
@@ -5727,6 +5732,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
     return notebooks.asOwner()
   }
+  /**
+   * F-332 step 1: the new standalone memory (memory-door.ts), his page only, and THE ONLY place `memoryDoor` is used. In this order, before anything is awaited and before the door's config or key is read:
+   * a chat's key and every caller who is not a signed-in CRM person are refused (humanOnly = requireCrmHuman: the agents on the Server must not read his secrets through the app), then every
+   * administrator who is not the first owner by id (firstOwnerOnly: a second owner too). The F-051 guard (another administrator => off for everybody) is asked by the module itself at the top of each call.
+   * The two /memory/new routes call this first.
+   */
+  function memoryDoorOwner(r: MountRequest) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    return memoryDoor
+  }
 
   /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
@@ -9281,6 +9297,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     // memory-door: R8
     ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await routeLayer(r)).setSettings(r.body) })],
+    // F-332 step 1: the NEW standalone memory (memory-door.ts), READ ONLY, his page only: each calls memoryDoorOwner first (a signed-in human, the first owner by id), before any await; the F-051 guard is asked by
+    // the module. They call no accessor of the F-051 layer, so they carry no `memory-door` marker (matrix rows R9 and R10 have no sites). The brain answers for the one caller; the scope is the only value that goes on.
+    ['GET', /^\/memory\/new\/status$/, async (_, r) => memoryDoorOwner(r).status()],
+    ['GET', /^\/memory\/new\/brain$/, async (_, r) => memoryDoorOwner(r).brain(r.query.get('scope'))],
     // F-309 N1: the agent notebooks, the OWNER's (notebookOwner: never a chat's key, the first owner by id). Each has its marker (notebook-door: K4..K9), so a tenth route is a red test.
     // notebook-door: K4
     ['GET', /^\/notebooks$/, (_, r) => notebookOwner(r).status()],

@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-BQVpt6HU.js";async function t({params:t}){let{id:n}=await t;e(`/goals/${n}`)}export{t as default};

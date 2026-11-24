@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-D2L_VfAl.js";function t(){e(`/goals`)}export{t as default};
