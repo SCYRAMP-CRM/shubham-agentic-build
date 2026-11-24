@@ -112,6 +112,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PATCH', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/beat$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
+  ['GET', /^\/goal-floors$/, OWNER],
+  ['PUT', /^\/floors\/([^/]+)\/goal-order$/, OWNER],
   ['GET', /^\/offline-chats$/, SIGNED],
   // F-211: the conversations' copy in the CRM drive, chat by chat (the owner of the app only).
   ['GET', /^\/conversations-drive$/, OWNER],

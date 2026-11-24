@@ -206,6 +206,10 @@ import { OLD_STAFF_TYPING, staffTypingOf, type StaffTyping } from '../../shared/
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals } from './crm-goals.ts'
+import { createGoalFloors } from './goal-floors.ts'
+import { LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
+import { checkOrderIds } from '../../shared/floor-goal-order.ts'
+import { GoalOrderError, createGoalOrder } from './floor-goal-order.ts'
 import { createCrmReads } from './crm-reads.ts'
 import { createCrmWrite } from './crm-write.ts'
 import { createCrmProxy, type CrmProxy } from './crmproxy.ts'
@@ -530,6 +534,10 @@ export interface AgenticOptions {
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[]; allowOthers?: boolean }
   /** F-332, TESTS ONLY (main.ts never sets it): a stand-in for the new standalone memory's network, its two small files and its timeout (memory-door.ts). */
   memoryDoorTest?: NonNullable<Parameters<typeof createMemoryDoor>[0]['test']>
+  /** F-334, TESTS ONLY (main.ts never sets it): what reads the goal -> floor link file, so a test can count its reads. */
+  goalFloorsTest?: { readText?: (file: string) => string | null }
+  /** F-334 addendum, TESTS ONLY (main.ts never sets it): what reads the goal order file, so a test can count its reads. */
+  goalOrderTest?: { readText?: (file: string) => string | null }
   /** F-078: the heartbeat's timer runs unless this is false (tests) or SAD_HEARTBEAT=0 (the way it was). */
   heartbeat?: boolean
   /** F-083: the watchdog's checks run in the heartbeat's beat unless this is false (tests) or SAD_WATCHDOG=0 (the way it was). */
@@ -1188,6 +1196,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log })
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
   const crmGoals = createCrmGoals({ proxy: crmProxy })
+  // F-334: which CRM goal was made by which floor's chat (the app's own small file; the CRM keeps no such field). Written only by the crm_goal_add case of toolFor, read only by GET /goal-floors.
+  const goalFloors = createGoalFloors({ dir: o.dir, log: o.log, ...(o.goalFloorsTest?.readText ? { readText: o.goalFloorsTest.readText } : {}) })
+  // F-334 addendum: the order of a floor's goals in its curtain (ids and positions only, goal-order.json). Written only by PUT /floors/:id/goal-order, read only by GET /goal-floors. The CRM is never touched.
+  const goalOrder = createGoalOrder({ dir: o.dir, log: o.log, ...(o.goalOrderTest?.readText ? { readText: o.goalOrderTest.readText } : {}) })
   const crmReads = createCrmReads({ proxy: crmProxy })
   const crmWrite = createCrmWrite({ proxy: crmProxy })
   // order o57e2, o4d14: the Accounts page's Email tab, read from the NEW Supabase project (schema sad; db/accounts/README.md) through the login sad_app named in two files in this state folder. Nothing connects
@@ -5743,6 +5755,40 @@ export function createAgentic(o: AgenticOptions): Agentic {
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
     return memoryDoor
   }
+  /**
+   * F-334: the links of CRM goals to floors (goal-floors.ts), his page only. In this order, before the file is read: a chat's key and every caller who is not a signed-in CRM person are refused (humanOnly), then
+   * every administrator who is not the first owner by id (firstOwnerOnly: a second owner too). The F-051 guard is not asked: the file holds goal ids and floor ids, never a word of a chat or of a goal, and the
+   * route never calls the CRM.
+   */
+  function goalFloorsOwner(r: MountRequest) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    return goalFloors
+  }
+
+  /**
+   * F-334 addendum: PUT /floors/<floor>/goal-order { ids } -> { ok, order }: his reorder of the goals shown in a floor's curtain. In this order, and every step BEFORE the order file is read or written: a chat's key and every
+   * non-person are refused (humanOnly), every administrator who is not the first owner by id (firstOwnerOnly), a floor id that is not well formed or not a floor of this app (404), a body that is not exactly { ids },
+   * and ids that are not 1 to 1000 distinct goal ids ALL linked to THIS floor in the link file (another floor's goal, a goal no floor made, a repeat or a made-up id: 400, nothing written). The CRM is never called and no
+   * goal text exists here; the log line is the floor id and a count.
+   */
+  function saveGoalOrder(r: MountRequest, floorId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+    floorOf(floorId)
+    const body = r.body
+    const refused = () => Object.assign(apiError(400, 'Those goals cannot be put in order.'), { code: 'goal-order-ids' })
+    if (!isObject(body) || Object.keys(body).length !== 1 || !('ids' in body)) throw refused()
+    const linkedHere = new Set(Object.entries(goalFloors.links()).filter(([, f]) => f === floorId).map(([id]) => id))
+    if (checkOrderIds(body.ids, linkedHere) !== null) throw refused()
+    try {
+      return { ok: true, order: goalOrder.save(floorId, body.ids as string[], linkedHere) }
+    } catch (e) {
+      if (e instanceof GoalOrderError && e.kind === 'invalid') throw refused()
+      throw Object.assign(apiError(503, 'The order could not be saved.'), { code: 'goal-order-write' })
+    }
+  }
 
   /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
@@ -6735,6 +6781,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'crm_goal_add': {
         const out = await crmGoals.add(args)
         log?.info(`${agent.name} added a CRM goal`)
+        // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.
+        goalFloors.link(goalIdOfAnswer(out), { floorId: floor.id, agentId: agent.id })
         return out
       }
       case 'crm_goal_update': {
@@ -8547,6 +8595,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return heartbeat.state()
       }],
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
+    // F-334 (his odf14, o09a5, o307d): the curtain of a floor's CRM goals asks which goals this app's chats made, and for which floor: goal id -> floor id, nothing else. The same owner checks first, before the file is read; no CRM call.
+    ['GET', /^\/goal-floors$/, (_, r) => {
+      const links = goalFloorsOwner(r).links()
+      return { links, orders: goalOrder.orders() }
+    }],
+    // F-334 addendum (his: "the ability to reorder the goals"): the order of one floor's goals, the owner's page only; ids only; the CRM is not touched. Every check comes before the order file is read or written.
+    ['PUT', /^\/floors\/([^/]+)\/goal-order$/, ([floorId], r) => saveGoalOrder(r, floorId)],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).

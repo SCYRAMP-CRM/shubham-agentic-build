@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Role, Route } from '../shared/agent-api.ts'
@@ -242,12 +242,17 @@ export function stableOf(c: Pick<ConfigFile, 'stablePorts'>): { on: boolean; sha
   return { on: s.on, share: s.share, block }
 }
 
-// Written whole to a temp name, then renamed, so a reader never sees half a file.
+// Written whole to a temp name, then renamed, so a reader never sees half a file. If the write or the rename fails, the temp file is removed (nothing is left behind) and the error goes on.
 export function writeAtomic(file: string, text: string, mode?: number) {
   mkdirSync(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
-  writeFileSync(tmp, text, mode === undefined ? undefined : { mode })
-  renameSync(tmp, file)
+  try {
+    writeFileSync(tmp, text, mode === undefined ? undefined : { mode })
+    renameSync(tmp, file)
+  } catch (e) {
+    rmSync(tmp, { force: true })
+    throw e
+  }
 }
 
 /** config.json as stored; created with the defaults when missing. */
