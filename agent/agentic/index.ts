@@ -181,7 +181,7 @@ import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shar
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
 import { AGENT_API_PREFIX } from '../../shared/agent-api.ts'
-import type { ChatOwner, ChatShare } from '../../shared/auth.ts'
+import { SBSKRRT_ID, type ChatOwner, type ChatShare } from '../../shared/auth.ts'
 import type { FeatureAccess } from '../auth/feature-access.ts'
 import type { Auth } from '../auth/index.ts'
 import { authError, OPEN, type Caller } from '../auth/types.ts'
@@ -205,9 +205,10 @@ import { broadcastTargets } from './broadcast-targets.ts'
 import { OLD_STAFF_TYPING, staffTypingOf, type StaffTyping } from '../../shared/staff-typing.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
-import { createCrmGoals } from './crm-goals.ts'
+import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
 import { LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
+import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../shared/goal-add.ts'
 import { checkOrderIds } from '../../shared/floor-goal-order.ts'
 import { GoalOrderError, createGoalOrder } from './floor-goal-order.ts'
 import { createCrmReads } from './crm-reads.ts'
@@ -1544,6 +1545,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const f = allFloors().find(x => x.id === id)
     if (!f) { pickFloors().get(id); throw apiError(404, 'No such floor') }
     return f
+  }
+
+  /**
+   * F-343 (his "we need directly in the mcp to add goals in a floor"): the floor a chat's NEW goal goes on. Nothing named = the floor of the calling chat (unchanged). `want` is a floor's id or its name, resolved HERE against
+   * the app's own list of floors, never trusted as given: an exact id, else an exact name without regard to capitals; a name more than one floor has is refused with the candidates (id, name, number of agents), so the chat
+   * can call again with an id; an unknown one is refused and lists nothing; a floor is never made. Only the owner's chats have crm_goal_add at all (ADMIN_TOOLS), and that gate is asked before this.
+   */
+  function goalFloorFor(want: unknown, own: Floor): Floor {
+    if (want === undefined || want === null) return own
+    if (typeof want !== 'string') throw apiError(400, 'floor must be the name or the id of a floor')
+    const t = want.trim()
+    if (!t) return own
+    const all = allFloors()
+    const byId = all.find(f => f.id === t)
+    if (byId) return byId
+    const named = all.filter(f => f.name.trim().toLowerCase() === t.toLowerCase())
+    if (named.length === 1) return named[0]
+    const shown = t.slice(0, 60)
+    if (named.length > 1) {
+      const lines = named.slice(0, 20).map(f => `${f.id} · ${f.name} · ${f.agents.length} agents`)
+      throw Object.assign(apiError(409, `More than one floor is called "${shown}": call again with floor set to one of these ids. Nothing was added.\n${lines.join('\n')}`), { code: 'floor-ambiguous' })
+    }
+    throw Object.assign(apiError(404, `No floor is called "${shown}" here. Nothing was added.`), { code: 'floor-unknown' })
   }
 
   function agentOf(floor: Floor, id: string): FloorAgent {
@@ -5792,6 +5816,62 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  /** F-343: the goals a person added by hand, by the client-made request id of one press of Save (10 minutes): a double tap or a retry is ONE goal. A failed one is forgotten at once. */
+  const handGoals = new Map<string, { at: number; work: Promise<{ id: string; goal: unknown }> }>()
+
+  /**
+   * F-343 (Shubham: "can it add goals in the alt+g" / "yes please do it"): POST /floors/<floor>/goals { title, description?, priority?, dueDate?, requestId } -> { id, goal }: a goal added BY HAND in the goals curtain of a
+   * floor, in the REAL CRM as the person signed in to it on this PC, linked to that floor. In this order, and every step BEFORE the CRM is called: a chat's key, a machine token and every caller who is not a signed-in CRM
+   * person are refused (humanOnly), every administrator who is not the first owner by id (firstOwnerOnly: a second owner too), a floor id that is not well formed or not a floor of this app (404), a body that is not
+   * exactly the allowed keys with their limits and a due date that is a real day (400 goal-text). Then the SAME crmGoals.add the chat tool uses, with the floor and NO agent (a person made it: the CRM gets the floor
+   * only; the link file keeps the fixed word BY_HAND). Every refusal is one fixed sentence with a code (shared/goal-add.ts): the CRM's own words and the typed text are never in an answer, an error or a log line;
+   * the log line is the floor id, the goal id and the time.
+   */
+  function addGoalByHand(r: MountRequest, floorId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+    floorOf(floorId)
+    const refuse = (status: number, code: GoalAddCode) => Object.assign(apiError(status, GOAL_ADD_WORDS[code]), { code })
+    const checked = checkGoalAdd(r.body)
+    if (!checked.ok) throw refuse(400, 'goal-text')
+    const { requestId, ...fields } = checked.value
+    try {
+      if (fields.dueDate !== undefined) dayOf(fields.dueDate, Date.now())
+    } catch {
+      throw refuse(400, 'goal-text')
+    }
+    const t = Date.now()
+    for (const [k, v] of handGoals) if (t - v.at > 600_000) handGoals.delete(k)
+    const kept = handGoals.get(requestId)
+    if (kept) return kept.work
+    const work = (async () => {
+      let out: string
+      try {
+        out = await crmGoals.add(fields, { floorId, agentId: null }, { userId: SBSKRRT_ID })
+      } catch (e) {
+        if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'goal-signin-other')
+        const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+        throw status === 409 ? refuse(409, 'goal-signin') : status >= 400 && status < 500 ? refuse(400, 'goal-refused') : refuse(502, 'goal-down')
+      }
+      let answer: unknown = null
+      try {
+        answer = JSON.parse(out)
+      } catch {
+        // an answer that is not JSON: the goal is made all the same; the id is then unknown
+      }
+      const made = goalIdOfAnswer(out)
+      if (made !== null) goalFloors.link(made, { floorId, agentId: BY_HAND })
+      const id = made ?? (isObject(answer) && typeof answer.id === 'string' ? answer.id : null)
+      if (id === null) throw refuse(502, 'goal-down')
+      o.log?.info(`goal added by hand: floor ${floorId.slice(0, 64)}, goal ${id.slice(0, 64)}, ${Date.now() - t} ms`)
+      return { id, goal: isObject(answer) ? (answer.goal ?? null) : null }
+    })()
+    handGoals.set(requestId, { at: t, work })
+    work.catch(() => handGoals.delete(requestId))
+    return work
+  }
+
   /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
    * the approvals and send-as-me routes) and the owner of the app; the version he was shown; once. A hand-off card is typed as an order marked "he
@@ -6782,12 +6862,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return crmGoals.list(args)
       case 'crm_goal_add': {
         // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
-        const out = await crmGoals.add(args, { floorId: floor.id, agentId: agent.id })
+        // F-343: the goal goes on the floor the chat NAMES (resolved above against the app's own list, owner-only tool), else its own; the origin floor sent to the CRM and the link file below use the SAME resolved floor.
+        const target = goalFloorFor(args.floor, floor)
+        const out = await crmGoals.add(args, { floorId: target.id, agentId: agent.id })
         log?.info(`${agent.name} added a CRM goal`)
         // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.
         // Only the answer of the call that MADE the goal has an id here; a call that only found it already made (a duplicate) answers without one and links nothing (and logs nothing).
         const madeId = goalIdOfAnswer(out)
-        if (madeId !== null) goalFloors.link(madeId, { floorId: floor.id, agentId: agent.id })
+        if (madeId !== null) goalFloors.link(madeId, { floorId: target.id, agentId: agent.id })
         return out
       }
       case 'crm_goal_update': {
@@ -8607,6 +8689,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }],
     // F-334 addendum (his: "the ability to reorder the goals"): the order of one floor's goals, the owner's page only; ids only; the CRM is not touched. Every check comes before the order file is read or written.
     ['PUT', /^\/floors\/([^/]+)\/goal-order$/, ([floorId], r) => saveGoalOrder(r, floorId)],
+    // F-343 (his "yes please do it"): a goal added by hand in a floor's goals curtain. The owner's page only; every check comes before the CRM is called (addGoalByHand); the ONE other caller of crmGoals.add is the chat tool.
+    ['POST', /^\/floors\/([^/]+)\/goals$/, ([floorId], r) => addGoalByHand(r, floorId)],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).

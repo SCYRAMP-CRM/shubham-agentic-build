@@ -327,10 +327,11 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'crm_goal_add',
     description:
-      "Add a goal to the CRM's Goals page. A PRODUCTION WRITE: the whole company sees it at once and it is by the signed-in person (see crm_whoami). Only call it when Shubham has said this goal is to be added (\"add a goal ...\", \"note this as a goal\"): never to tidy up, mirror something, or on your own initiative; one goal per call, in his words with enough context to act on later. It is a General goal (the whole organisation) assigned to him unless you name others. Check crm_goals first if it may exist already; the same goal sent twice within minutes is added once.",
+      "Add a goal to the CRM's Goals page. A PRODUCTION WRITE: the whole company sees it at once and it is by the signed-in person (see crm_whoami). Only call it when Shubham has said this goal is to be added (\"add a goal ...\", \"note this as a goal\"): never to tidy up, mirror something, or on your own initiative; one goal per call, in his words with enough context to act on later. It is a General goal (the whole organisation) assigned to him unless you name others. Check crm_goals first if it may exist already; the same goal sent twice within minutes is added once. FLOOR: the goal is put on the floor of the chat that adds it (a Lead adding to its own floor passes nothing). When Shubham says to add it \"in floor X\", \"on the Sales floor\" and the like, pass floor with that floor's name (or its id): it is looked up in the app's own list of floors; a name that more than one floor has is refused with the candidates, so retry with an id; an unknown floor is refused; a floor is never made here.",
     inputSchema: {
       type: 'object',
       properties: {
+        floor: { type: 'string', description: "Only when he names another floor: that floor's name or id (exact; a name is matched without regard to capitals). Left out: the floor of this chat." },
         title: { type: 'string', description: 'What is to be done (at most 500 characters). Required.' },
         description: { type: 'string', description: 'More detail (at most 5000 characters).' },
         priority: { type: 'string', enum: ['low', 'medium', 'high', 'urgent'], description: 'Default medium.' },

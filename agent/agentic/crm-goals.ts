@@ -33,7 +33,8 @@ export interface CrmGoalsOptions {
 /** F-334-1: the floor and the agent of the chat that is making the goal. The CRM keeps them on the goal (origin_floor_id, origin_agent_id) so the goals curtain can tell which floor made it, whoever reads it. */
 export interface GoalOrigin {
   floorId: string
-  agentId: string
+  /** null: a goal a PERSON added by hand in the curtain (F-343): no chat made it, so the CRM gets the floor only. */
+  agentId: string | null
 }
 
 interface Person {
@@ -211,7 +212,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     },
 
     /** A new goal, an organisation goal ("General" on the Goals page), assigned to the signed-in person unless told otherwise. */
-    async add(args: Record<string, unknown>, origin: GoalOrigin | null = null): Promise<string> {
+    async add(args: Record<string, unknown>, origin: GoalOrigin | null = null, expect: { userId: string } | null = null): Promise<string> {
       const title = words(args.title, 'title', MAX_TITLE, true)!
       const description = words(args.description, 'description', MAX_DESCRIPTION, false)
       const priority = oneOf(args.priority, PRIORITIES, 'priority') ?? 'medium'
@@ -223,6 +224,8 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         parent = args.parentGoalId
       }
       const who = await me()
+      // F-343 (Agent 14's read): a goal a PERSON adds by hand is made as the person the CRM login on this PC belongs to; F-342 keeps another person's good login, so it is only made when that is who the caller expects (the first owner). Nothing is written otherwise.
+      if (expect !== null && who.id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
       const assignees = args.assignees === undefined ? [who.id] : await people(args.assignees, who)
       const board = await boardOf(args, 'add')
       // The same goal sent twice in minutes is the one that is there: no second goal in the company's CRM for a retry.
@@ -248,7 +251,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       }
       // F-334-1: the floor and the agent that made it go to the CRM with the goal (UUIDs only). A backend that does not know the two fields either ignores them or refuses them (400): the goal is then sent ONCE more without
       // them, and only the app's own link (goal-floors) says which floor made it. Nothing here ever edits a goal that already exists.
-      const originFields = origin !== null && UUID.test(origin.floorId) && UUID.test(origin.agentId) ? { origin_floor_id: origin.floorId.toLowerCase(), origin_agent_id: origin.agentId.toLowerCase() } : null
+      const originFields = origin !== null && UUID.test(origin.floorId) && (origin.agentId === null || UUID.test(origin.agentId)) ? { origin_floor_id: origin.floorId.toLowerCase(), ...(origin.agentId !== null ? { origin_agent_id: origin.agentId.toLowerCase() } : {}) } : null
       const post = (async () => {
         let got: Goal
         try {
