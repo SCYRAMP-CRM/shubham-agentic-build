@@ -61,6 +61,8 @@ export const TOKEN_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
 export const API_KEY_VAR = 'ANTHROPIC_API_KEY'
 const varOf = (kind: ClaudeKind) => (kind === 'api_key' ? API_KEY_VAR : TOKEN_VAR)
 export const CHECK_EVERY_MS = 60 * 60 * 1000
+/** F-342: the first owner's app sign-in renews the PC's CRM login only when less than this is left of its 7 days (it is never renewed before, so signing in from another device restarts nothing). */
+export const RENEW_BELOW_MS = 2 * 24 * 60 * 60 * 1000
 /** The CRM's own codes for a person whose subscription's week is used up, or that was turned off. */
 export const USED_UP_CODES: ReadonlySet<string> = new Set(['WEEKLY_CAP_REACHED', 'SUBSCRIPTION_DISABLED'])
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
@@ -150,6 +152,19 @@ export interface ClaudeSubscription {
   credentialWithSubscription(): { name: string; value: string; subscriptionId: string } | null
   /** Signs in to the CRM and asks it at once; throws CrmError when the CRM says no or can't be reached. */
   signIn(login: string, password: string): Promise<ClaudeInfo>
+  /**
+   * F-342 (one sign-in): this PC's CRM login made from a CRM session the app's own sign-in already holds (the first owner's), so he signs in once. No second request to the CRM, no password. In the same
+   * queue, through the same writer, file and mode as signIn; the login it writes is marked `source: 'app'` (so the app's last sign-out can end it; never the cookie). THE RENEWAL RULE: a still-good login of
+   * the SAME person at this run's address with at least RENEW_BELOW_MS (2 days) left is LEFT EXACTLY AS IT IS ('current': not rewritten, its cookie and time unchanged, so a sign-in from another device
+   * renews nothing and restarts nothing that follows the login); it is replaced ('saved') only when there is none, it was made at another address, it has ended, or less than 2 days remain.
+   * 'kept': a login of ANOTHER person that is still good is there, and stays. 'other-address': the session is not at this run's CRM address, nothing was written. It does not fetch the Claude credential (the check does).
+   */
+  adoptSession(s: CrmSession): Promise<'saved' | 'current' | 'kept' | 'other-address'>
+  /**
+   * F-342: the app's LAST sign-out of the first owner ends the login the app made (marked `source: 'app'`), through the steps the Devices sign-out takes (the credential it placed comes out, the switch is
+   * forgotten, the login is removed). 'not-app-made': there is no login, or it is the Devices sign-in's (only Devices ends that): nothing was done.
+   */
+  endAppLogin(): Promise<'ended' | 'not-app-made'>
   /** Asks the CRM again (when signed in). `replace` takes over a CLAUDE_CODE_OAUTH_TOKEN something else set. */
   check(opts?: { replace?: boolean }): Promise<ClaudeInfo>
   /** Takes out the token the app put in and forgets the session. */
@@ -209,6 +224,7 @@ export function loadSession(file: string, crmUrl?: string): CrmSession | null {
     cookie: raw.cookie,
     signedInAt: raw.signedInAt,
     user: { id: u.id, name: u.name, username: str(u.username) ? u.username : null, email: str(u.email) ? u.email : null },
+    ...(raw.source === 'app' ? { source: 'app' as const } : {}),
   }
 }
 
@@ -434,6 +450,19 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     lastCheck = { at: iso(now()), result: 'error', message: 'The CRM ended this session. Sign in again.' }
     choices = []
     allowed = null
+  }
+
+  /**
+   * What follows a CRM sign-in, whoever made it (Settings › Devices, or the first owner's sign-in to the app, F-342): another person's credential comes out first, what the last person's switch
+   * remembers is forgotten, the login is kept (the one writer), and one line says so. `line` holds no cookie and no password.
+   */
+  async function install(next: CrmSession, line: string) {
+    // Someone else signing in here: what the last person's subscription put in comes out
+    // first, so nobody keeps running on another's account.
+    if (session && session.user.id !== next.user.id && placed) await unplace(`${next.user.name} signed in instead of ${session.user.name}`)
+    if ((session && session.user.id !== next.user.id) || (store.state().userId !== null && store.state().userId !== next.user.id)) forgetSwitch()
+    saveSession(next)
+    log.info(line)
   }
 
   async function ask(replace: boolean) {
@@ -708,14 +737,50 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
           busy = false
           o.onChange()
         }
-        // Someone else signing in here: what the last person's subscription put in comes out
-        // first, so nobody keeps running on another's account.
-        if (session && session.user.id !== next.user.id && placed) await unplace(`${next.user.name} signed in instead of ${session.user.name}`)
-        if ((session && session.user.id !== next.user.id) || (store.state().userId !== null && store.state().userId !== next.user.id)) forgetSwitch()
-        saveSession(next)
-        log.info(`signed in to the CRM at ${url} as ${next.user.name}`)
+        await install(next, `signed in to the CRM at ${url} as ${next.user.name}`)
         await ask(false)
         return status()
+      }),
+
+    adoptSession: s =>
+      serial(async () => {
+        // Its 7 days count on this PC's clock, as for the Devices sign-in. Marked as the app's: only the app's last sign-out ends a login with this mark.
+        const next: CrmSession = { ...s, signedInAt: iso(now()), source: 'app' }
+        if (!sameCrm(next.url, url)) return 'other-address'
+        if (session && now() < expiresAt(session)) {
+          // A still-good login of ANOTHER person is theirs to end (their Devices sign-out, or their 7 days): the first owner's app sign-in does not replace it.
+          if (session.user.id.toLowerCase() !== next.user.id.toLowerCase()) {
+            log.info(`the CRM login kept on this PC is ${session.user.name}'s and still good: ${next.user.name}'s sign-in to the app did not replace it`)
+            return 'kept'
+          }
+          // The same person's, with at least 2 days left: left exactly as it is (not rewritten, same cookie, same time). Replacing it would make everything that follows the login restart (Codex chats do) at every sign-in from every device.
+          if (expiresAt(session) - now() >= RENEW_BELOW_MS) return 'current'
+        }
+        const before = session
+        try {
+          await install(next, `this PC's CRM login was made from ${next.user.name}'s sign-in to the app (${url})`)
+        } catch (e) {
+          // saveSession holds the login in memory before it writes the file: a write that failed must not leave Devices claiming a login that is not on disk.
+          session = before
+          throw e
+        }
+        // A line left by an ended or other-address login is not about this one.
+        if (before === null) lastCheck = null
+        o.onChange()
+        return 'saved'
+      }),
+
+    endAppLogin: () =>
+      serial(async () => {
+        if (!session || session.source !== 'app') return 'not-app-made'
+        // The steps of the Devices sign-out: what the person's subscription put in comes out, the switch is forgotten, the login goes.
+        await unplace('the app signed out for the last time')
+        log.info(`this PC's CRM login (made from ${session.user.name}'s sign-in to the app) ended with the app's last sign-out`)
+        saveSession(null)
+        lastCheck = null
+        forgetSwitch()
+        o.onChange()
+        return 'ended'
       }),
 
     check: (opts = {}) =>

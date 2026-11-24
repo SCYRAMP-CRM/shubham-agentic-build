@@ -31,6 +31,9 @@ export interface Goal {
   assignedBy?: string | null
   /** o410f: who made the goal (the CRM's goals.created_by). Absent on an older backend. */
   createdBy?: string | null
+  /** F-334-1: the floor and the agent of the chat that made the goal (the CRM's goals.origin_floor_id / origin_agent_id, which this app sends when a chat adds a goal). null on a goal made any other way or before; absent on an older backend. */
+  originFloorId?: string | null
+  originAgentId?: string | null
 }
 
 /** A task in the CRM's Today bucket (the bucket holds goal ids; its answer keeps the old "task" keys). */

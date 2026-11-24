@@ -313,7 +313,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
   // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
   // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
-  const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), crmUrl, log: log.child('auth') })
+  // F-342 (one sign-in): the first owner's sign-in to the app also makes this PC's CRM login, through the Claude module (the one writer of it, built above); it is renewed only when less than 2 days of its 7 remain, and his
+  // LAST app sign-out ends a login made this way (never one the Devices sign-in made).
+  const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), adoptPcLogin: s => claude.adoptSession(s), forgetPcLogin: () => claude.endAppLogin(), crmUrl, log: log.child('auth') })
   // Order o9465: Settings › Access (what is open to whom), beside auth.json; the agentic mount says who has shares once it is up.
   const featureAccess = createFeatureAccess({ dir: paths.agent, isAdmin: c => auth.isAdmin(c), directory: () => auth.directory(), log: log.child('access') })
   // F-008: other PCs' passwords remembered for Control (only as H1, never handed out).

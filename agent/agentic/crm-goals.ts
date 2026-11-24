@@ -1,6 +1,7 @@
 import { isMine, normaliseStatus, rankGoals, assigneesOf, dueDay, type Goal, type Member } from '../../shared/goals.ts'
 import { apiError } from '../api.ts'
-import { createCrmCall } from './crm-call.ts'
+import { UUID } from '../claude/crm.ts'
+import { createCrmCall, isObject } from './crm-call.ts'
 import { createCrmScopes } from './crm-scopes.ts'
 import type { CrmProxy } from './crmproxy.ts'
 
@@ -27,6 +28,12 @@ const json = (v: unknown) => JSON.stringify(v, null, 2)
 export interface CrmGoalsOptions {
   proxy: Pick<CrmProxy, 'request' | 'session'>
   now?: () => number
+}
+
+/** F-334-1: the floor and the agent of the chat that is making the goal. The CRM keeps them on the goal (origin_floor_id, origin_agent_id) so the goals curtain can tell which floor made it, whoever reads it. */
+export interface GoalOrigin {
+  floorId: string
+  agentId: string
 }
 
 interface Person {
@@ -204,7 +211,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     },
 
     /** A new goal, an organisation goal ("General" on the Goals page), assigned to the signed-in person unless told otherwise. */
-    async add(args: Record<string, unknown>): Promise<string> {
+    async add(args: Record<string, unknown>, origin: GoalOrigin | null = null): Promise<string> {
       const title = words(args.title, 'title', MAX_TITLE, true)!
       const description = words(args.description, 'description', MAX_DESCRIPTION, false)
       const priority = oneOf(args.priority, PRIORITIES, 'priority') ?? 'medium'
@@ -239,8 +246,17 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         ...(board ?? { target_type: 'organization' }),
         ...(parent ? { parent_goal_id: parent } : {}),
       }
+      // F-334-1: the floor and the agent that made it go to the CRM with the goal (UUIDs only). A backend that does not know the two fields either ignores them or refuses them (400): the goal is then sent ONCE more without
+      // them, and only the app's own link (goal-floors) says which floor made it. Nothing here ever edits a goal that already exists.
+      const originFields = origin !== null && UUID.test(origin.floorId) && UUID.test(origin.agentId) ? { origin_floor_id: origin.floorId.toLowerCase(), origin_agent_id: origin.agentId.toLowerCase() } : null
       const post = (async () => {
-        const got = await crm<Goal>('POST', 'v1/org/goals', body)
+        let got: Goal
+        try {
+          got = await crm<Goal>('POST', 'v1/org/goals', originFields ? { ...body, ...originFields } : body)
+        } catch (e) {
+          if (!(originFields && isObject(e) && e.status === 400)) throw e
+          got = await crm<Goal>('POST', 'v1/org/goals', body)
+        }
         if (!got || typeof got.id !== 'string') throw apiError(502, 'The CRM answered without the goal. Check the Goals page before adding it again.')
         recent.set(key, { id: got.id, at: t })
         return got

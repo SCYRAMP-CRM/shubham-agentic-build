@@ -31,7 +31,8 @@ import { authError, type Caller } from './types.ts'
 // name), when it began and was last used; the CRM's member list for the Share picker; and the
 // settings. NEVER a password, a CRM cookie or a session token: the password goes to the CRM once,
 // the CRM cookie is retained only in a private memory companion for F-144 saved-view sync;
-// it is removed with its app session and is unavailable after restart. No CRM cookie is persisted.
+// it is removed with its app session and is unavailable after restart. No CRM cookie is persisted BY THIS MODULE. F-342: the first owner's CRM session is also handed, once, to the
+// PC's own CRM login (option adoptPcLogin, main.ts): the Claude module keeps it where the Devices sign-in keeps its login, with the same writer, file and mode.
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_MS = AUTH_SESSION_DAYS * DAY_MS
@@ -132,6 +133,17 @@ export interface AuthOptions {
     listMembers(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<CrmMember[]>
   }
   log?: Logger
+  /**
+   * F-342 (one sign-in): called with the CRM session of the FIRST owner's sign-in (Shubham, by id: the test `isFirstOwner` makes), once the app's own session exists, so this PC's CRM login is made from that
+   * session and he signs in once. Never for a second owner, staff, a refused sign-in or the open app. Not waited for (a slow PC queue never holds the sign-in). If it throws or rejects, one line says so (the
+   * error code only, never the cookie) and the sign-in is as it was. The session holds the cookie: the callee keeps it in the one place the PC's login already lives and nowhere else.
+   */
+  adoptPcLogin?: (session: CrmSession) => unknown
+  /**
+   * F-342: called when the FIRST owner's LAST app session has just been ended by a sign-out, so the PC's CRM login the app made (marked as the app's, never the Devices sign-in's) ends with it. Other sessions of his
+   * (his phone, his laptop) keep it alive; a session that only expires or idles out, or is revoked, does not end it. Not waited for; a failure is one line with the error code only.
+   */
+  forgetPcLogin?: () => unknown
 }
 
 export interface SignedIn {
@@ -416,8 +428,35 @@ export function createAuth(o: AuthOptions): Auth {
     sweep()
     save()
     log?.info(`${user.username} (${user.id.slice(0, 8)}) signed in${c.via === 'tailnet' ? ' over the tailnet' : ''}`)
+    // F-342: the first owner's CRM session also becomes this PC's CRM login (the comparison isFirstOwner makes, by id). The session is the one the CRM gave above: no second sign-in, the password is not kept.
+    if (user.id.toLowerCase() === SBSKRRT_ID) handToPc(session)
     const next: Caller = { person: personOf(user), via: c.via, sid: hash(token).slice(0, 12) }
     return { status: status(next), cookie: cookieHeader(token, SESSION_MS / 1000, secure) }
+  }
+
+  /** F-342: starts `run` and does not wait for it; a failure is one line with the error code (a message could hold a path, never the cookie, but only the code is said). */
+  function toPc(run: () => unknown, what: string, done: string) {
+    const failed = (e: unknown) => {
+      const code = isObject(e) && typeof e.code === 'string' ? ` (${e.code.slice(0, 20)})` : ''
+      log?.warn(`${what}${code}; ${done} itself is done`)
+    }
+    try {
+      Promise.resolve(run()).catch(failed)
+    } catch (e) {
+      failed(e)
+    }
+  }
+
+  /** F-342: the first owner's CRM session becomes this PC's CRM login (adoptPcLogin). */
+  function handToPc(session: CrmSession) {
+    const adopt = o.adoptPcLogin
+    if (adopt) toPc(() => adopt(session), "this PC's CRM login could not be made from the sign-in", 'the sign-in')
+  }
+
+  /** F-342: the app's last sign-out of the first owner ends the PC login the app made (forgetPcLogin). */
+  function leavePc() {
+    const forget = o.forgetPcLogin
+    if (forget) toPc(() => forget(), "this PC's CRM login could not be ended with the app sign-out", 'the sign-out')
   }
 
   function cookieHeader(value: string, maxAgeSeconds: number, secure: boolean) {
@@ -429,6 +468,8 @@ export function createAuth(o: AuthOptions): Auth {
     if (row) {
       log?.info(`${row.user.username} (${row.user.id.slice(0, 8)}) signed out`)
       drop(row.h, 'signed-out')
+      // F-342: the first owner's LAST live app session just ended by a sign-out: the PC login the app made ends with it. A sign-out on one device leaves it to his other sessions.
+      if (row.user.id.toLowerCase() === SBSKRRT_ID && !f.sessions.some(s => s.user.id.toLowerCase() === SBSKRRT_ID && liveRow(s.h))) leavePc()
     }
     return { status: status({ person: null, via: c.via, sid: null }), cookie: cookieHeader('', 0, false) }
   }

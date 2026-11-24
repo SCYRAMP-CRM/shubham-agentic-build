@@ -42,6 +42,8 @@ export interface CrmSession {
   cookie: string
   user: CrmUser
   signedInAt: string
+  /** F-342: 'app' when this login was made from the first owner's sign-in to the app (so the app's last sign-out ends it); absent for the Devices sign-in's, which only Devices ends. Never the cookie. */
+  source?: 'app'
 }
 
 /** The CRM said no (`status` its HTTP status, `code` its own code), or no answer came (`status` null). */

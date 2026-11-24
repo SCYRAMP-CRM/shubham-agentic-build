@@ -53,13 +53,25 @@ export function capName(name: unknown): string {
 const ORDER: Record<GoalStatus, number> = { todo: 0, done: 1, abandoned: 2 }
 
 /**
+ * The ONE place that says which floor a goal belongs to: the floor id of the app's OWN link first (goal id -> floor id, agent/agentic/goal-floors.ts, written by this app when a chat adds a goal: nobody else can
+ * change it); only for a goal with no link, the floor id the CRM carries on the goal itself (originFloorId, sent by this app when a chat adds a goal, an older backend or another PC), when it is a well-formed id;
+ * else null, no floor made it. The CRM's field is only a fallback to SHOW the goal (anyone who may edit a goal in the CRM could write any floor id there, so it never overrules the app's own record, and a goal
+ * known only by it is shown, not reordered: the order route knows only linked goals). `curtainOf` asks only this. Nothing ever writes a floor onto a goal that already exists.
+ */
+export function floorOfGoal(goal: Pick<Goal, 'id' | 'originFloorId'>, links: Readonly<Record<string, string>>): string | null {
+  if (Object.hasOwn(links, goal.id)) return links[goal.id]
+  const own = goal.originFloorId
+  return typeof own === 'string' && LINK_ID_RE.test(own) ? own : null
+}
+
+/**
  * What a floor's curtain shows. `order` is the floor's saved order (the person's own, from the app's order file): with one, the goals never placed come FIRST (the newest first: a new goal goes to the top), then the placed
  * ones in their saved order, all statuses in ONE list (a status filter then shows its goals in their relative order, so the hidden ones keep their place). Without one, the Goals page's own ranking, open goals first.
  */
 export function curtainOf(goals: readonly Goal[], members: readonly Member[], links: Readonly<Record<string, string>>, floorId: string, order: readonly string[] = []): Curtain {
   const listed = new Map(goals.map(g => [g.id, g]))
   const on = goals.filter(g => !g.isDisabled)
-  const here = on.filter(g => Object.hasOwn(links, g.id) && links[g.id] === floorId)
+  const here = on.filter(g => floorOfGoal(g, links) === floorId)
   const named = (id: string) => capName(members.find(m => m.userId === id)?.fullName) || 'Someone'
   const byDefault = rankGoals(here).sort((a, b) => ORDER[normaliseStatus(a.status)] - ORDER[normaliseStatus(b.status)])
   const ranked = order.length ? rankByOrderNewFirst(byDefault, order, g => (g.createdAt && Number.isFinite(Date.parse(g.createdAt)) ? Date.parse(g.createdAt) : null)) : byDefault
@@ -71,7 +83,7 @@ export function curtainOf(goals: readonly Goal[], members: readonly Member[], li
   const counts: Record<GoalStatus, number> = { todo: 0, done: 0, abandoned: 0 }
   for (const r of rows) counts[r.status]++
   const gone = Object.entries(links).filter(([id, f]) => f === floorId && (!listed.has(id) || listed.get(id)!.isDisabled)).length
-  const unlinked = on.filter(g => !Object.hasOwn(links, g.id)).length
+  const unlinked = on.filter(g => floorOfGoal(g, links) === null).length
   return { rows, counts, gone, unlinked }
 }
 

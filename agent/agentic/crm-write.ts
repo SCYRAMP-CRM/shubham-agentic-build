@@ -24,6 +24,26 @@ export interface CrmWriteOptions {
   now?: () => number
 }
 
+/**
+ * F-334-1: a goal's floor and agent (origin_floor_id, origin_agent_id; the camelCase forms too, any letter case) are set ONLY when a chat adds the goal (crm_goal_add, which sends them itself). This generic write must
+ * never put them on a goal that exists, or move one: refused at any depth of any body, before anything is sent.
+ */
+const ORIGIN_KEY = /^origin[_-]?(floor|agent)[_-]?id$/i
+export const ORIGIN_REFUSED = 'Goals take their floor only when a chat adds them (crm_goal_add): it cannot be set or changed here. Nothing was sent.'
+
+function refuseOrigin(v: unknown, depth = 0): void {
+  if (depth > 6) return
+  if (Array.isArray(v)) {
+    for (const x of v) refuseOrigin(x, depth + 1)
+    return
+  }
+  if (!isObject(v)) return
+  for (const [k, x] of Object.entries(v)) {
+    if (ORIGIN_KEY.test(k)) throw apiError(403, ORIGIN_REFUSED)
+    refuseOrigin(x, depth + 1)
+  }
+}
+
 function checkIds(v: unknown, where: string, depth = 0): void {
   if (depth > 6) return
   if (Array.isArray(v)) {
@@ -67,6 +87,7 @@ export function createCrmWrite(o: CrmWriteOptions) {
       if (args.body !== undefined) {
         if (!isObject(args.body)) throw apiError(400, 'body must be an object of the fields to set')
         if (JSON.stringify(args.body).length > BODY_MAX) throw apiError(400, `body is too big (at most ${BODY_MAX} characters)`)
+        refuseOrigin(args.body)
         checkIds(args.body, '')
         body = args.body
       }

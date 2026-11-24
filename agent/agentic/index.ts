@@ -6781,7 +6781,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'crm_goals':
         return crmGoals.list(args)
       case 'crm_goal_add': {
-        const out = await crmGoals.add(args)
+        // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
+        const out = await crmGoals.add(args, { floorId: floor.id, agentId: agent.id })
         log?.info(`${agent.name} added a CRM goal`)
         // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.
         // Only the answer of the call that MADE the goal has an id here; a call that only found it already made (a duplicate) answers without one and links nothing (and logs nothing).
