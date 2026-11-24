@@ -8,6 +8,21 @@ export const BUILD_REPO = 'https://github.com/bztechserver-droid/shubham-agentic
 /** The agent exits with this when asked to update; Start.cmd then pulls the new build and starts it again. */
 export const UPDATE_EXIT_CODE = 75
 
+// F-348 (Shubham: "make a restart button also asap in the next publish"): a PLAIN restart of the app. Under Start.cmd / the guard the app is started again on ANY exit; only the code 75 runs the update step first (agent/guard/supervisor.ts), so a plain
+// restart leaves with this code and pulls nothing. Chats live in the chat host (its own process), which a plain restart never touches.
+export const RESTART_EXIT_CODE = 0
+export const RESTART_CODES = ['restart-busy', 'restart-unsupervised', 'restart-already'] as const
+export type RestartCode = (typeof RESTART_CODES)[number]
+/** The fixed sentences of a refused restart (the page shows only these) and what the confirmation says plainly. */
+export const RESTART_WORDS: Record<RestartCode, string> = {
+  'restart-busy': 'An update or a publish is running. Restart after it has finished.',
+  'restart-unsupervised': 'This app was not started by Start.cmd, so it would not come back by itself. Nothing was restarted.',
+  'restart-already': 'The app is already restarting.',
+}
+export const RESTART_ABOUT = 'The app restarts in a few seconds and this page reconnects by itself. Stopping the app can take up to about 25 seconds (it also closes the WhatsApp browser windows). Chats that are running keep running: they live in their own process. Nothing new is pulled. A message sent in those seconds may need sending again.'
+/** An Update pressed while a restart is on its way: a second stop would cut the first one off, so it waits. */
+export const RESTART_UPDATE_WORDS = 'The app is restarting. Update after it is back.'
+
 /** A build's RELEASE.json. */
 export interface BuildVersion {
   /** "2026.10.31-1305": when it was built, to the minute. */

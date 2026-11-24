@@ -21,6 +21,8 @@ import { copyFileSync, existsSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
+import { UPDATE_EXIT_CODE } from '../shared/build.ts'
+import { portAnswers } from './guard-reach.ts'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type HostOs, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
 import { agenticOff, createAgentic } from './agentic/index.ts'
 import { createMcpCatalogMount } from './agentic/mcp-catalog.ts'
@@ -1443,8 +1445,11 @@ if (import.meta.main) {
       devDir,
       role: () => config.role,
       log: log.child('build'),
-      restart: code => void shutdown('updating to the newer build', code),
+      // F-348: only an UPDATE says "updating to the newer build" (the guard reads that line to run the update step); a plain restart says what it is and pulls nothing.
+      restart: code => void shutdown(code === UPDATE_EXIT_CODE ? 'updating to the newer build' : 'restarting: asked on the Build page', code),
       supervised: process.env.SAD_SUPERVISED === '1',
+      // F-348: the guard's own port answers right now (the plain restart is refused when it does not: nothing would start the app again)
+      guardAnswers: () => portAnswers(Number(process.env.SAD_GUARD_PORT) || 21228),
       policy: updatePolicy,
       auditDir: statePaths().agent,
       // F-173a + Shubham's orders o2f32 and ob12b: who presses Update, decided in ONE place (auth/types.ts updateRights): the first owner by id (and a program on this PC with the machine token) as before; any other signed-in person, a second owner

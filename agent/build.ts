@@ -4,7 +4,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
-import { buildHistoryOf, buildStatusOf, parseBuildNote, UPDATE_EXIT_CODE, UPDATE_WHY_WORDS, type BuildHistory, type BuildHistoryOwnerRow, type BuildInfo, type BuildVersion, type PublishRecord, type PublishRequest, type UpdateWhyNot } from '../shared/build.ts'
+import { buildHistoryOf, buildStatusOf, parseBuildNote, RESTART_EXIT_CODE, RESTART_UPDATE_WORDS, RESTART_WORDS, UPDATE_EXIT_CODE, UPDATE_WHY_WORDS, type RestartCode, type BuildHistory, type BuildHistoryOwnerRow, type BuildInfo, type BuildVersion, type PublishRecord, type PublishRequest, type UpdateWhyNot } from '../shared/build.ts'
 import { apiError, type ApiMount, type MountRequest } from './api.ts'
 import { appendAccessLog, appendAccessLogOrThrow } from './auth/access-log.ts'
 import { createRefusalAudit } from './build-update-refusals.ts'
@@ -100,6 +100,8 @@ export interface BuildOptions {
   restart: (code: number) => void
   /** Started by Start.cmd, which updates and restarts it (SAD_SUPERVISED=1). */
   supervised: boolean
+  /** F-348 (Agent 14): does the guard answer NOW? SAD_SUPERVISED is read once at the start; a plain restart is refused when the guard has died since (the app would stay down). Left out (tests): not asked. */
+  guardAnswers?: () => Promise<boolean>
   /** Tests: a fake git, and the command publish runs. */
   git?: Git
   publishCommand?: (devDir: string, req: PublishRequest) => { file: string; args: string[] }
@@ -289,6 +291,8 @@ export function createBuild(o: BuildOptions): Build {
   /** The same three reasons as a CODE, for what a person's Build page is told (shared/build.ts UPDATE_WHY_WORDS has the words). */
   const cannotWhy: UpdateWhyNot | null = kind !== 'build' ? 'dev' : !isClone ? 'not-a-clone' : !o.supervised ? 'not-supervised' : null
 
+  /** F-348: a plain restart was asked for and is on its way: a second press is refused. */
+  let restartAt: number | null = null
   const update: BuildInfo['update'] = { state: 'unknown', available: null, checkedAt: null, error: null, can: cannot === null, cannot, hostWait: null }
   const publish: NonNullable<BuildInfo['publish']> | null = o.devDir
     ? { devDir: o.devDir, devCommit: null, devChanges: 0, pending: null, newest: null, state: 'idle', startedAt: null, endedAt: null, log: [], published: null, error: null }
@@ -574,6 +578,8 @@ export function createBuild(o: BuildOptions): Build {
   }
 
   function startUpdate(body?: unknown, via: UpdatePermit['via'] = 'admin', hold?: UpdateHold) {
+    // F-348 (Agent 14): a restart is on its way: a second stop would end the process at once and cut the first one off, so an Update (any kind) waits for the app to be back
+    if (restartAt !== null) throw Object.assign(apiError(409, RESTART_UPDATE_WORDS), { code: 'restart-already' })
     if (!update.can) throw apiError(409, update.cannot ?? "This PC can't update itself")
     // Order o7e6d S1: before force, the wait for busy chats, the chat host or the restart: nothing has been started or cut yet. Force never passes it.
     const holding = heldBy()
@@ -808,6 +814,8 @@ export function createBuild(o: BuildOptions): Build {
       // The owner's own press: its body (force, after the wait) is his, as it always was.
       return startUpdate(r.body, 'admin')
     },
+    // F-348 (Shubham: "make a restart button also asap in the next publish"): a PLAIN restart, nothing pulled. Only the owner's own signed-in page; see restartApp.
+    'POST /restart': r => restartApp(r),
     // Cancelling an update (and a restart anyway, above) stays the first owner's: a person never cuts into a wait the owner or another person started.
     'POST /update-cancel': r => {
       needOwner(r)
@@ -870,6 +878,34 @@ export function createBuild(o: BuildOptions): Build {
     audit({ id: actor.id, name: actor.name }, { history: { note: parsed.lines.length ? 'edited' : 'cleared', version: record.version } })
     log?.info(`history: the note of build ${record.version ?? '?'} was ${parsed.lines.length ? 'edited' : 'cleared'}`)
     return buildHistoryOf([record], 'owner').rows[0] as BuildHistoryOwnerRow
+  }
+
+  /**
+   * F-348: restarts the app WITHOUT pulling a build (the guard starts it again on any exit but 75). The first owner's signed-in page only: not a chat key, not the machine channel, not a person. Refused in fixed words, nothing
+   * restarted: while a publish runs or an Update waits for the chats, when nothing would bring the app back (not under Start.cmd), and when one is already on its way. One log line and one line in the Access log.
+   */
+  async function restartApp(r: MountRequest) {
+    const actor = publishActor(r.headers, r.caller)
+    if (!actor || actor.kind !== 'owner' || r.headers['x-sad-chat-key'] !== undefined) throw authError(403, 'Only the owner, signed in on this page, restarts the app.', 'admin-only')
+    if (r.body !== undefined && !(isObject(r.body) && Object.keys(r.body).length === 0)) throw apiError(400, 'Nothing to send: {}')
+    const refuse = (code: RestartCode) => Object.assign(apiError(409, RESTART_WORDS[code]), { code })
+    if (restartAt !== null) throw refuse('restart-already')
+    if (!o.supervised) throw refuse('restart-unsupervised')
+    // SAD_SUPERVISED is only read at the start: if the guard has died since, an exit would leave the app DOWN until Start is pressed. The guard must answer now.
+    if (o.guardAnswers && !(await o.guardAnswers())) throw refuse('restart-unsupervised')
+    if (publish?.state === 'running' || hostWait !== null) throw refuse('restart-busy')
+    if (restartAt !== null) throw refuse('restart-already') // a second press that came in while the first looked for the guard
+    restartAt = clock()
+    audit({ id: actor.id, name: actor.name }, { restart: 'plain' })
+    log?.info('restarting: asked on the Build page by the owner')
+    try {
+      o.restart(RESTART_EXIT_CODE)
+    } catch (e) {
+      restartAt = null
+      log?.warn(`restarting: it failed: ${e instanceof Error ? e.message : String(e)}`)
+      throw apiError(502, 'The app could not restart. Nothing was changed.')
+    }
+    return { restarting: true }
   }
 
   return {
