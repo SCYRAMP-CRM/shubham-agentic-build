@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.23-2240",
+  "version": "2026.11.24-1304",
   "commit": "ca0a7b3",
-  "dirty": false,
-  "builtAt": "2026-11-23T17:10:54.464Z",
-  "devHash": "d7dc26251c5709b8fefa",
+  "dirty": true,
+  "builtAt": "2026-11-24T07:34:08.967Z",
+  "devHash": "849c25628e2740506b81",
   "chatHost": {
     "protocol": 1,
     "version": 1
@@ -11,11 +11,11 @@
   "publishAudit": {
     "checks": "full",
     "by": {
-      "kind": "lead",
-      "id": "local-machine",
-      "name": "Lead (local machine)"
+      "kind": "owner",
+      "id": "019d2ff6-1b5c-7aed-a08c-474497789b8f",
+      "name": "sbskrrt"
     },
-    "at": "2026-11-23T17:02:03.817Z"
+    "at": "2026-11-24T07:24:19.461Z"
   },
   "crmFsSha256": "29c80cc8580d598691f6dd347f3986bf43467a8cec33ec2049eb86534c018ba1",
   "source": "shubham-agentic-dev"
