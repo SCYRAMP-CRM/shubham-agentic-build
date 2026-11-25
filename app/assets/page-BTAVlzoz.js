@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-_lVre-vk.js";function t(){e(`/wpages`)}export{t as default};

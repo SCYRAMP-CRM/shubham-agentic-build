@@ -290,6 +290,14 @@ export function subProgress<T extends TreeInput & { status: string }>(rows: read
 
 /** The question before a MAIN goal is ticked while `n` of its sub-goals are not done. */
 export const doneConfirmWords = (n: number): string => `${n} sub-goal${n === 1 ? ' is' : 's are'} not done: mark ${n === 1 ? 'it' : 'them all'} done?`
+/** One tick of a main goal writes at most this many sub-goals (one request each): more is refused in a fixed sentence, never started. */
+export const DONE_BATCH_MAX = 25
+export const doneTooManyWords = (n: number): string => `This goal has ${n} sub-goals not done; at most ${DONE_BATCH_MAX} can be marked at once. Mark some of them first.`
+/** Sub-goals the app has not linked to this floor are not marked (the route would refuse them): the question says how many stay as they are. */
+export const doneSkippedWords = (k: number): string => (k === 1 ? '1 more is not a goal of this floor and stays as it is.' : `${k} more are not goals of this floor and stay as they are.`)
+/** A batch that stopped part-way: how many were written before it stopped (the first refusal), and the line the Undo carries. Fixed words, no title. */
+export const partialDoneWords = (written: number, of: number, what: 'done' | 'not done'): string => `${written} of ${of} were marked ${what} before it stopped; the rest were not.`
+export const partialUndoWords = (written: number, of: number, what: 'done' | 'not done'): string => `${written} of ${of} marked ${what}.`
 export const DONE_YES = 'Yes, mark all done'
 export const DONE_NO = 'No'
 /** The line after a tick, an untick, or a tick of a whole tree: fixed words around the title (cut and cleaned as a row's title is). */
