@@ -2,6 +2,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import path from 'node:path'
 import { writeAtomic } from '../config.ts'
 import { privateRow } from './conversations.ts'
+import { isRelayText } from '../../shared/relay-kind.ts'
 
 // F-051: the floor chats' turns, the raw layer's conversations: each thing said to an agent's
 // chat (by Shubham, or by another chat), with the answer it got. Read from the chats' JSONL,
@@ -78,11 +79,8 @@ export function cleanSaid(raw: string): { text: string; from: 'shubham' | 'chat'
  * reply to an order (`[reply from <Agent> on <Floor> to order <id>] ...`) and the heartbeat's check-in (`[heartbeat hh:mm] ...`). One predicate, used when a turn is made (its `from`)
  * and, on the `said` text, wherever the memory decides whether a turn feeds it (the legacy log was made with a regex that knew only the first two).
  */
-export const isRelayText = (said: string): boolean => {
-  const t = said.trimStart()
-  // The shapes the app and the chats WRITE (orders.ts REPLY_PREFIX, heartbeat.ts NUDGE_PREFIX): a pasted "[reply from the customer] ..." or "[heartbeat] ..." is his words.
-  return /^\[(message from|broadcast from)\b/.test(t) || /^\[reply from [^\]]+ to order [^\]\s]+\]/.test(t) || /^\[heartbeat \d{1,2}:\d{2}\]/.test(t)
-}
+// F-367: the predicate itself is shared/relay-kind.ts (one list of the shapes, for the memory and for the chat view's filter); a goals beat (`[heartbeat goals hh:mm]`) is the app's too.
+export { isRelayText }
 
 // What looks like a secret, kept out of the turns: they are recalled into other chats and given
 // to the librarian. The kind of thing is kept ("[a key, removed]"), never its value.

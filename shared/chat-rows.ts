@@ -57,6 +57,8 @@ export type ChatRow =
   /** Order o3963: a button for a PC's Control screen an agent offered (its show_screen tool, answered): a bubble on the agent's side; nothing connects before a tap. */
   | { k: 'screen'; id: string; tool: ChatToolItem; screen: ScreenShown }
   | { k: 'notice'; id: string; item: ChatNoticeItem }
+  /** F-367: a run of messages the chat's filter ("Only you and this chat") hides: one slim line that says how many and opens them in place (`open`: they are shown, the line says Hide). Made by shared/chat-relay-filter.ts, never by the feed. */
+  | { k: 'hidden'; id: string; count: number; kinds: ('chat' | 'app')[]; names: string[]; open: boolean }
 
 /** Two bubbles from the same side this close are one cluster. */
 export const CLUSTER_MS = 5 * 60 * 1000
@@ -236,7 +238,12 @@ export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = [], op
     })
   }
 
-  // Clusters: neighbours on the same side, by the same sender, close in time.
+  markClusters(rows)
+  return rows
+}
+
+/** Clusters: neighbours on the same side, by the same sender, close in time (first/last of each message row). F-367: also run again after the filter takes rows out. */
+export function markClusters(rows: ChatRow[]): void {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
     if (row.k !== 'msg') continue
@@ -247,5 +254,4 @@ export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = [], op
     row.first = !joins(prev, row)
     row.last = !(next?.k === 'msg' && joins(row, next))
   }
-  return rows
 }

@@ -8,6 +8,7 @@
 /** How many messages (not tool calls) the first answer and a history page hold. */
 import type { ChatAttachment } from './attachments.ts'
 import type { DeliveryBlockReason, DeliveryDiagnostic } from './delivery-reason.ts'
+import type { RelayKind } from './relay-kind.ts'
 
 export const CHAT_WINDOW_MESSAGES = 40
 
@@ -39,6 +40,8 @@ export interface ChatUserItem extends ChatItemBase {
   attachments?: ChatAttachment[]
   from: ChatSender | null
   command: boolean
+  /** F-367: who it came from when it is not what he typed (another chat, the app, his own order passed on by the Assistant, his answer to a waiting goal): set by the feed's converter from the WHOLE received message (shared/relay-kind.ts), absent for his own words. */
+  relay?: RelayKind
 }
 
 /** The agent said it (markdown). `error`: claude's own error line (a rate limit, say), not the model. */

@@ -15,6 +15,7 @@ import {
 } from '../../shared/chat.ts'
 import { splitAttachments } from '../../shared/attachments.ts'
 import { parseInstanceMessage } from '../../shared/instance-message.ts'
+import { relayKindOf } from '../../shared/relay-kind.ts'
 import type { Logger } from '../log.ts'
 import { readMenu, readStatus } from './screen.ts'
 import { claudeProjectsDir, findTranscript } from './transcripts.ts'
@@ -311,6 +312,9 @@ export class Converter {
     if (!body.trim() && !files.length) return []
     const item: ChatItem = { kind: 'user', id: uuid, at, text: cap(body, TEXT_MAX), from: instance ? { name: instance.agent, floor: instance.floor, chat: null, instance: { template: instance.template, hop: instance.hop } } : sibling ? senderOf(sibling[1]) : null, command: false }
     if (files.length) item.attachments = files
+    // F-367: who it came from when it is not what he typed (the chat's filter): decided from the WHOLE message, anchored at its start (shared/relay-kind.ts), so the page never reads chat text for it.
+    const relay = relayKindOf(t)
+    if (relay) item.relay = relay
     return [add(item)]
   }
 }
