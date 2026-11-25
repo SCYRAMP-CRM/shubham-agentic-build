@@ -1259,7 +1259,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
   void crmFiles.resume().catch(() => undefined)
   // Order ofedf: the Claude usage, reported to the CRM the way the old app did (usage/usage.ts): every Claude chat's cost per person, per hour,
   // and Claude's own 5-hour and week limits per account, each sent with the person's own CRM login. Off with the status line (SAD_CLAUDE_USAGE=0).
-  const usage: Usage | null = o.auth && usageOn ? createUsage({ dir: o.dir, auth: o.auth, proxy: crmProxy, build: () => { const v = o.currentBuild?.(); return v ? { id: buildIdOf(v), label: os.hostname().slice(0, 120) } : null }, log: o.log, onError: m => o.log?.warn(m) }) : null
+  const usage: Usage | null = o.auth && usageOn ? createUsage({ dir: o.dir, auth: o.auth, proxy: crmProxy, build: () => { const v = o.currentBuild?.(); return v ? { id: buildIdOf(v), label: os.hostname().slice(0, 120) } : null }, log: o.log, onError: m => o.log?.warn(m),
+    // F-352: the same usage, BY PC, for the CRM's "Usage for Server Agentic" tab (usage/pc-reporter.ts), with this PC's own CRM session.
+    pc: {
+      device: () => ({ id: self().id, name: self().name }),
+      placed: () => { const i = o.claudeSub?.()?.info(); return i?.token === 'set' && i.subscription ? { key: i.subscription.id, name: i.subscription.name } : null },
+      signedIn: () => crmProxy.session().signedIn,
+      post: async (p, body) => { const r = await crmProxy.request('POST', p, { json: body }); await r.arrayBuffer().catch(() => undefined); return { status: r.status } },
+      knownDevices: () => (mode() === 'hub' ? controlDeviceCatalogue().map(d => ({ id: d.id, name: d.name })) : []),
+    } }) : null
   if (usage && !process.env.NODE_TEST_CONTEXT) usage.start()
   // F-211 stage 1 (orders obd04, o7472): every floor chat's conversation goes, one way, into the CRM drive's project "Conversations" as plain JSONL parts and a manifest
   // (conversations.ts). Only the hub (or a PC on its own) sends: it holds every PC's copy (F-021). Its own uploads engine (its own waiting folder: the page's uploads list never

@@ -2,6 +2,7 @@ import path from 'node:path'
 import type { Auth } from '../auth/index.ts'
 import { crmLoginOf, type CrmProxy } from '../agentic/crmproxy.ts'
 import { createLedger, type CostReading } from './ledger.ts'
+import { createPcReporter, type PcAnswer, type PcReporter } from './pc-reporter.ts'
 import { createReporter, type LimitsReading, type Reporter } from './reporter.ts'
 import { readSnapshots } from './snapshots.ts'
 
@@ -10,10 +11,25 @@ import { readSnapshots } from './snapshots.ts'
 // - the Assistant's own headless turns (fast-host, memory, librarian) hand their cost over with reading();
 // - the ledger (ledger.ts) turns running costs into hours per person; the reporter (reporter.ts) sends what changed, with each
 //   person's own CRM session, and waits while a person is not signed in here.
+// - F-352: the same ledger, summed per PC, goes to the CRM's tab "Usage for Server Agentic" (pc-reporter.ts), with THIS PC's own CRM session. Only when the agent gives it `pc`.
 
 export const USAGE_SNAPSHOT_DIR = 'usage'
 export const USAGE_LEDGER_FILE = 'claude-usage.json'
 const TICK_MS = 60 * 1000
+
+/** F-352: what the per-PC report needs from the agent (all of it read-only except post). Left out: no per-PC report. */
+export interface UsagePcSource {
+  /** This PC: its device id and name. */
+  device(): { id: string; name: string }
+  /** The Claude subscription placed on this PC now, or null. */
+  placed(): { key: string; name: string | null } | null
+  /** Whether this PC holds a CRM login now. */
+  signedIn(): boolean
+  /** One POST to the CRM with this PC's own session. */
+  post(path: string, body: unknown): Promise<PcAnswer>
+  /** The Server only: every PC it knows. */
+  knownDevices?(): Array<{ id: string; name: string }>
+}
 
 export interface UsageOptions {
   /** The agent's state folder: the ledger file and the snapshot folder live in it. */
@@ -27,6 +43,8 @@ export interface UsageOptions {
   /** Tests: the timer (0 = none; start() is then a no-op). */
   intervalMs?: number
   onError?: (message: string) => void
+  /** F-352: the per-PC report to the CRM's "Usage for Server Agentic" tab (pc-reporter.ts). */
+  pc?: UsagePcSource
 }
 
 export interface Usage {
@@ -68,12 +86,17 @@ export function createUsage(o: UsageOptions): Usage {
     now,
     log: o.log,
   })
+  // F-352: beside the old reporter, which stays exactly as it was: the same ledger, read only, summed per PC.
+  const pcReporter: PcReporter | null = o.pc ? createPcReporter({ ledger, ...o.pc, now, log: o.log }) : null
   let timer: ReturnType<typeof setInterval> | null = null
   let busy: Promise<void> | null = null
 
   const sink = {
     reading: (r: CostReading) => ledger.reading(r),
-    limits: (r: LimitsReading) => reporter.limits(r),
+    limits: (r: LimitsReading) => {
+      reporter.limits(r)
+      pcReporter?.limits(r)
+    },
   }
 
   async function tick(): Promise<void> {
@@ -83,6 +106,8 @@ export function createUsage(o: UsageOptions): Usage {
         readSnapshots(snapshotDir, sink, now())
         ledger.save()
         await reporter.flush()
+        // the per-PC report is its own pass: nothing it does can hold the per-person report back (it never throws, and it comes after)
+        await pcReporter?.flush()
       } catch (e) {
         o.onError?.(`claude usage: a pass failed (${e instanceof Error ? e.message : String(e)})`)
       } finally {

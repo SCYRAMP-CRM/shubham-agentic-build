@@ -199,6 +199,8 @@ export function nestedWords(title: string, parentTitle: string | null): string {
 }
 /** How long the Undo line stays. */
 export const NEST_UNDO_MS = 8000
+/** The slot (px) a row opens under its title while a goal is carried over it: the drag engine measures the rows below it that much lower, and the row draws a slot of exactly this height. */
+export const NEST_SLOT_PX = 40
 
 /** The rows drawn directly under `parentId` (null: the top level), in list order. */
 export function childrenOf<T extends TreeInput>(rows: readonly T[], parents: ReadonlyMap<string, string | null>, parentId: string | null): T[] {
@@ -220,3 +222,77 @@ export function siblingPlaces<T extends TreeInput>(rows: readonly T[], movable: 
   }
   return out
 }
+
+// ---- F-357 (Shubham: "the done goal check box should be there and show the doen goal in open only when main task done then mov ethe whole tree to doen ok"): a goal's TREE goes by its MAIN goal. PURE: which rows a view
+// shows, what the filters count, which sub-goals are not done yet, and the fixed words around a tick. The page asks them while it draws; the status itself is written by the Edit goal route (PATCH { status }).
+
+/** The MAIN goals of a list: the rows that stand at the top of their own tree (no drawn parent; a sub-goal whose parent is not on the list stands at the top too). */
+export function mainsOf<T extends TreeInput>(rows: readonly T[]): T[] {
+  const parents = parentsOf(rows)
+  return rows.filter(r => (parents.get(r.id) ?? null) === null)
+}
+
+/**
+ * The rows of the trees whose MAIN goal has `status`, in list order: the WHOLE tree goes with its main goal, whatever each sub-goal's own status is (a done sub-goal stays listed under its still-open main goal; when the
+ * main goal is done the whole tree is in the Done view, every sub-goal as it is).
+ */
+export function treeView<T extends TreeInput & { status: string }>(rows: readonly T[], status: string): T[] {
+  const parents = parentsOf(rows)
+  const own = new Map(rows.map(r => [r.id, r.status] as const))
+  const mainOf = (id: string): string => {
+    let at = id
+    for (let i = 0; i < 64; i++) {
+      const up = parents.get(at) ?? null
+      if (up === null) return at
+      at = up
+    }
+    return at
+  }
+  return rows.filter(r => own.get(mainOf(r.id)) === status)
+}
+
+/** What the filters count: MAIN goals per status (a done sub-goal under an open main goal counts for nothing of its own: it is part of that tree). */
+export function mainCounts<T extends TreeInput & { status: string }>(rows: readonly T[]): Record<'todo' | 'done' | 'abandoned', number> {
+  const out = { todo: 0, done: 0, abandoned: 0 }
+  for (const r of mainsOf(rows)) if (r.status === 'todo' || r.status === 'done' || r.status === 'abandoned') out[r.status]++
+  return out
+}
+
+/** Every sub-goal of every level under `id` that is still to do (a done or dropped one is left as it is), the deepest last: what "mark them all done" would change. */
+export function openUnder<T extends TreeInput & { status: string }>(rows: readonly T[], parents: ReadonlyMap<string, string | null>, id: string): T[] {
+  const out: T[] = []
+  const walk = (parent: string, depth: number) => {
+    if (depth > 64) return
+    for (const k of childrenOf(rows, parents, parent)) {
+      if (k.status === 'todo') out.push(k)
+      walk(k.id, depth + 1)
+    }
+  }
+  walk(id, 0)
+  return out
+}
+
+/** How many sub-goals of every level are done, and how many there are (the sub-goals toggle says it to a screen reader). */
+export function subProgress<T extends TreeInput & { status: string }>(rows: readonly T[], parents: ReadonlyMap<string, string | null>, id: string): { done: number; total: number } {
+  let done = 0
+  let total = 0
+  const walk = (parent: string, depth: number) => {
+    if (depth > 64) return
+    for (const k of childrenOf(rows, parents, parent)) {
+      total++
+      if (k.status === 'done') done++
+      walk(k.id, depth + 1)
+    }
+  }
+  walk(id, 0)
+  return { done, total }
+}
+
+/** The question before a MAIN goal is ticked while `n` of its sub-goals are not done. */
+export const doneConfirmWords = (n: number): string => `${n} sub-goal${n === 1 ? ' is' : 's are'} not done: mark ${n === 1 ? 'it' : 'them all'} done?`
+export const DONE_YES = 'Yes, mark all done'
+export const DONE_NO = 'No'
+/** The line after a tick, an untick, or a tick of a whole tree: fixed words around the title (cut and cleaned as a row's title is). */
+export const doneWords = (title: string): string => `Marked ${capTitle(title) || 'The goal'} done.`
+export const undoneWords = (title: string): string => `Marked ${capTitle(title) || 'The goal'} not done.`
+export const allDoneWords = (title: string, n: number): string => `Marked ${capTitle(title) || 'The goal'} and its ${n} sub-goal${n === 1 ? '' : 's'} done.`
