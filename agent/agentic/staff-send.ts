@@ -43,8 +43,8 @@ const CONTROL = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/
 const LEAD = /^[\s\p{Z}\p{Cf}\p{M}]+/u
 const LINES = /[\n\p{Zl}\p{Zp}]/u
 const INVISIBLE = /\p{Cf}+/gu
-/** A line that starts like one of the hub's own markers (the shapes every chat's brief teaches): a message, a broadcast, a reply, the heartbeat. */
-const HUB_MARKER = /^\[\s*(?:message\s+from|broadcast\s+from|reply\s+from|heartbeat)/i
+/** A line that starts like one of the hub's own markers (the shapes every chat's brief teaches): a message, a broadcast, a reply, the heartbeat, and (F-362) his answer to a goal that waits for him. */
+const HUB_MARKER = /^\[\s*(?:message\s+from|broadcast\s+from|reply\s+from|heartbeat|goal\s+answer)/i
 
 /**
  * The words a staff Assistant may send, made plain, or why not. Line ends become newlines and a tab a space; then it is refused (nothing typed) when it is empty, longer than STAFF_SEND_TEXT_MAX, holds any
@@ -69,7 +69,7 @@ export function staffSendTextWords(why: StaffSendTextWhy): string {
     case 'empty': return 'There was no message to send. Nothing was sent.'
     case 'too-long': return `That message is longer than ${STAFF_SEND_TEXT_MAX} characters. Send it shorter, or in parts. Nothing was sent.`
     case 'control': return 'The message holds a control character (a key, not text). Send plain words. Nothing was sent.'
-    case 'marker': return 'No line of the message may start like a message marker ("[message from", "[broadcast from", "[reply from", "[heartbeat"): the app writes those. Put a word before it. Nothing was sent.'
+    case 'marker': return 'No line of the message may start like a message marker ("[message from", "[broadcast from", "[reply from", "[heartbeat", "[goal answer"): the app writes those. Put a word before it. Nothing was sent.'
   }
 }
 

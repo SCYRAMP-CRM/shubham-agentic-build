@@ -77,6 +77,10 @@ export const LATCH_CLASSES: Readonly<Record<string, LatchClass>> = {
   memory_save: 'note',
   // F-309 N1: a note to the agent's notebook is as harmless as a floor note (the server saves it, merges it or holds it for the owner; it never acts).
   notebook_add: 'note',
+  // F-361: one cleaned line in the app's own file about a goal of the chat's own floor (shown to Shubham in the goals curtain); it changes nothing in the CRM and acts on nothing, so it is as harmless as a note.
+  goal_progress: 'note',
+  // F-362: marks a goal of the chat's own floor as waiting for him (one cleaned line in the app's own file); it changes nothing in the CRM, acts on nothing and cannot be ended by the chat, so it is as harmless as a note.
+  goal_wait: 'note',
   // They only prepare: his own tap sends.
   prepare_send: 'prepare',
   wa_prepare_send: 'prepare',

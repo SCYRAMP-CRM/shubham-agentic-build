@@ -142,6 +142,11 @@ export interface HeartbeatDeps {
    */
   watch?(): Promise<Finding[]>
   /**
+   * F-359: the per-chat GOALS heartbeat (chat-beat.ts). Asked once per beat, after this beat's own look at the chats; `nudged` is the set of chats the old check-in just typed into
+   * (they are left alone in this beat). What it finds worth telling (a heartbeat that paused itself) comes back as findings. Absent, or with no chat switched on: nothing here changes.
+   */
+  goalBeats?(now: number, nudged: ReadonlySet<string>): Promise<Finding[]>
+  /**
    * Lead's rule "visible means TOLD" (16 Nov 2026): things the app watches that Shubham must hear about, not only find on a page (today: the old
    * phone gate sharing more than Christopher's ports, from Ports). Each is told once per key, like every finding (until it changes or an hour).
    */
@@ -150,11 +155,11 @@ export interface HeartbeatDeps {
   log?: { info(m: string): void; warn(m: string): void }
 }
 
-export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent' | 'alarm' | 'drift'
+export type FindingKind = 'restarted' | 'nudged' | 'cannot-restart' | 'question' | 'stuck' | 'build' | 'replies' | 'more' | 'menu' | 'down' | 'silent' | 'alarm' | 'drift' | 'goal-beat'
 
 /**
  * What the heartbeat's news pushes to the phone (index.ts hands the rest to nobody: the Assistant is told and the log has it either way).
- * F-083: no push between 23:00 and 07:00 for what the watchdog found (menu, down, silent); it is in the morning summary.
+ * F-083: no push between 23:00 and 07:00 for what the watchdog found (menu, down, silent); it is in the morning summary. F-359: nor for a chat's goals heartbeat that paused itself.
  * A DRIFT (codex/drift.ts) is STAGED (Lead, 18 Nov): it is told to the Assistant and logged from the first beat, and pushed to the phone only once
  * `<state>/agent/drift-push.on` exists (or SAD_DRIFT_PUSH=on). Create it only after several beats after the publish that carries the check have read clean: a
  * detector that false-fires does not annoy an agent, it wakes Shubham on his phone, at night, about nothing, and he stops trusting the next one. Once on, a drift
@@ -165,7 +170,7 @@ export function phoneItems<T extends { kind: FindingKind }>(items: readonly T[],
   const quiet = o.hour >= 23 || o.hour < 7
   return items.filter(i => {
     if (i.kind === 'drift') return o.driftPush && !quiet
-    return !(quiet && (i.kind === 'menu' || i.kind === 'down' || i.kind === 'silent'))
+    return !(quiet && (i.kind === 'menu' || i.kind === 'down' || i.kind === 'silent' || i.kind === 'goal-beat'))
   })
 }
 
@@ -267,6 +272,7 @@ export function createHeartbeat(deps: HeartbeatDeps): Heartbeat {
     let restarts = 0
     let held = 0
     const questionSince = saved.told // reuse: question first-seen times live under 'qs:<sid>'
+    const nudgedNow = new Set<string>() // F-359: the chats this beat typed its old nudge into
     const seenQuestion = new Set<string>()
 
     for (const a of deps.agents()) {
@@ -326,6 +332,7 @@ export function createHeartbeat(deps: HeartbeatDeps): Heartbeat {
       const text = `${NUDGE_PREFIX}${hhmm(now)}] The app's check found that your chat had stopped before its work was finished (${u.why}). Carry on from where you left off. If it was already done, or is waiting for Shubham, say so in one line. This is not an order and not from another chat: do not answer it with an acknowledgement.`
       const sent = await deps.nudge(sid, text).catch(() => false)
       saved.nudges[sid] = { rowId: u.rowId, at: [...recent, now] }
+      nudgedNow.add(sid)
       findings.push(
         restartedNow
           ? { kind: 'restarted', key: `restarted:${sid}:${u.rowId}`, did: true, agent: a.agentName, floor: a.floorName, text: `${who} had stopped with work unfinished (${u.why}). The app started it again${sent ? ' and nudged it once to carry on' : ' (the nudge could not be typed yet)'}.` }
@@ -337,6 +344,13 @@ export function createHeartbeat(deps: HeartbeatDeps): Heartbeat {
         findings.push(...(await deps.watch()))
       } catch (e) {
         deps.log?.warn(`heartbeat: the watchdog failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    if (deps.goalBeats) {
+      try {
+        findings.push(...(await deps.goalBeats(now, nudgedNow)))
+      } catch (e) {
+        deps.log?.warn(`heartbeat: the goals heartbeat failed: ${e instanceof Error ? e.message : String(e)}`)
       }
     }
     for (const k of Object.keys(questionSince)) if (k.startsWith('qs:') && !seenQuestion.has(k.slice(3))) delete questionSince[k]

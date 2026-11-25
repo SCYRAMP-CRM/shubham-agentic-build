@@ -52,6 +52,7 @@ export const PERSON_ASSISTANT_DOORS: readonly PersonDoor[] = [
   door('POST', 'execution-selection', 'refuse', 'the engine choice: the owner of the app\'s'),
   door('POST', 'execution-verify', 'refuse', 'the engine choice: the owner of the app\'s'),
   door('GET', 'execution-intents/:id', 'refuse', 'the engine choice: the owner of the app\'s'),
+  door('PUT', 'beat', 'refuse', 'F-359: the goals heartbeat of a chat (it types into the chat on its own, and counts against the usage): the first owner\'s alone, by id (firstOwnerOnly in index.ts)'),
 ]
 
 /** The sockets, by their path under /agentic: both name the chat by ?session=. */

@@ -78,6 +78,22 @@ export function linksForWire(file: GoalFloorsFile): Record<string, string> {
   return out
 }
 
+/** F-361: the floor a goal is linked to (the one whose chat made it), or null. Ids only. */
+export function floorOfGoal(file: GoalFloorsFile, goalId: unknown): string | null {
+  if (typeof goalId !== 'string' || !GOAL_ID_RE.test(goalId) || !Object.hasOwn(file.links, goalId)) return null
+  return file.links[goalId].floorId
+}
+
+/**
+ * F-361: who made each goal linked to ONE floor, and when (ids and a time, still no word of any goal): the fallback a goal's row in the curtain has when no agent has reported on it. `agentId` may be the fixed
+ * word of a goal added by hand (shared/goal-add.ts BY_HAND): the page knows no such agent and says nothing for it.
+ */
+export function madeForWire(file: GoalFloorsFile, floorId: string): Record<string, { agentId: string; at: string }> {
+  const out: Record<string, { agentId: string; at: string }> = {}
+  for (const [id, l] of Object.entries(file.links)) if (l.floorId === floorId) out[id] = { agentId: l.agentId, at: l.at }
+  return out
+}
+
 /**
  * The goal id in what crm_goal_add answered, and ONLY when this is the answer of the call that MADE the goal: `{ added: <id>, ... }`. The answer of a call that found the goal already made or still being made
  * (`{ id, note, page }`: the same goal added a moment ago, maybe by a chat of ANOTHER floor) is not the maker's and never stamps a link: that answer can come back before the maker's own, so stamping it would give the

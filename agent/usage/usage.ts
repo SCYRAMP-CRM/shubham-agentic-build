@@ -47,7 +47,46 @@ export interface UsageOptions {
   pc?: UsagePcSource
 }
 
+/** Claude's meter as the newest snapshots say it (F-359: the goals heartbeat reads it; nothing else does). Times in ms. */
+export interface UsageMeter {
+  weekPercent: number | null
+  fiveHourPercent: number | null
+  weekResetsAt: number | null
+  /** The OLDEST of the readings it is made of (a stale one never passes as fresh). */
+  at: number
+}
+
+/**
+ * What the newest limits snapshots say, taking the worst case: the highest week percent, the highest 5-hour percent of the windows that have not reset since, the earliest week reset time. With `key` ('' is the PC's own
+ * login) only that subscription's readings count (the goals heartbeat reads the subscription placed on this PC now); without it, every subscription's. A reading older than `maxAgeMs` (or from the future) is left out, as
+ * is one with neither window; null when nothing is left.
+ */
+export function meterOf(readings: Iterable<LimitsReading>, now: number, maxAgeMs: number, key?: string): UsageMeter | null {
+  let week: number | null = null
+  let five: number | null = null
+  let weekReset: number | null = null
+  let at: number | null = null
+  for (const r of readings) {
+    if (key !== undefined && r.subscriptionKey !== key) continue
+    const t = Date.parse(r.observedAt)
+    if (!Number.isFinite(t) || now - t > maxAgeMs || t > now + 60_000) continue
+    const wp = r.week?.percent ?? null
+    const fp = r.fiveHour?.percent ?? null
+    if (wp === null && fp === null) continue
+    const wr = r.week?.resetsAt ? Date.parse(r.week.resetsAt) : NaN
+    const fr = r.fiveHour?.resetsAt ? Date.parse(r.fiveHour.resetsAt) : NaN
+    if (wp !== null) week = week === null ? wp : Math.max(week, wp)
+    if (Number.isFinite(wr)) weekReset = weekReset === null ? wr : Math.min(weekReset, wr)
+    // A 5-hour window that has reset since the reading started over: its old percentage is not counted.
+    if (fp !== null && !(Number.isFinite(fr) && fr <= now)) five = five === null ? fp : Math.max(five, fp)
+    at = at === null ? t : Math.min(at, t)
+  }
+  return at === null ? null : { weekPercent: week, fiveHourPercent: five, weekResetsAt: weekReset, at }
+}
+
 export interface Usage {
+  /** F-359: the newest limits (see meterOf), or null when there is none fresh enough. */
+  meter(maxAgeMs: number, key?: string): UsageMeter | null
   /** The folder the chats' status lines write their snapshots into (give it to chats as SAD_USAGE_DIR). */
   snapshotDir: string
   /** The Assistant's own headless turn: its process's running cost (Claude's total_cost_usd). Never throws. */
@@ -91,9 +130,13 @@ export function createUsage(o: UsageOptions): Usage {
   let timer: ReturnType<typeof setInterval> | null = null
   let busy: Promise<void> | null = null
 
+  /** The newest limits reading per subscription (F-359 reads it; the reporter has its own copy and is not touched). */
+  const newest = new Map<string, LimitsReading>()
   const sink = {
     reading: (r: CostReading) => ledger.reading(r),
     limits: (r: LimitsReading) => {
+      const was = newest.get(r.subscriptionKey)
+      if (!was || Date.parse(r.observedAt) >= Date.parse(was.observedAt)) newest.set(r.subscriptionKey, r)
       reporter.limits(r)
       pcReporter?.limits(r)
     },
@@ -119,6 +162,7 @@ export function createUsage(o: UsageOptions): Usage {
 
   return {
     snapshotDir,
+    meter: (maxAgeMs, key) => meterOf(newest.values(), now(), maxAgeMs, key),
     reading(r) {
       try {
         if (ledger.reading(r)) ledger.save()

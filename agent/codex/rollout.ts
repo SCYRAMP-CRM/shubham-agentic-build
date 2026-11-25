@@ -261,3 +261,129 @@ export function discoverThread(home: string, sessionId: string, sinceMs: number)
   }
   return null
 }
+
+// F-359 (the goals heartbeat for Codex chats, Shubham 25 Nov 2026: "this shoudl be claud eand codex both compaitble ok"): two reads of the END of a rollout, never the whole file (a rollout can be very large). Both are as TOLERANT as the
+// rest of this file: a row of another shape is skipped, and what cannot be read is null (the heartbeat then holds: it never beats a chat on a guess).
+const BEAT_TAIL_BYTES = 512 * 1024
+
+/** The last `bytes` of a file as text, starting at the first whole line; '' when it cannot be read. */
+function readTailText(file: string, bytes: number): string {
+  try {
+    const size = statSync(file).size
+    const start = Math.max(0, size - bytes)
+    const fd = openSync(file, 'r')
+    try {
+      const buf = Buffer.allocUnsafe(Math.min(bytes, size))
+      const n = readSync(fd, buf, 0, buf.length, start)
+      const text = buf.toString('utf8', 0, n)
+      return start > 0 ? text.slice(text.indexOf('\n') + 1) : text
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+}
+
+/** The assistant's last words in a rollout (its newest non-empty `message` of role assistant) and when they were written (ms), or null. */
+export function lastAssistantMessage(file: string): { text: string; at: number } | null {
+  const lines = readTailText(file, BEAT_TAIL_BYTES).split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line.includes('"role":"assistant"')) continue
+    const row = parseRolloutLine(line)
+    const p = row && isObject(row.payload) ? row.payload : null
+    if (!row || !p || row.type !== 'response_item' || p.type !== 'message' || p.role !== 'assistant') continue
+    const text = contentText(p.content).trim()
+    if (!text) continue
+    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN
+    if (!Number.isFinite(at)) continue
+    return { text, at }
+  }
+  return null
+}
+
+/** What a rollout's newest rate-limit reading says (Codex writes it with every token_count row: payload.rate_limits.{primary,secondary}.{used_percent, window_minutes, resets_at in seconds}). */
+export interface CodexLimits {
+  /** When the reading was written (ms). */
+  at: number
+  weekPercent: number | null
+  fiveHourPercent: number | null
+  weekResetsAt: number | null
+  fiveHourResetsAt: number | null
+  /** Codex itself says a limit has been reached (rate_limit_reached_type is set). */
+  reached: boolean
+}
+
+/** A window that lasts a day or more is the weekly one; a shorter one is the 5-hour one. */
+const WEEK_WINDOW_MIN = 24 * 60
+
+/** The newest rate-limit reading in the end of a rollout, or null when there is none (an old chat, a login that reports none, a file that cannot be read). */
+export function codexLimitsOf(file: string): CodexLimits | null {
+  const lines = readTailText(file, BEAT_TAIL_BYTES).split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line.includes('"rate_limits"')) continue
+    const row = parseRolloutLine(line)
+    const p = row && isObject(row.payload) ? row.payload : null
+    if (!row || !p || row.type !== 'event_msg' || p.type !== 'token_count' || !isObject(p.rate_limits)) continue
+    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN
+    if (!Number.isFinite(at)) continue
+    const out: CodexLimits = { at, weekPercent: null, fiveHourPercent: null, weekResetsAt: null, fiveHourResetsAt: null, reached: typeof p.rate_limits.rate_limit_reached_type === 'string' && p.rate_limits.rate_limit_reached_type !== '' }
+    for (const w of [p.rate_limits.primary, p.rate_limits.secondary]) {
+      if (!isObject(w)) continue
+      const pct = w.used_percent
+      const minutes = w.window_minutes
+      if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0 || pct > 1000 || typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes <= 0) continue
+      const resets = typeof w.resets_at === 'number' && Number.isFinite(w.resets_at) && w.resets_at > 0 ? (w.resets_at < 1e12 ? w.resets_at * 1000 : w.resets_at) : null
+      const week = minutes >= WEEK_WINDOW_MIN
+      if (week) {
+        out.weekPercent = out.weekPercent === null ? pct : Math.max(out.weekPercent, pct)
+        out.weekResetsAt = out.weekResetsAt === null ? resets : resets === null ? out.weekResetsAt : Math.min(out.weekResetsAt, resets)
+      } else {
+        out.fiveHourPercent = out.fiveHourPercent === null ? pct : Math.max(out.fiveHourPercent, pct)
+        out.fiveHourResetsAt = out.fiveHourResetsAt === null ? resets : resets === null ? out.fiveHourResetsAt : Math.min(out.fiveHourResetsAt, resets)
+      }
+    }
+    if (out.weekPercent === null && out.fiveHourPercent === null) continue
+    return out
+  }
+  return null
+}
+
+/** The newest rollouts of a Codex home: only the newest day folders are listed, never the whole history. */
+function recentRollouts(home: string, count: number): string[] {
+  const root = sessionsDir(home)
+  const desc = (a: string, b: string) => b.localeCompare(a)
+  const files: { file: string; mtimeMs: number }[] = []
+  for (const y of list(root).sort(desc)) {
+    for (const m of list(path.join(root, y)).sort(desc)) {
+      for (const d of list(path.join(root, y, m)).sort(desc)) {
+        const dir = path.join(root, y, m, d)
+        for (const f of list(dir)) {
+          if (!ROLLOUT_RE.test(f)) continue
+          try {
+            files.push({ file: path.join(dir, f), mtimeMs: statSync(path.join(dir, f)).mtimeMs })
+          } catch {
+            // Gone while we looked.
+          }
+        }
+        if (files.length >= count) return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, count).map(f => f.file)
+      }
+    }
+  }
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, count).map(f => f.file)
+}
+
+/**
+ * The newest rate-limit reading among the most recent rollouts of this PC's Codex home (one Codex login serves every chat here, so any of them can have written the newest one), or null. Reads only the end of
+ * each of at most `count` files, so an idle chat is not blind just because ITS OWN last turn was long ago.
+ */
+export function recentCodexLimits(home: string, count = 6): CodexLimits | null {
+  let best: CodexLimits | null = null
+  for (const file of recentRollouts(home, count)) {
+    const l = codexLimitsOf(file)
+    if (l && (best === null || l.at > best.at)) best = l
+  }
+  return best
+}

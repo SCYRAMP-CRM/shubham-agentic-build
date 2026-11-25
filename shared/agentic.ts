@@ -496,6 +496,8 @@ export type AgenticEvent =
   | { t: 'pc-control'; answer: import('./pc-control.ts').PcControlAnswer }
   | { t: 'floors'; floors: Floor[] }
   | { t: 'live'; live: Record<string, ChatState> }
+  /** F-361: what an agent reported on a goal of this floor changed: ask GET /floors/:id/goal-progress again. A poke with no text, sent to the first owner's pages only. */
+  | { t: 'goal-progress'; floorId: string }
   | { t: 'memory'; floorId: string }
   /** F-056: the task list changed (something was added, ticked, edited or deleted, by anyone): ask for it again. */
   | { t: 'tasks' }

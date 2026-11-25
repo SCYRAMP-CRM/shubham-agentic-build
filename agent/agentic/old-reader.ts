@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import vm from 'node:vm'
+import { hideSecrets } from '../../shared/hide-secrets.ts'
 import { DEFAULT_OLD_READER, parseOldReaderSettings, type OldReaderSettings } from '../../shared/old-reader.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -59,27 +60,8 @@ const READ_CHARS = 40_000
 
 export const isSecretName = (name: string) => SECRET_NAME.test(name) || SECRET_EXT.test(name)
 
-// One line at a time (a key that spans lines is handled by maskLines).
-const LINE_SECRETS: [RegExp, string][] = [
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '[a token is stored here]'],
-  [/\b(?:sk|pk|rk)-(?:ant-|proj-|live_|test_)?[A-Za-z0-9_-]{16,}/g, '[a key is stored here]'],
-  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}/g, '[a token is stored here]'],
-  [/\bAKIA[0-9A-Z]{16}\b/g, '[a key is stored here]'],
-  [/\bAIza[0-9A-Za-z_-]{30,}/g, '[a key is stored here]'],
-  [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, '[a token is stored here]'],
-  // The password of a connection string (scheme://user:password@host).
-  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'"`]+:)[^\s@'"`]+@/gi, '$1[hidden]@'],
-  // password = "…", "apiKey": '…', token: `…` (a literal of six characters or more given to a secret's name).
-  [/((?:pass(?:word|wd)?|pwd|secret|token|api[-_]?key|apikey|access[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?key)\w*["']?\s*[:=]\s*["'`])([^"'`\s]{6,})(["'`])/gi, '$1[hidden]$3'],
-  [/(\bBearer\s+)[A-Za-z0-9._~+/-]{16,}=*/g, '$1[hidden]'],
-]
-
-/** One line with its secrets hidden. */
-export function hideSecrets(line: string): string {
-  let s = line
-  for (const [re, to] of LINE_SECRETS) s = s.replace(re, to)
-  return s
-}
+// One line at a time (a key that spans lines is handled by maskLines). F-361: the single-line masker moved to shared/hide-secrets.ts (a chat's goal-progress line uses it too) and is re-exported here, unchanged.
+export { hideSecrets }
 
 /** Lines with their secrets hidden; a private key's whole block becomes one note and blank lines (so line numbers stay true). */
 export function maskLines(lines: readonly string[]): string[] {

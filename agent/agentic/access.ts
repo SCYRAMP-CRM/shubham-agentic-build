@@ -114,8 +114,16 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/heartbeat\/morning$/, OWNER],
   ['PATCH', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/beat$/, OWNER],
+  // F-359: a chat's goals heartbeat: read all, and the switch of one chat (the first owner's only; the routes ask for a signed-in human and the first owner by id before anything is read or written).
+  ['GET', /^\/beats$/, OWNER],
+  ['PUT', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
   ['GET', /^\/goal-floors$/, OWNER],
+  // F-361: what the agents reported on one floor's goals, and who made each (the first owner's page only; the route asks for a signed-in person and the first owner by id before it reads the file).
+  ['GET', /^\/floors\/([^/]+)\/goal-progress$/, OWNER],
+  // F-362: his answer to a goal that waits for him, and his "Not waiting any more" (the first owner's page only; human-only; every check comes before the wait file is read).
+  ['POST', /^\/floors\/([^/]+)\/goals\/([^/]+)\/answer$/, OWNER],
+  ['POST', /^\/floors\/([^/]+)\/goals\/([^/]+)\/dismiss$/, OWNER],
   ['PUT', /^\/floors\/([^/]+)\/goal-order$/, OWNER],
   // F-343: a goal added by hand in the goals curtain (the owner's page only; the route asks for a signed-in human and the first owner by id before it touches the CRM).
   ['POST', /^\/floors\/([^/]+)\/goals$/, OWNER],

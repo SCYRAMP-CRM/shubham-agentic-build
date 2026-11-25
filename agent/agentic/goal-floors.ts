@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
-import { MAX_FILE_BYTES, linkGoal, linksForWire, parseGoalFloors, serializeGoalFloors, type GoalFloorsFile, type LinkResult } from '../../shared/goal-floors.ts'
+import { MAX_FILE_BYTES, floorOfGoal, linkGoal, linksForWire, madeForWire, parseGoalFloors, serializeGoalFloors, type GoalFloorsFile, type LinkResult } from '../../shared/goal-floors.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 
@@ -13,6 +13,10 @@ export const GOAL_FLOORS_FILE = 'goal-floors.json'
 export interface GoalFloors {
   /** The links as the page is sent them: goal id -> floor id. Fail closed: any trouble reading is "nothing linked". */
   links(): Record<string, string>
+  /** F-361: the floor this goal is linked to (the floor of the chat that made it), or null. */
+  floorOf(goalId: unknown): string | null
+  /** F-361: who made each goal linked to this floor, and when (ids and a time). */
+  made(floorId: string): Record<string, { agentId: string; at: string }>
   /** Records that `goalId` was made by a chat of this floor and agent (first link wins). Never throws: a failure is one log line (ids only) and `write-failed`. */
   link(goalId: unknown, by: { floorId: string; agentId: string }): LinkResult | 'write-failed'
 }
@@ -33,6 +37,8 @@ export function createGoalFloors(o: { dir: string; log?: Pick<Logger, 'warn'>; n
 
   return {
     links: () => linksForWire(read()),
+    floorOf: goalId => floorOfGoal(read(), goalId),
+    made: floorId => madeForWire(read(), floorId),
     link(goalId, by) {
       const id = typeof goalId === 'string' ? goalId.slice(0, 64) : '?'
       try {

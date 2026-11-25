@@ -95,6 +95,8 @@ import { LATCH_NAME } from './latch-hook.ts'
 import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
 import { createHeartbeat, driftPushOn, phoneItems, unfinishedWork } from './heartbeat.ts'
+import { beatKey, beatKindOfProfile, beatRefusalOf, createChatBeats, createGoalBeats, floorGoalsAnswer, openGoalsOf, type BeatSend, type GoalsRead } from './chat-beat.ts'
+import { BEAT_OWNER_WORDS, METER_MAX_AGE_MS, REFUSAL_WORDS, parseBeatPatch, patchForKind, type BeatRefusal } from '../../shared/chat-beat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
 import { APP, NOT_RECORDED, UNATTRIBUTED, classesOfInput, createPresence, describePresence, screenActOf, screenCallerOf, screenOutcomeOf, screenToolOf, type ChatActor, type ChatRef, type Door } from './chat-presence.ts'
@@ -159,7 +161,7 @@ import type { DependenciesAnswer, DependencyPc, DependencyReport } from '../../s
 import { buildMcpInventory, findRunner, planInstall, registerCurated, removeCurated, type InventoryChat } from './mcp-inventory.ts'
 import { MCP_CURATED, readMcpDefaultDone, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpDefaultDone, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
-import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
+import { CODEX_FORMAT, codexLimitsOf, discoverThread, findRollout, lastAssistantMessage, recentCodexLimits } from '../codex/rollout.ts'
 import { readLaunched, readRunning, type DriftReading } from '../codex/drift.ts'
 import { watchForThread } from '../codex/discovery.ts'
 import { switchConversationComplete } from '../codex/complete-conversion.ts'
@@ -215,6 +217,10 @@ import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
+import { createGoalProgress } from './goal-progress.ts'
+import { createGoalWait } from './goal-wait.ts'
+import { ANSWERED_LINE, ANSWER_NOT_CLEARED_WORDS, ANSWER_STATUS, ANSWER_WORDS, DISMISSED_LINE, WAIT_OK_WORDS, WAIT_STATUS, WAIT_WORDS, answerMessage, type AnswerRefusal } from '../../shared/goal-wait.ts'
+import { REPORT_OK_WORDS, REPORT_STATUS, REPORT_WORDS, updatePhrase } from '../../shared/goal-progress.ts'
 import { GOAL_ID_RE, LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
 import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../shared/goal-add.ts'
 import { GOAL_EDIT_WORDS, checkGoalDisable, checkGoalEdit, checkGoalNest, isDisableBody, isNestBody, type GoalEditCode } from '../../shared/goal-edit.ts'
@@ -338,6 +344,8 @@ const NEEDS_SERVER = new Set([
   'crm_goals',
   'crm_goal_add',
   'crm_goal_update',
+  'goal_progress',
+  'goal_wait',
   'crm_scopes',
   'crm_board',
   'crm_catalog',
@@ -363,6 +371,8 @@ const ADMIN_TOOLS = new Set([
   'crm_goals',
   'crm_goal_add',
   'crm_goal_update',
+  'goal_progress',
+  'goal_wait',
   'crm_scopes',
   'crm_board',
   'crm_catalog',
@@ -409,6 +419,8 @@ const FIRST_OWNER_TOOLS = new Set([
   'crm_goals',
   'crm_goal_add',
   'crm_goal_update',
+  'goal_progress',
+  'goal_wait',
   'crm_scopes',
   'crm_board',
   'crm_catalog',
@@ -1040,6 +1052,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Order o9465: the task list's changes also go to someone it is open to (Settings › Access).
     if (e.t === 'tasks') return access.isAdmin(c) || (!!c.person && !!o.featureAccess?.allows(c, 'tasks')) ? JSON.stringify(e) : null
     if (e.t === 'auth') return JSON.stringify(e)
+    // F-361 (Agent 14's read): an ALLOW-LIST, asked before every rule below that would let an event of an unknown kind through: ONLY the first owner's connection is told that a goal's progress changed (a poke with the
+    // floor id and no text). A person, a second owner, a staff member and a socket that is not the first owner's get nothing.
+    if (e.t === 'goal-progress') return isFirstOwner(c) ? JSON.stringify({ t: 'goal-progress', floorId: e.floorId } satisfies AgenticEvent) : null
     if (e.t === 'memory') {
       const f = allFloors().find(x => x.id === e.floorId)
       return f && access.floorSeen(c, f) ? JSON.stringify(e) : null
@@ -1234,6 +1249,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const goalFloors = createGoalFloors({ dir: o.dir, log: o.log, ...(o.goalFloorsTest?.readText ? { readText: o.goalFloorsTest.readText } : {}) })
   // F-334 addendum: the order of a floor's goals in its curtain (ids and positions only, in the order module's own file). Written only by PUT /floors/:id/goal-order, read only by GET /goal-floors. The CRM is never touched.
   const goalOrder = createGoalOrder({ dir: o.dir, log: o.log, ...(o.goalOrderTest?.readText ? { readText: o.goalOrderTest.readText } : {}) })
+  // F-361: where each goal has reached (one cleaned line per goal, in the module's own file). Written only by the goal_progress case and the crm_goal_update stamp of toolFor, read only by GET /floors/:id/goal-progress; a
+  // change tells the first owner's pages with a text-free poke on the events socket (eventFor lets it go to the first owner and nobody else).
+  const tellPagesAboutGoals = (floorId: string) => emit({ t: 'goal-progress', floorId })
+  const goalProgress = createGoalProgress({ dir: o.dir, log: o.log, onChange: tellPagesAboutGoals })
+  // F-362: the goals that WAIT for him (one cleaned line each, in the module's own file). Set only by the goal_wait case of toolFor; ended only by his answer or his dismissal (answerWait, dismissWait: his page, human-only);
+  // read by GET /floors/:id/goal-progress, by his answer route and by the heartbeat (agentIsWaiting). The same poke tells his pages.
+  const goalWait = createGoalWait({ dir: o.dir, log: o.log, onChange: tellPagesAboutGoals })
   const crmReads = createCrmReads({ proxy: crmProxy })
   const crmWrite = createCrmWrite({ proxy: crmProxy })
   // order o57e2, o4d14: the Accounts page's Email tab, read from the NEW Supabase project (schema sad; db/accounts/README.md) through the login sad_app named in two files in this state folder. Nothing connects
@@ -5340,6 +5362,137 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return decidesOn(questionRouteOf(at.floor.id), c.person.id)
   }
 
+  // F-359 (Shubham, 25 Nov 2026: "we need abiliy tto attach heartbeat for certain caht in the agentic ... it will check hte goals and keep wroking on them"): the GOALS heartbeat of a chat the first owner switched on
+  // (chat-beat.ts has the rules, shared/chat-beat.ts the words and limits). It runs inside the old heartbeat's beat (the `goalBeats` hook) and does nothing while no chat is switched on. Its state is its own file, never floors.json.
+  const chatBeats = createChatBeats({ file: path.join(o.dir, 'chat-beats.json'), log })
+  /** Why this chat cannot have a goals heartbeat (a key of REFUSAL_WORDS), or null. The same answer for the route (when he switches it on) and for every look (a chat that became ineligible is held). */
+  function beatRefusal(f: Floor, a: FloorAgent): BeatRefusal | null {
+    return beatRefusalOf({
+      pcControl: isPcControl(f),
+      orchestrator: isOrchestratorAgent(f.name, a),
+      personAssistant: isPersonAssistant(a),
+      firstOwnerChat: isFirstOwner(access.asChat(a)),
+      kind: beatKindOf(a),
+    })
+  }
+  /** What an agent's chat is made of (its execution profile): a native Claude chat, a native Codex chat, Codex in Claude Code ('bridge'), or another engine (no heartbeat). A profile that cannot be read is 'other'. */
+  function beatKindOf(a: FloorAgent) {
+    try {
+      return beatKindOfProfile(executionIdentityOf(a, defaultsNow()).profile)
+    } catch {
+      return 'other' as const
+    }
+  }
+  /** The same for the chat of a session; a session no floor has is 'other'. */
+  const beatKindOfSession = (sid: string) => {
+    const at = bySession(sid)
+    return at ? beatKindOf(at.agent) : ('other' as const)
+  }
+  /**
+   * Types the heartbeat's words into a Codex or Codex-in-Claude-Code chat of THIS PC the way send_to_chat does (typeInto with confirmed: true): the checked sender with its receipts, never over text in his box (a draft is a refusal,
+   * not a join, for these chats), never pressed Enter on at a prompt or a menu, and never sent twice. 'sent' only when the receipt says so; a delivery still in progress or not confirmed may have been typed, so it is 'uncertain' (counted, never
+   * typed again); anything else (a draft, a menu, blocked, gone) is 'later'. Bounded: the beat does not wait more than BEAT_DELIVERY_MS for the receipt (the one native send goes on by itself).
+   */
+  const BEAT_DELIVERY_MS = 25_000
+  async function beatDeliver(sid: string, text: string): Promise<BeatSend> {
+    const sending = typeInto({ sessionId: sid, id: self().id }, text, { confirmed: true }).then(
+      (ok): BeatSend => (ok ? 'sent' : 'later'),
+      (e: unknown): BeatSend => {
+        const code = isObject(e) ? e.code : undefined
+        return code === 'delivery-pending' || code === 'delivery-unconfirmed' ? 'uncertain' : 'later'
+      },
+    )
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([sending, new Promise<BeatSend>(resolve => { timer = setTimeout(() => resolve('uncertain'), BEAT_DELIVERY_MS) })])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  /** When the chat's conversation file was last written (ms), or null when it has none. */
+  const transcriptWrittenAt = (sid: string): number | null => {
+    try {
+      const file = findTranscript(sid, projectsDir)
+      return file ? statSync(file).mtimeMs : null
+    } catch {
+      return null
+    }
+  }
+  const goalBeats = createGoalBeats(chatBeats, {
+    now: Date.now,
+    agents: agentRefs,
+    ineligible: (floorId, agentId) => {
+      const f = floors.list().find(x => x.id === floorId)
+      const a = f?.agents.find(x => x.id === agentId)
+      return f && a ? beatRefusal(f, a) : 'gone'
+    },
+    stateOf: sid => whereAll()[sid]?.state,
+    kind: beatKindOfSession,
+    here: sid => whereAll()[sid]?.id === self().id,
+    fenced: sid => runFenced(sid, false),
+    stoppedOnPurpose: sid => heartbeat.isStopped(sid),
+    idleSince: transcriptWrittenAt,
+    lastAnswer: sid => {
+      try {
+        const file = findTranscript(sid, projectsDir)
+        if (!file) return null
+        // A NATIVE Codex chat's conversation is a rollout: its own reader. Codex in Claude Code keeps a Claude JSONL, so it is read with Claude's reader (Agent 14's read: the rollout parser on Claude lines finds nothing,
+        // and the no-open-goals pause could never fire for it).
+        if (beatKindOfSession(sid) === 'codex') return lastAssistantMessage(file)
+        const rows = readTranscriptFile(file)
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const m = rows[i]
+          if (m.role !== 'assistant' || !m.text.trim()) continue
+          const t = Date.parse(m.timestamp ?? '')
+          return { text: m.text, at: Number.isFinite(t) ? t : statSync(file).mtimeMs }
+        }
+        return null
+      } catch {
+        return null
+      }
+    },
+    // What guards a chat: a Claude chat, the subscription a chat started NOW would run on (the credential the CRM placed on this PC, else the PC's own login): its meter and no other's. A native Codex chat: the Codex account's own
+    // reading, the newest rate-limit row in the chat's OWN rollout (none: held). Codex in Claude Code: no meter exists to read, so only today's cap and the pauses guard it ('unmetered').
+    meter: sid => {
+      try {
+        const kind = beatKindOfSession(sid)
+        if (kind === 'other') return null
+        if (kind === 'bridge') return 'unmetered' as const
+        if (kind === 'codex') {
+          // The newest reading across this PC's recent Codex conversations (one login serves them all), and this chat's own: whichever is newer. An idle floor with none newer than 6 hours is 'not known', so it holds.
+          const file = codexRollout(sid)
+          const own = file ? codexLimitsOf(file) : null
+          const recent = o.codex ? recentCodexLimits(o.codex.paths.home) : null
+          const l = own && recent ? (recent.at > own.at ? recent : own) : (own ?? recent)
+          return l ? { weekPercent: l.reached ? 100 : l.weekPercent, fiveHourPercent: l.fiveHourPercent, weekResetsAt: l.weekResetsAt, fiveHourResetsAt: l.fiveHourResetsAt, at: l.at } : null
+        }
+        return usage?.meter(METER_MAX_AGE_MS, usageSubFor(o.credential?.() ?? null)) ?? null
+      } catch {
+        return null
+      }
+    },
+    linkedGoals: floorId => Object.values(goalFloors.links()).filter(f => f === floorId).length,
+    // The app reads the floor's open goals itself, as the first owner's CRM login (never anyone else's: another person's kept login lists what THEY see). null = cannot be told (the marker line is then the fallback).
+    openGoals: async floorId => {
+      try {
+        return openGoalsOf(JSON.parse(await crmGoals.list({ status: 'open', limit: 100 })) as GoalsRead, goalFloors.links(), floorId, SBSKRRT_ID)
+      } catch {
+        return null
+      }
+    },
+    // Only into a chat that runs on this PC. A Claude chat: the same safe typing as the old nudge (never over his unsent draft). A Codex or Codex-in-Claude-Code chat: the checked sender of send_to_chat (beatDeliver).
+    type: async (sid, text) => {
+      const w = whereAll()[sid]
+      if (!w || w.id !== self().id) return 'later'
+      const kind = beatKindOfSession(sid)
+      if (kind === 'other') return 'later'
+      if (kind !== 'claude') return beatDeliver(sid, text)
+      chats.typeWhenReady(sid, text, { holdForDraft: true })
+      return 'sent'
+    },
+    log,
+  })
+
   const heartbeat = createHeartbeat({
     now: Date.now,
     file: path.join(o.dir, 'heartbeat.json'),
@@ -5348,6 +5501,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     stateOf: sid => whereAll()[sid]?.state,
     tail: tailOf,
     watch: watchdogOn ? () => watchdog.watch() : undefined,
+    goalBeats: (now, nudged) => goalBeats.run(now, nudged),
     openOrder: sid => orders.list().some(x => x.to.sessionId === sid),
     restart: async (floorId, agentId) => {
       try {
@@ -6164,6 +6318,40 @@ export function createAgentic(o: AgenticOptions): Agentic {
     o.auth?.deny(c, 403, 'admin-only', where)
     throw authError(403, words, 'admin-only')
   }
+  /**
+   * F-359: GET /beats -> { engineOn, unreadable, beats: { "<floorId>|<agentId>": ChatBeatView } }. A signed-in person (humanOnly: a chat's key and a machine token are refused) who is the FIRST owner by id (firstOwnerOnly: a second owner too).
+   */
+  function beatsRead(r: MountRequest) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, BEAT_OWNER_WORDS)
+    return { engineOn: heartbeat.state().enabled, unreadable: chatBeats.unreadable(), beats: goalBeats.views() }
+  }
+  /**
+   * F-359: PUT /floors/<floor>/agents/<agent>/beat { enabled?, intervalMin?, dailyCap?, paused? } -> { beat }. A signed-in person (humanOnly), the FIRST owner by id (firstOwnerOnly), a floor and an agent that are well formed ids and exist
+   * (404), a body that is some of exactly those four keys with an allowed value (400 beat-body), and, to switch it ON, a chat that may have one (409, the fixed sentence of beatRefusal). The setting lives in chat-beats.json only: floor PATCH
+   * (the page sends the whole agents array) cannot carry it and no chat tool reaches it.
+   */
+  function beatSet(r: MountRequest, floorId: string, agentId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, BEAT_OWNER_WORDS)
+    if (!LINK_ID_RE.test(floorId) || !LINK_ID_RE.test(agentId)) throw apiError(404, 'No such chat')
+    const f = floorOf(floorId)
+    const a = f.agents.find(x => x.id === agentId)
+    if (!a) throw apiError(404, 'No such chat')
+    const patch = parseBeatPatch(r.body)
+    if (!patch) throw Object.assign(apiError(400, 'Expected one or more of enabled, intervalMin, dailyCap and paused, with their allowed values.'), { code: 'beat-body' })
+    if (patch.enabled === true) {
+      const why = beatRefusal(f, a)
+      if (why) throw Object.assign(apiError(409, REFUSAL_WORDS[why]), { code: `beat-${why}` })
+    }
+    // A chat no meter guards (Codex in Claude Code) has fewer choices and safer defaults (shared/chat-beat.ts patchForKind); a value that is not one of its kind's choices is refused, and switching it on stores values it allows.
+    const key = beatKey(floorId, agentId)
+    const stored = patchForKind(beatKindOf(a), patch, chatBeats.get(key) ?? null)
+    if (!stored) throw Object.assign(apiError(400, 'That is not one of the choices for this chat.'), { code: 'beat-choice' })
+    chatBeats.patch(key, stored)
+    log?.info(`goals heartbeat: the setting of agent ${agentId} on floor ${floorId} was changed`)
+    return { beat: goalBeats.view(floorId, agentId) }
+  }
   /** F-322: what a second owner is told by the heartbeat's routes (they wake the hub's Assistant, which is the first owner's). */
   const HEARTBEAT_WORDS = "The heartbeat is for the first owner of this app: it wakes his Assistant. Your own Assistant is My Assistant."
   /**
@@ -6217,6 +6405,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return goalFloors
   }
   /**
+   * F-361: the agents' progress lines on a floor's goals (goal-progress.ts), his page only, in the order goalFloorsOwner asks: a chat's key and every caller who is not a signed-in CRM person are refused (humanOnly), then every
+   * administrator who is not the first owner by id (firstOwnerOnly: a second owner too). Every one of them comes BEFORE the floor is looked up or the file is read. The lines are chat text, so nothing here logs or repeats one.
+   */
+  function goalProgressOwner(r: MountRequest) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+  }
+  /**
    * F-345: the hub's choice "Chats put tasks in Goals", the first owner's page only, and THE ONLY place `tasksToGoalsStore` is read or changed by a route. A chat's key is refused for both (an agent does not read or
    * flip the words of its own brief); a second owner is refused by id (his chats never get the paragraph, and the switch is for Shubham's chats); the PUT also needs a signed-in CRM person (humanOnly: a machine token
    * or an expired cookie writes nothing). The answer is only the one boolean and whether the file could be read.
@@ -6263,6 +6459,91 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * only; the link file keeps the fixed word BY_HAND). Every refusal is one fixed sentence with a code (shared/goal-add.ts): the CRM's own words and the typed text are never in an answer, an error or a log line;
    * the log line is the floor id, the goal id and the time.
    */
+  /**
+   * F-362: HIS answer to a goal that waits for him (the learning "Understood, next step" / "Not yet", the approval "Yes" / "No", a question's reply). In this order, every step BEFORE anything is sent: a chat's key and anyone
+   * who is not a signed-in person are refused (humanOnly), then every administrator who is not the first owner by id (firstOwnerOnly); the floor and the goal ids; the body (exactly a choice, a request id and, for a question
+   * only, his text); the wait must exist and belong to this floor; the choice must fit its kind; the chat that waits must still be on the floor and RUNNING (an answer never starts a chat). The message is built by the
+   * app from the kind and the choice (shared/goal-wait.ts answerMessage: never the goal's title, never the agent's line; only his own typed reply for a question) and goes through sayTo, the send path under the chat
+   * box (a durable receipt; the request id is the message id, so a second tap is the same message). ONLY when the chat took it is the wait cleared and the progress line written, in the app's own words.
+   * Agent 14's fixes: (1) ONE answer at a time per goal: two taps with different request ids (two devices, a double tap) would both pass the checks while the first send awaits its receipt, so a goal that is being
+   * answered is held in `answering` and a second one is refused (409 busy) until the first is over; (2) the body carries the wait's `at`, the version the page showed him: a chat may reword its pending wait at any time,
+   * and an answer to words he did not read is refused (409 changed), for every kind. Known and accepted, cost only: sayTo may OPEN a chat that stopped between the running check and the send.
+   */
+  async function answerWait(r: MountRequest, floorId: string, goalId: string): Promise<{ ok: true; sent: true }> {
+    goalProgressOwner(r)
+    const caller = callerOf(r)
+    if (!LINK_ID_RE.test(floorId) || !GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
+    const floor = floorOf(floorId)
+    const refuse = (code: AnswerRefusal | 'not-cleared') => Object.assign(apiError(code === 'not-cleared' ? 503 : ANSWER_STATUS[code], code === 'not-cleared' ? ANSWER_NOT_CLEARED_WORDS : ANSWER_WORDS[code]), { code })
+    const b = isObject(r.body) ? r.body : null
+    if (!b || typeof b.choice !== 'string' || typeof b.requestId !== 'string' || !UUID_RE.test(b.requestId) || typeof b.waitAt !== 'string' || Object.keys(b).some(k => k !== 'choice' && k !== 'requestId' && k !== 'text' && k !== 'waitAt')) throw refuse('bad-request')
+    const wait = goalWait.get(goalId)
+    if (!wait || wait.floorId !== floorId) throw refuse('no-wait')
+    if (wait.at !== b.waitAt) throw refuse('changed')
+    if (b.text !== undefined && wait.kind !== 'question') throw refuse('bad-request')
+    const message = answerMessage(goalId, wait.kind, b.choice, b.text)
+    if (message === null) throw refuse('bad-request')
+    let sid: string | null
+    try {
+      sid = agentOf(floor, wait.agentId).sessionId
+    } catch {
+      throw refuse('gone')
+    }
+    if (!sid || !whereAll()[sid]) throw refuse('stopped')
+    // From here to the end of the send NO second answer or dismissal of this goal may run (the set is made before the first await).
+    if (answeringWait.has(goalId)) throw refuse('busy')
+    answeringWait.add(goalId)
+    try {
+      const said = await sayTo(floorId, wait.agentId, message, { messageId: b.requestId, expectedSessionId: sid }, caller)
+      const state = said.receipt?.state
+      if (state !== 'sent') throw refuse(state === 'blocked' ? (said.receipt?.reason === 'asking' ? 'asking' : 'not-sent') : 'unconfirmed')
+      try {
+        goalWait.clear(goalId)
+      } catch {
+        throw refuse('not-cleared')
+      }
+      goalProgress.stamp({ goalId, line: ANSWERED_LINE(b.choice), floorId, agentId: wait.agentId, goalFloor: floorId, kind: 'answered' })
+      return { ok: true, sent: true }
+    } finally {
+      answeringWait.delete(goalId)
+    }
+  }
+  /**
+   * F-362: his "Not waiting any more": the same doors as the answer, sends NOTHING to the chat, ends the wait and says so on the goal in the app's own words (kind 'dismissed': it never says an answer went). The body is
+   * exactly { waitAt } (the version he saw); a goal that is being answered, or a wait that changed, is refused as for an answer.
+   */
+  function dismissWait(r: MountRequest, floorId: string, goalId: string): { ok: true } {
+    goalProgressOwner(r)
+    if (!LINK_ID_RE.test(floorId) || !GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
+    floorOf(floorId)
+    const refuse = (code: AnswerRefusal) => Object.assign(apiError(ANSWER_STATUS[code], ANSWER_WORDS[code]), { code })
+    const b = isObject(r.body) ? r.body : null
+    if (!b || typeof b.waitAt !== 'string' || Object.keys(b).some(k => k !== 'waitAt')) throw refuse('bad-request')
+    const wait = goalWait.get(goalId)
+    if (!wait || wait.floorId !== floorId) throw refuse('no-wait')
+    if (wait.at !== b.waitAt) throw refuse('changed')
+    if (answeringWait.has(goalId)) throw refuse('busy')
+    try {
+      goalWait.clear(goalId)
+    } catch {
+      throw Object.assign(apiError(503, ANSWER_NOT_CLEARED_WORDS), { code: 'not-cleared' })
+    }
+    goalProgress.stamp({ goalId, line: DISMISSED_LINE, floorId, agentId: wait.agentId, goalFloor: floorId, kind: 'dismissed' })
+    return { ok: true }
+  }
+  /** F-362 (Agent 14's fix 4): the goals being answered this moment (see answerWait). */
+  const answeringWait = new Set<string>()
+  /**
+   * F-362 (Agent 14's fix 4): a goal that is CLOSED (done or dropped, by him on the page or by a chat's crm_goal_update) is no longer waiting for anyone: its wait is released so it stops holding a place. Never throws: if the
+   * file cannot be written the wait stays and expires by itself (WAIT_TTL_MS). A goal closed in the CRM's own page, disabled or deleted is found by that expiry.
+   */
+  function releaseClosedGoalWait(goalId: unknown) {
+    try {
+      goalWait.clear(goalId)
+    } catch {
+      // it expires
+    }
+  }
   function addGoalByHand(r: MountRequest, floorId: string) {
     humanOnly(r)
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
@@ -6394,6 +6675,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // an answer that is not JSON: the goal was changed all the same
     }
     o.log?.info(`goal changed by hand: floor ${floorId.slice(0, 64)}, goal ${goalId.slice(0, 64)}, fields ${Object.keys(fields).join(',')}, ${Date.now() - t} ms`)
+    if (fields.status === 'done' || fields.status === 'abandoned') releaseClosedGoalWait(goalId)
     return { ok: true, goal }
   }
 
@@ -7410,8 +7692,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return crmGoals.whoami()
       case 'crm_members':
         return crmGoals.members(args)
-      case 'crm_goals':
-        return crmGoals.list(args)
+      case 'crm_goals': {
+        // F-359: `floor` (a floor's name or id, resolved against the app's own list like crm_goal_add's) = only the goals LINKED to that floor in the app's own link file, in the order of the floor's Alt+G curtain. Left out: exactly as before.
+        if (args.floor === undefined) return crmGoals.list(args)
+        let target: Floor
+        try {
+          target = goalFloorFor(args.floor, floor)
+        } catch (e) {
+          // goalFloorFor's refusals end "Nothing was added." (they were written for crm_goal_add): a read adds nothing, so it does not say so.
+          if (e instanceof Error) e.message = e.message.replace(' Nothing was added.', '')
+          throw e
+        }
+        const { floor: _floor, limit, ...rest } = args
+        const want = typeof limit === 'number' && limit > 0 ? Math.min(Math.floor(limit), 100) : 30
+        const read = JSON.parse(await crmGoals.list({ ...rest, limit: 100 })) as GoalsRead
+        return json(floorGoalsAnswer(read, goalFloors.links(), goalOrder.orders()[target.id] ?? [], target, want))
+      }
       case 'crm_goal_add': {
         // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
         // F-343: the goal goes on the floor the chat NAMES (resolved above against the app's own list, owner-only tool), else its own; the origin floor sent to the CRM and the link file below use the SAME resolved floor.
@@ -7440,7 +7736,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-344b (Agent 14's read): a goal is changed AS the person the CRM login on this PC belongs to; F-342 keeps another person's good login, so the owner's chat only changes goals while that login is the owner's own (the same check as the hand routes; 409 and nothing sent otherwise)
         const out = await crmGoals.update(args, { userId: SBSKRRT_ID })
         log?.info(`${agent.name} changed a CRM goal`)
+        // F-361 (Agent 14's read): ONLY AFTER the CRM took the change (a refusal above, the login check's 409 included, throws before this line and leaves nothing): the goal's row says, in the app's own fixed words
+        // ("Marked done", "Dropped", "Back to to do", "Edited"), that THIS agent changed it. No word of the agent's or of the goal; a goal not linked to this floor, or a refusal of any kind, is silent.
+        goalProgress.stamp({ goalId: args.id, line: updatePhrase(args.status), floorId: floor.id, agentId: agent.id, goalFloor: goalFloors.floorOf(args.id) })
+        if (args.status === 'done' || args.status === 'abandoned') releaseClosedGoalWait(args.id)
         return out
+      }
+      // F-361: where this agent has reached on a goal of THIS floor: one cleaned line kept in the app's own file (goal-progress.ts), shown live on the goal's row in the floor's curtain. The agent and the floor are the
+      // CALLING chat's, never an argument; only a goal linked to this floor is taken; nothing is sent to the CRM; the answer repeats no word of the line; no log line holds it.
+      case 'goal_progress': {
+        const done = goalProgress.report({ goalId: args.goalId, line: args.line, floorId: floor.id, agentId: agent.id, goalFloor: goalFloors.floorOf(args.goalId) })
+        if (done !== 'ok' && done !== 'same') throw apiError(REPORT_STATUS[done], REPORT_WORDS[done])
+        return json({ ok: true, note: REPORT_OK_WORDS })
+      }
+      // F-362: this agent says a goal of THIS floor waits for Shubham (a question, an approval, or a lesson step he must say he understood). The agent and the floor are the CALLING chat's; the line is cleaned like a progress
+      // line; there is no way here to END a wait; nothing is sent to the CRM; the answer repeats no word of the line; no log line holds it.
+      case 'goal_wait': {
+        const done = goalWait.report({ goalId: args.goalId, kind: args.kind, line: args.line, floorId: floor.id, agentId: agent.id, goalFloor: goalFloors.floorOf(args.goalId) })
+        if (done !== 'ok' && done !== 'same') throw apiError(WAIT_STATUS[done], WAIT_WORDS[done])
+        return json({ ok: true, note: WAIT_OK_WORDS })
       }
       // The rest of the CRM, read only (crm-reads.ts): the boards, one board's cards, what the CRM has, and any of it that may be read.
       case 'crm_scopes':
@@ -9255,12 +9569,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
         await heartbeat.beat()
         return heartbeat.state()
       }],
+    // F-359: the goals heartbeat of each chat (the first owner's only; ids and fixed words, never a word of a chat or of a goal), and its switch. Every check comes before the file is touched (beatSet).
+    ['GET', /^\/beats$/, (_, r) => beatsRead(r)],
+    ['PUT', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat$/, ([floorId, agentId], r) => beatSet(r, floorId, agentId)],
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
     // F-334 (his odf14, o09a5, o307d): the curtain of a floor's CRM goals asks which goals this app's chats made, and for which floor: goal id -> floor id, nothing else. The same owner checks first, before the file is read; no CRM call.
     ['GET', /^\/goal-floors$/, (_, r) => {
       const links = goalFloorsOwner(r).links()
       return { links, orders: goalOrder.orders() }
     }],
+    // F-361 (his "more live ... which agent is working on it and where it has reached"): what the agents have reported on THIS floor's goals, and who made each goal: the first owner's page only, every check before the file is read; no CRM call.
+    ['GET', /^\/floors\/([^/]+)\/goal-progress$/, ([floorId], r) => {
+      goalProgressOwner(r)
+      if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+      floorOf(floorId)
+      return { progress: goalProgress.forFloor(floorId), made: goalFloors.made(floorId), waits: goalWait.forFloor(floorId) }
+    }],
+    // F-362: HIS answer to a wait on a goal of this floor, and his "Not waiting any more". The first owner's page only, human-only; every check comes before the wait file is read (answerWait, dismissWait).
+    ['POST', /^\/floors\/([^/]+)\/goals\/([^/]+)\/answer$/, ([floorId, goalId], r) => answerWait(r, floorId, goalId)],
+    ['POST', /^\/floors\/([^/]+)\/goals\/([^/]+)\/dismiss$/, ([floorId, goalId], r) => dismissWait(r, floorId, goalId)],
     // F-334 addendum (his: "the ability to reorder the goals"): the order of one floor's goals, the owner's page only; ids only; the CRM is not touched. Every check comes before the order file is read or written.
     ['PUT', /^\/floors\/([^/]+)\/goal-order$/, ([floorId], r) => saveGoalOrder(r, floorId)],
     // F-343 (his "yes please do it"): a goal added by hand in a floor's goals curtain. The owner's page only; every check comes before the CRM is called (addGoalByHand); the ONE other caller of crmGoals.add is the chat tool.
@@ -11262,6 +11589,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
+      goalProgress.close()
       executionService?.close()
       messageReceipts.close()
       nativeReceipts.close()
