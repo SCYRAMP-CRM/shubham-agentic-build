@@ -95,8 +95,8 @@ import { LATCH_NAME } from './latch-hook.ts'
 import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
 import { createHeartbeat, driftPushOn, phoneItems, unfinishedWork } from './heartbeat.ts'
-import { beatKey, beatKindOfProfile, beatRefusalOf, createChatBeats, createGoalBeats, floorGoalsAnswer, openGoalsOf, type BeatSend, type GoalsRead } from './chat-beat.ts'
-import { BEAT_OWNER_WORDS, METER_MAX_AGE_MS, REFUSAL_WORDS, parseBeatPatch, patchForKind, type BeatRefusal } from '../../shared/chat-beat.ts'
+import { beatKey, beatKindOfProfile, beatRefusalOf, createChatBeats, createGoalBeats, floorGoalsAnswer, openGoalIdsOf, openGoalsOf, type BeatPc, type BeatSend, type GoalsRead, type Meter } from './chat-beat.ts'
+import { ACTIVE_RECENT_MS, BEAT_LOOK_TIMEOUT_MS, BEAT_OWNER_WORDS, METER_MAX_AGE_MS, MIN_FREE_RAM_MB, NO_OPEN_GOALS_LINE, NUDGE_OK_WORDS, NUDGE_WORDS, REFUSAL_WORDS, START_WORDS, lastLineOf, meterToLook, parseBeatPatch, patchForKind, readBeatLook, readBeatLookAsk, type BeatKind, type BeatLook, type BeatLookAsk, type BeatRefusal, type ChatBeatEligibility } from '../../shared/chat-beat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
 import { APP, NOT_RECORDED, UNATTRIBUTED, classesOfInput, createPresence, describePresence, screenActOf, screenCallerOf, screenOutcomeOf, screenToolOf, type ChatActor, type ChatRef, type Door } from './chat-presence.ts'
@@ -152,7 +152,7 @@ import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexE
 import type { CodexManager } from '../codex/index.ts'
 import { parseVersion } from '../codex/find.ts'
 import { dependencyReport } from './dependencies.ts'
-import { buildClaudePcStatus, joinChats, safeWords, type ClaudeSubSlice, type SlicePreview, type SliceSwitch } from '../claude/pc-status.ts'
+import { buildClaudePcStatus, cleanName, joinChats, safeWords, type ClaudeSubSlice, type SlicePreview, type SliceSwitch } from '../claude/pc-status.ts'
 import { crmUrlOf } from '../claude/crm.ts'
 import { KEY_SHAPE, keyedReport, type PcKeyStore } from '../claude/pc-key.ts'
 import { planRestart, type RestartCandidate } from './claude-restart.ts'
@@ -555,6 +555,8 @@ export interface AgenticOptions {
   tuneGapMs?: number
   /** Tests: how often a running chat's JSONL is looked at for what to send on (1 s). */
   syncEveryMs?: number
+  /** Tests (F-365): the Server's free memory in MB (the machine's own when left out): what the heartbeat's numbers and the limit on a start made by a chat read. */
+  freeMemMb?: () => number
   /**
    * F-051: the memory layer. meaning: the embedding model (main.ts turns it on; left out, search
    * goes by words and nothing is downloaded); start: started with the agent rather than at first
@@ -4760,14 +4762,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * the callers). A restart (/exit) still refuses a draft: that is not a message. A Codex chat keeps the refusal (see joinsDraft).
    * F-221 (review of T2): `unconfirmedThrows`: a member PC's lost answer is delivery-unconfirmed, never "not typed" (lostAnswer).
    */
-  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller; unconfirmedThrows?: boolean } = {}): Promise<boolean> {
+  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller; unconfirmedThrows?: boolean; refuseDraft?: boolean } = {}): Promise<boolean> {
     // 10 Nov 2026, Shubham ("before Codex everything worked"): a message from an agent (agent tools, broadcast, order reply) to a NATIVE CLAUDE
     // chat goes the old direct way again: one paste, one Enter, no receipt, no confirmation, no retry. The checked sender stayed for the chats
     // that need it (Codex, OpenCode, Codex in Claude Code). It also ends the stuck "[Pasted text #N]": Claude Code collapses a long paste, the
     // checked sender could not recognise its own text and never pressed Enter. Never sends twice: there is no retry.
     const confirmed = opt.confirmed === true && !oldWayForClaude(c.sessionId)
     assertMessageRuntime(c.sessionId,c.id,confirmed)
-    const refuseDraft = false
+    // F-363: only the goals heartbeat asks for this (a beat is never joined to a person's unsent text, on any engine or PC); every other caller keeps the 10 Nov rule above.
+    const refuseDraft = opt.refuseDraft === true
     // F-297: a STAFF send (the caller registered its live checks) NEVER joins unsent text, on any path: the hub looked first (staffSendToChat), and this is the last step, at the write itself.
     const staffSend = !!opt.caller && liveChecks.has(opt.caller)
     if (confirmed) {
@@ -4792,7 +4795,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (result === 'draft') {
         // F-297: a staff send NEVER joins unsent text (it is a person's own words, and the Enter that follows would submit them with it).
-        if (!joinsDraft(c.sessionId) || staffSend) throw apiError(409, draftWords(c.sessionId))
+        if (!joinsDraft(c.sessionId) || staffSend || refuseDraft) throw apiError(409, draftWords(c.sessionId))
         // Nothing was typed by the confirmed sender. Send the old direct way, joining the unsent text.
         log?.info(`chat ${c.sessionId.slice(0, 8)}: the box holds unsent text; the message is typed the old direct way after it (no receipt)`)
         if (c.id === self().id) {
@@ -5393,10 +5396,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * Types the heartbeat's words into a Codex or Codex-in-Claude-Code chat of THIS PC the way send_to_chat does (typeInto with confirmed: true): the checked sender with its receipts, never over text in his box (a draft is a refusal,
    * not a join, for these chats), never pressed Enter on at a prompt or a menu, and never sent twice. 'sent' only when the receipt says so; a delivery still in progress or not confirmed may have been typed, so it is 'uncertain' (counted, never
    * typed again); anything else (a draft, a menu, blocked, gone) is 'later'. Bounded: the beat does not wait more than BEAT_DELIVERY_MS for the receipt (the one native send goes on by itself).
+   * F-363: the same for a chat on ANOTHER PC (`pcId`): send_to_chat's own path to a member (receipts for a Codex chat), and for a Claude chat there the old direct send with the draft REFUSED (a beat is never joined to his unsent text:
+   * `refuseDraft`) and a lost answer read as "may have been typed" (`unconfirmedThrows`: counted, never typed again).
    */
   const BEAT_DELIVERY_MS = 25_000
-  async function beatDeliver(sid: string, text: string): Promise<BeatSend> {
-    const sending = typeInto({ sessionId: sid, id: self().id }, text, { confirmed: true }).then(
+  async function beatDeliver(sid: string, text: string, pcId: string = self().id): Promise<BeatSend> {
+    const elsewhere = pcId !== self().id
+    const sending = typeInto({ sessionId: sid, id: pcId }, text, { confirmed: true, ...(elsewhere ? { refuseDraft: true, unconfirmedThrows: true } : {}) }).then(
       (ok): BeatSend => (ok ? 'sent' : 'later'),
       (e: unknown): BeatSend => {
         const code = isObject(e) ? e.code : undefined
@@ -5419,6 +5425,95 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return null
     }
   }
+  /** F-365: the Server's free memory in MB, read when asked (the option is for tests). */
+  const freeMbNow = (): number => (o.freeMemMb ? o.freeMemMb() : Math.round(os.freemem() / 1_048_576))
+  /** F-365: how many agents of a floor run on THIS PC (the Server), in any state. */
+  const floorRunningHere = (floorId: string): number => {
+    const where = whereAll()
+    return floors.list().find(x => x.id === floorId)?.agents.filter(a => !!a.sessionId && where[a.sessionId]?.id === self().id).length ?? 0
+  }
+
+  /**
+   * The chat's last answer (its words and when it was written, ms), or null. Read on the PC the chat runs on, by its `kind`: a NATIVE Codex chat's conversation is a rollout (its own reader); Codex in Claude Code keeps a Claude JSONL, so it is
+   * read with Claude's reader (Agent 14's read: the rollout parser on Claude lines finds nothing, and the no-open-goals pause could never fire for it).
+   */
+  const beatLastAnswerOf = (sid: string, kind: BeatKind): { text: string; at: number } | null => {
+    try {
+      const file = findTranscript(sid, projectsDir)
+      if (!file) return null
+      if (kind === 'codex') return lastAssistantMessage(file)
+      const rows = readTranscriptFile(file)
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const m = rows[i]
+        if (m.role !== 'assistant' || !m.text.trim()) continue
+        const t = Date.parse(m.timestamp ?? '')
+        return { text: m.text, at: Number.isFinite(t) ? t : statSync(file).mtimeMs }
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+  /**
+   * What guards a chat, read on the PC it runs on: a Claude chat, the subscription a chat started NOW would run on (the credential the CRM placed on this PC, else the PC's own login): its meter and no other's. A native Codex chat: the Codex
+   * account's own reading, the newest rate-limit row in the chat's OWN rollout and across this PC's recent Codex conversations (none: held). Codex in Claude Code: no meter exists to read, so only today's cap and the pauses guard it ('unmetered').
+   */
+  const beatMeterOf = (sid: string, kind: BeatKind): Meter | null | 'unmetered' => {
+    try {
+      if (kind === 'other') return null
+      if (kind === 'bridge') return 'unmetered' as const
+      if (kind === 'codex') {
+        // The newest reading across this PC's recent Codex conversations (one login serves them all), and this chat's own: whichever is newer. An idle floor with none newer than 6 hours is 'not known', so it holds.
+        const file = codexRollout(sid)
+        const own = file ? codexLimitsOf(file) : null
+        const recent = o.codex ? recentCodexLimits(o.codex.paths.home) : null
+        const l = own && recent ? (recent.at > own.at ? recent : own) : (own ?? recent)
+        return l ? { weekPercent: l.reached ? 100 : l.weekPercent, fiveHourPercent: l.fiveHourPercent, weekResetsAt: l.weekResetsAt, fiveHourResetsAt: l.fiveHourResetsAt, at: l.at } : null
+      }
+      return usage?.meter(METER_MAX_AGE_MS, usageSubFor(o.credential?.() ?? null)) ?? null
+    } catch {
+      return null
+    }
+  }
+  /**
+   * F-363 (Shubham: "to any chat"), the PC's side: what THIS PC says of its OWN chats to the Server's question `beat-look` (the Server's link only: the member switch of `serve`). For each chat asked about (at most 24, session ids and a kind
+   * only): whether it is in this PC's pool, its state, how long ago its conversation was written, how long ago its last answer was and whether that answer's last line is exactly the no-open-goals line, and the meter that guards it HERE.
+   * AGES and PERCENTAGES and yes/no: never a time of this PC's clock, a word a chat wrote, a path or a name.
+   */
+  function beatLookHere(raw: unknown): { version: 1; chats: BeatLook } {
+    const asks = readBeatLookAsk(raw)
+    if (!asks) throw apiError(400, 'Expected {chats: [{sessionId, kind}]} with at most 24 chats.')
+    const now = Date.now()
+    const states = chats.states()
+    const out: BeatLook = {}
+    for (const q of asks) {
+      const state = states[q.sessionId]
+      if (state === undefined) { out[q.sessionId] = { found: false, state: null, idleForMs: null, last: null, meter: null }; continue }
+      const wrote = transcriptWrittenAt(q.sessionId)
+      const last = beatLastAnswerOf(q.sessionId, q.kind)
+      const m = beatMeterOf(q.sessionId, q.kind)
+      out[q.sessionId] = {
+        found: true,
+        state,
+        idleForMs: wrote === null ? null : Math.round(now - wrote),
+        last: last ? { agoMs: Math.round(now - last.at), noGoals: lastLineOf(last.text) === NO_OPEN_GOALS_LINE } : null,
+        meter: m === 'unmetered' ? 'unmetered' : m ? meterToLook(m, now) : null,
+      }
+    }
+    return { version: 1, chats: out }
+  }
+  /** The Server's side: ONE question to one connected PC about its heartbeat chats. 'offline': no link; 'older': the PC does not know the question; 'silent': it did not answer, or its answer is not the shape (every field is checked). */
+  async function beatLookAt(pc: BeatPc, asks: BeatLookAsk[]): Promise<BeatLook | 'offline' | 'older' | 'silent'> {
+    const link = team?.member(pc.id)
+    if (!link) return 'offline'
+    let raw: unknown
+    try {
+      raw = await request<unknown>(link, 'beat-look', { chats: asks }, BEAT_LOOK_TIMEOUT_MS)
+    } catch (e) {
+      return (e as { code?: string })?.code === 'unknown-op' || /this PC doesn't do beat-look/i.test(message(e)) ? 'older' : 'silent'
+    }
+    return readBeatLook(raw, asks.map(a => a.sessionId)) ?? 'silent'
+  }
   const goalBeats = createGoalBeats(chatBeats, {
     now: Date.now,
     agents: agentRefs,
@@ -5429,49 +5524,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     stateOf: sid => whereAll()[sid]?.state,
     kind: beatKindOfSession,
-    here: sid => whereAll()[sid]?.id === self().id,
+    // F-363: the PC a chat runs on now (the hub's live view of every PC), and whether its own PC is one that is not connected.
+    pcOf: sid => {
+      const w = whereAll()[sid]
+      return w ? { id: w.id, name: w.id === self().id ? self().name : cleanName(w.name, 60), self: w.id === self().id } : null
+    },
+    homeAway: sid => {
+      const home = bySession(sid)?.agent.homePc
+      return !!home && home !== self().id && !remote.has(home)
+    },
+    look: beatLookAt,
     fenced: sid => runFenced(sid, false),
     stoppedOnPurpose: sid => heartbeat.isStopped(sid),
     idleSince: transcriptWrittenAt,
-    lastAnswer: sid => {
-      try {
-        const file = findTranscript(sid, projectsDir)
-        if (!file) return null
-        // A NATIVE Codex chat's conversation is a rollout: its own reader. Codex in Claude Code keeps a Claude JSONL, so it is read with Claude's reader (Agent 14's read: the rollout parser on Claude lines finds nothing,
-        // and the no-open-goals pause could never fire for it).
-        if (beatKindOfSession(sid) === 'codex') return lastAssistantMessage(file)
-        const rows = readTranscriptFile(file)
-        for (let i = rows.length - 1; i >= 0; i--) {
-          const m = rows[i]
-          if (m.role !== 'assistant' || !m.text.trim()) continue
-          const t = Date.parse(m.timestamp ?? '')
-          return { text: m.text, at: Number.isFinite(t) ? t : statSync(file).mtimeMs }
-        }
-        return null
-      } catch {
-        return null
-      }
-    },
-    // What guards a chat: a Claude chat, the subscription a chat started NOW would run on (the credential the CRM placed on this PC, else the PC's own login): its meter and no other's. A native Codex chat: the Codex account's own
-    // reading, the newest rate-limit row in the chat's OWN rollout (none: held). Codex in Claude Code: no meter exists to read, so only today's cap and the pauses guard it ('unmetered').
-    meter: sid => {
-      try {
-        const kind = beatKindOfSession(sid)
-        if (kind === 'other') return null
-        if (kind === 'bridge') return 'unmetered' as const
-        if (kind === 'codex') {
-          // The newest reading across this PC's recent Codex conversations (one login serves them all), and this chat's own: whichever is newer. An idle floor with none newer than 6 hours is 'not known', so it holds.
-          const file = codexRollout(sid)
-          const own = file ? codexLimitsOf(file) : null
-          const recent = o.codex ? recentCodexLimits(o.codex.paths.home) : null
-          const l = own && recent ? (recent.at > own.at ? recent : own) : (own ?? recent)
-          return l ? { weekPercent: l.reached ? 100 : l.weekPercent, fiveHourPercent: l.fiveHourPercent, weekResetsAt: l.weekResetsAt, fiveHourResetsAt: l.fiveHourResetsAt, at: l.at } : null
-        }
-        return usage?.meter(METER_MAX_AGE_MS, usageSubFor(o.credential?.() ?? null)) ?? null
-      } catch {
-        return null
-      }
-    },
+    lastAnswer: sid => beatLastAnswerOf(sid, beatKindOfSession(sid)),
+    meter: sid => beatMeterOf(sid, beatKindOfSession(sid)),
     linkedGoals: floorId => Object.values(goalFloors.links()).filter(f => f === floorId).length,
     // The app reads the floor's open goals itself, as the first owner's CRM login (never anyone else's: another person's kept login lists what THEY see). null = cannot be told (the marker line is then the fallback).
     openGoals: async floorId => {
@@ -5481,18 +5548,56 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return null
       }
     },
-    // Only into a chat that runs on this PC. A Claude chat: the same safe typing as the old nudge (never over his unsent draft). A Codex or Codex-in-Claude-Code chat: the checked sender of send_to_chat (beatDeliver).
+    // F-365 (F-362): does this chat's agent wait for him on a goal that is still open? Nothing waits: no CRM read. Something waits: the open goals are read the way openGoals reads them (his login); when that cannot be told, it counts as waiting (the safe side).
+    waiting: async (floorId, agentId) => {
+      if (!goalWait.agentIsWaiting(agentId, () => true)) return false
+      try {
+        const ids = openGoalIdsOf(JSON.parse(await crmGoals.list({ status: 'open', limit: 100 })) as GoalsRead, goalFloors.links(), floorId, SBSKRRT_ID)
+        return goalWait.agentIsWaiting(agentId, id => ids === null || ids.has(id))
+      } catch {
+        return true
+      }
+    },
+    // F-365: the numbers of the beat, from the app's own knowledge (no CRM read): the OTHER agents of the floor that are working this moment or reported on a goal (or changed one) in the last half hour; how many agents of the floor run on this PC;
+    // the Server's free memory.
+    activeAgents: (floorId, exceptAgentId, now) => {
+      const f = floors.list().find(x => x.id === floorId)
+      if (!f) return 0
+      const reported = new Set<string>()
+      for (const e of Object.values(goalProgress.forFloor(floorId))) {
+        const t = Date.parse(e.at)
+        if ((e.kind === 'reported' || e.kind === 'updated') && Number.isFinite(t) && now - t <= ACTIVE_RECENT_MS && t - now <= 60_000) reported.add(e.agentId)
+      }
+      const where = whereAll()
+      return f.agents.filter(a => a.id !== exceptAgentId && !isOrchestratorAgent(f.name, a) && ((!!a.sessionId && where[a.sessionId]?.state === 'running') || reported.has(a.id))).length
+    },
+    runningOnServer: floorRunningHere,
+    freeMemMb: freeMbNow,
+    // A chat of this PC. A Claude chat: the same safe typing as the old nudge (never over his unsent draft). A Codex or Codex-in-Claude-Code chat: the checked sender of send_to_chat (beatDeliver). F-363: a chat of another PC goes through
+    // beatDeliver as well, over the link that reaches it (receipts for a Codex chat; for a Claude chat the direct send with the draft refused and a lost answer read as "may have been typed").
     type: async (sid, text) => {
       const w = whereAll()[sid]
-      if (!w || w.id !== self().id) return 'later'
+      if (!w) return 'later'
       const kind = beatKindOfSession(sid)
       if (kind === 'other') return 'later'
-      if (kind !== 'claude') return beatDeliver(sid, text)
+      if (w.id !== self().id || kind !== 'claude') return beatDeliver(sid, text, w.id)
       chats.typeWhenReady(sid, text, { holdForDraft: true })
       return 'sent'
     },
     log,
   })
+
+  /**
+   * F-365 (Agent 14's block): the app's OWN limit on a start made by a chat (the app_open_chat tool), so the numbers in the beat's message are not the only fence: none while the Server has less than MIN_FREE_RAM_MB free (less what the ledger has already
+   * granted), and, ONLY for a floor that has a switched-on heartbeat chat with a number chosen, none while the floor already has that number (the largest chosen) plus 2 agents running on this PC. Every other floor keeps only the memory
+   * check. null: the start may go on.
+   */
+  function startRefusal(floorId: string): { code: 'start-memory' | 'start-limit'; words: string } | null {
+    if (!(freeMbNow() - goalBeats.grantedMb() >= MIN_FREE_RAM_MB)) return { code: 'start-memory', words: START_WORDS.memory }
+    const keep = goalBeats.keepFor(floorId)
+    if (keep !== null && floorRunningHere(floorId) >= keep + 2) return { code: 'start-limit', words: START_WORDS.limit }
+    return null
+  }
 
   const heartbeat = createHeartbeat({
     now: Date.now,
@@ -6325,7 +6430,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function beatsRead(r: MountRequest) {
     humanOnly(r)
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, BEAT_OWNER_WORDS)
-    return { engineOn: heartbeat.state().enabled, unreadable: chatBeats.unreadable(), beats: goalBeats.views() }
+    // For every agent of every floor: what it is made of and why it cannot have a heartbeat (null: it may): the page draws the section from THIS, not from its own reading of the chat's execution profile.
+    const chats: Record<string, ChatBeatEligibility> = {}
+    for (const f of floors.list()) for (const a of f.agents) chats[beatKey(f.id, a.id)] = { kind: beatKindOf(a), refusal: beatRefusal(f, a) }
+    return { engineOn: heartbeat.state().enabled, unreadable: chatBeats.unreadable(), beats: goalBeats.views(), chats }
   }
   /**
    * F-359: PUT /floors/<floor>/agents/<agent>/beat { enabled?, intervalMin?, dailyCap?, paused? } -> { beat }. A signed-in person (humanOnly), the FIRST owner by id (firstOwnerOnly), a floor and an agent that are well formed ids and exist
@@ -6340,7 +6448,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const a = f.agents.find(x => x.id === agentId)
     if (!a) throw apiError(404, 'No such chat')
     const patch = parseBeatPatch(r.body)
-    if (!patch) throw Object.assign(apiError(400, 'Expected one or more of enabled, intervalMin, dailyCap and paused, with their allowed values.'), { code: 'beat-body' })
+    if (!patch) throw Object.assign(apiError(400, 'Expected one or more of enabled, intervalMin, dailyCap, paused, keepActive and mayStart, with their allowed values.'), { code: 'beat-body' })
     if (patch.enabled === true) {
       const why = beatRefusal(f, a)
       if (why) throw Object.assign(apiError(409, REFUSAL_WORDS[why]), { code: `beat-${why}` })
@@ -6352,6 +6460,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
     chatBeats.patch(key, stored)
     log?.info(`goals heartbeat: the setting of agent ${agentId} on floor ${floorId} was changed`)
     return { beat: goalBeats.view(floorId, agentId) }
+  }
+  /**
+   * F-365 (Shubham: "make nudge button so i cna manully nudge the lead to check on this"): POST /floors/<floor>/agents/<agent>/beat/nudge (an empty JSON object as the body: the mount refuses a POST that is not JSON) -> { nudge: { at, how, words } }. The same checks as beatSet in the same order (a signed-in person: a chat's
+   * key and a machine token are refused; the FIRST owner by id; well formed ids; the floor and agent; a chat that may have a heartbeat: 409 beat-<why>), and then the gate's own nudge: the same fixed beat message typed now, whatever the chat's idle clock,
+   * meter, daily cap and heartbeat switch say, except for a chat that is not running, working or at a question, stopped on purpose, waiting for him, with unsent text, or nudged in the last minute (409 nudge-<why> with a plain sentence; 429 nudge-too-soon).
+   * The heartbeat's own entry is never touched.
+   */
+  async function beatNudge(r: MountRequest, floorId: string, agentId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, BEAT_OWNER_WORDS)
+    if (!LINK_ID_RE.test(floorId) || !LINK_ID_RE.test(agentId)) throw apiError(404, 'No such chat')
+    const f = floorOf(floorId)
+    const a = f.agents.find(x => x.id === agentId)
+    if (!a) throw apiError(404, 'No such chat')
+    const why = beatRefusal(f, a)
+    if (why) throw Object.assign(apiError(409, REFUSAL_WORDS[why]), { code: `beat-${why}` })
+    const res = await goalBeats.nudge(floorId, agentId)
+    if (!res.ok) throw Object.assign(apiError(res.code === 'too-soon' ? 429 : 409, NUDGE_WORDS[res.code]), { code: `nudge-${res.code}` })
+    return { nudge: { at: res.at, how: res.how, words: NUDGE_OK_WORDS[res.how] } }
   }
   /** F-322: what a second owner is told by the heartbeat's routes (they wake the hub's Assistant, which is the first owner's). */
   const HEARTBEAT_WORDS = "The heartbeat is for the first owner of this app: it wakes his Assistant. Your own Assistant is My Assistant."
@@ -7303,6 +7430,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // has itself (its own codex-in-claude-v1 would take the managed branch below, select/seal/commit, before any later refusal), no other PC.
         // Refused here, before that branch: nothing is selected, sealed, committed or launched (openChat checks the rest).
         if (isStaffAssistant(a) && (args.executionProfile !== undefined || args.restoreHistory !== undefined || executionIdentityOf(a, defaultsNow()).profile !== 'claude-native-v1' || (typeof args.pc === 'string' && args.pc.trim() !== '' && args.pc !== self().id && args.pc.trim().toLowerCase() !== self().name.toLowerCase()))) throw staffError("A person's own Assistant opens on the Server only, as native Claude.")
+        // F-365 (Agent 14's block): a start made by a chat on THIS PC is bounded by the app, not by the words of a message (a chat that is already running here is not a start).
+        const startsElsewhere = typeof args.pc === 'string' && args.pc.trim() !== '' && args.pc !== self().id && args.pc.trim().toLowerCase() !== self().name.toLowerCase()
+        if (!startsElsewhere && !(a.sessionId && whereAll()[a.sessionId]?.id === self().id)) {
+          const refusal = startRefusal(f.id)
+          if (refusal) throw Object.assign(apiError(409, refusal.words), { code: refusal.code })
+        }
         const explicitProfile = args.executionProfile
         if (args.restoreHistory !== undefined && (args.restoreHistory !== true || explicitProfile !== 'codex-native-v1')) throw executionHttpError('execution-invalid', 'selection')
         // Order occ4c: claude-native-v1 is the way back to native Claude for a managed conversation (the service refuses it for a plain one).
@@ -7738,7 +7871,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const { floor: _floor, limit, ...rest } = args
         const want = typeof limit === 'number' && limit > 0 ? Math.min(Math.floor(limit), 100) : 30
         const read = JSON.parse(await crmGoals.list({ ...rest, limit: 100 })) as GoalsRead
-        return json(floorGoalsAnswer(read, goalFloors.links(), goalOrder.orders()[target.id] ?? [], target, want))
+        // F-365: two more fields per goal from the app's own progress and wait files (minutes since the newest report on it; whether an agent waits for Shubham on it): numbers and yes/no, never a line anyone wrote.
+        const progress = goalProgress.forFloor(target.id)
+        const waits = goalWait.forFloor(target.id)
+        const nowMs = Date.now()
+        return json(floorGoalsAnswer(read, goalFloors.links(), goalOrder.orders()[target.id] ?? [], target, want, {
+          reportedMinAgo: id => {
+            const t = Object.hasOwn(progress, id) ? Date.parse(progress[id]!.at) : Number.NaN
+            return Number.isFinite(t) ? Math.max(0, Math.floor((nowMs - t) / 60_000)) : null
+          },
+          waiting: id => Object.hasOwn(waits, id),
+        }))
       }
       case 'crm_goal_add': {
         // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
@@ -9604,6 +9747,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-359: the goals heartbeat of each chat (the first owner's only; ids and fixed words, never a word of a chat or of a goal), and its switch. Every check comes before the file is touched (beatSet).
     ['GET', /^\/beats$/, (_, r) => beatsRead(r)],
     ['PUT', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat$/, ([floorId, agentId], r) => beatSet(r, floorId, agentId)],
+    // F-365: the nudge button (the same fixed beat message typed now): the first owner's own tap, ids and fixed words only.
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat\/nudge$/, ([floorId, agentId], r) => beatNudge(r, floorId, agentId)],
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
     // F-334 (his odf14, o09a5, o307d): the curtain of a floor's CRM goals asks which goals this app's chats made, and for which floor: goal id -> floor id, nothing else. The same owner checks first, before the file is read; no CRM call.
     ['GET', /^\/goal-floors$/, (_, r) => {
@@ -10990,6 +11135,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (t === null) throw apiError(404, "That chat isn't running here")
             return t
           })
+        // F-363: the Server's goals heartbeat asks what a beat needs to know of chats on this PC (their state, ages, the meter that guards them: numbers and yes/no only). Only the Server's link reaches this switch.
+        case 'beat-look':
+          return answer(raw => beatLookHere(raw))
         // o4743: the hub asks what this PC's chat holds in its input line, and asks it to clear an unsent draft there.
         case 'draft-read':
           return answer(raw => {

@@ -117,6 +117,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // F-359: a chat's goals heartbeat: read all, and the switch of one chat (the first owner's only; the routes ask for a signed-in human and the first owner by id before anything is read or written).
   ['GET', /^\/beats$/, OWNER],
   ['PUT', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat$/, OWNER],
+  // F-365: the nudge button: the same beat message typed now (the first owner's own tap; the route asks for a signed-in human and the first owner by id).
+  ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/beat\/nudge$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
   ['GET', /^\/goal-floors$/, OWNER],
   // F-361: what the agents reported on one floor's goals, and who made each (the first owner's page only; the route asks for a signed-in person and the first owner by id before it reads the file).

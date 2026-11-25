@@ -1,0 +1,1 @@
+import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./react-B8SKf8RM.js";import{Pt as n}from"./store-DvlfSXD7.js";var r=e(t(),1);function i(e,t){let i=(0,r.useSyncExternalStore)(n.subscribe,()=>n.get(e),()=>null);return t&&i?.agentId!==t?null:i}export{i as t};
