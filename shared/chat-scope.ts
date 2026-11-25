@@ -1,6 +1,6 @@
 import { pageFeature } from './access.ts'
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
-import { AGENTS_NEW_ROUTE, MEMORY_ROUTE } from './blank-pages.ts'
+import { AGENTS_AKASH_ROUTE, AGENTS_NEW_ROUTE, MEMORY_AKASH_ROUTE, MEMORY_ROUTE, PLATFORM_AKASH_ROUTE, PLATFORM_SHUBHAM_ROUTE } from './blank-pages.ts'
 import { isFirstOwner, type AuthPerson, type ChatAccess, type ChatCan, type ChatOwner } from './auth.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 import { QUICK_ROUTE } from './quick-page.ts'
@@ -109,7 +109,7 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
 // Order o088b (F-267): the Quick page (live talk on its own page, the locked "talk" feature) is the owner's; placed before '/phone-app' too.
 // Orders o5c05 / o7c7c: Getting started ('/start') is a page of its own (its Access rows are in shared/access.ts), so it is open to the people the owner chose when the agent sends the
 // list; with no list (an older agent) it is the owner's like every page that is not Home, Features, Themes, Agents, Chats or Settings. Placed after '/setup', where it belongs.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/start', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/subscriptions', '/mcps', '/paperclip', '/schedules', '/browser', AGENTS_NEW_ROUTE, MEMORY_ROUTE, AGENT_DIRECTORY_ROUTE, QUICK_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/start', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/subscriptions', '/mcps', '/paperclip', '/schedules', '/browser', AGENTS_NEW_ROUTE, MEMORY_ROUTE, PLATFORM_SHUBHAM_ROUTE, PLATFORM_AKASH_ROUTE, AGENTS_AKASH_ROUTE, MEMORY_AKASH_ROUTE, AGENT_DIRECTORY_ROUTE, QUICK_ROUTE, '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

@@ -9,7 +9,7 @@
 /** The pages a staff Assistant may look at (exact routes only). */
 export const STAFF_SCREEN_PAGES: readonly string[] = ['/']
 
-const DENIED = /settings|pc-|devices|remote|rustdesk|browser|access|accounts|whatsapp|chris|paperclip|schedules|setup|build|mcps|themes|features|agents|memory|tasks|goals|chats|crm/
+const DENIED = /settings|pc-|devices|remote|rustdesk|browser|access|accounts|whatsapp|chris|paperclip|schedules|setup|build|mcps|themes|features|agents|memory|tasks|goals|chats|crm|platform/
 
 /**
  * The page's route as the page reports it. Anything that is not a plain path (a query, a hash, an encoding, a double slash, a

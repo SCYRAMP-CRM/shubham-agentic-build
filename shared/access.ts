@@ -13,7 +13,7 @@
  */
 
 import { AGENT_DIRECTORY_ROUTE } from './agent-directory.ts'
-import { AGENTS_NEW, MEMORY } from './blank-pages.ts'
+import { AGENTS_AKASH, AGENTS_NEW, MEMORY, MEMORY_AKASH, PLATFORM_AKASH, PLATFORM_SHUBHAM } from './blank-pages.ts'
 import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 import { QUICK_ROUTE } from './quick-page.ts'
 
@@ -71,13 +71,19 @@ export const FEATURES: readonly Feature[] = [
   { key: 'home', group: 'pages', label: 'Home', blurb: 'Where the app starts.', pages: ['/'] },
   { key: 'features', group: 'pages', label: 'Features', blurb: 'What is asked for and what is built (to read; ticking stays yours).', pages: ['/features'] },
   { key: 'themes', group: 'pages', label: 'Themes', blurb: 'The six looks, light and dark.', pages: ['/themes'] },
-  { key: 'agents', group: 'pages', label: 'Agentic Platform', blurb: 'Their floors and the agents shared with them, and making their own. What you shared stays open to them anyway.', pages: ['/agents', '/chats'] },
+  { key: 'agents', group: 'pages', label: 'Agentic Platform (Old)', blurb: 'Their floors and the agents shared with them, and making their own. What you shared stays open to them anyway.', pages: ['/agents', '/chats'] },
+  // F-340: the two NEW blank Agentic Platform pages, a row each, Only me like every page (the pages are in the menu's order, see src/app/nav.ts).
+  { key: PLATFORM_SHUBHAM.key, group: 'pages', label: PLATFORM_SHUBHAM.label, blurb: PLATFORM_SHUBHAM.access, pages: [PLATFORM_SHUBHAM.route] },
+  { key: PLATFORM_AKASH.key, group: 'pages', label: PLATFORM_AKASH.label, blurb: PLATFORM_AKASH.access, pages: [PLATFORM_AKASH.route] },
   // Order obb81 (goal "Agents tab", step 1): every agent's definition, notes, memory files and last replies. Starts as Only me like every row; its
   // look at an agent's memory and replies (the brain route) stays the owner's even when the page is opened to someone (it is in no rule below).
-  { key: 'agent-directory', group: 'pages', label: 'Agents', blurb: 'Every agent: what it does, edited here; its notes, memory files and last replies stay yours.', pages: [AGENT_DIRECTORY_ROUTE] },
+  { key: 'agent-directory', group: 'pages', label: 'Agents (Old)', blurb: 'Every agent: what it does, edited here; its notes, memory files and last replies stay yours.', pages: [AGENT_DIRECTORY_ROUTE] },
   // F-320 (his orders ofe1f, o67e8): two BLANK pages, a row each, Only me like every page.
   { key: AGENTS_NEW.key, group: 'pages', label: AGENTS_NEW.label, blurb: AGENTS_NEW.access, pages: [AGENTS_NEW.route] },
+  // F-340: Agents (Akash), then Memory (Shubham) (the Memory page, label only) and Memory (Akash): a row each, Only me.
+  { key: AGENTS_AKASH.key, group: 'pages', label: AGENTS_AKASH.label, blurb: AGENTS_AKASH.access, pages: [AGENTS_AKASH.route] },
   { key: MEMORY.key, group: 'pages', label: MEMORY.label, blurb: MEMORY.access, pages: [MEMORY.route] },
+  { key: MEMORY_AKASH.key, group: 'pages', label: MEMORY_AKASH.label, blurb: MEMORY_AKASH.access, pages: [MEMORY_AKASH.route] },
   { key: 'old-reader', group: 'pages', label: 'Live talking', blurb: 'Questions about the old app, answered in seconds (both Live talking pages).', pages: [OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE] },
   { key: 'pc-control', group: 'pages', label: 'PC control', blurb: 'The PCs and their tabs (each tab below is chosen on its own).', pages: ['/pc-control'] },
   { key: 'browser', group: 'pages', label: 'Browser', blurb: 'A browser on the Server.', pages: ['/browser'], locked: 'It is your browser on the Server, with your sign-ins.' },
