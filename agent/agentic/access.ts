@@ -107,6 +107,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/fast\/names$/, OWNER],
   ['GET', /^\/fast\/settings$/, OWNER],
   ['PUT', /^\/fast\/settings$/, OWNER],
+  // F-345: "Chats put tasks in Goals" (the first owner's only: the route asks for the first owner by id, and a signed-in person for the PUT).
+  ['GET', /^\/chat-settings$/, OWNER],
+  ['PUT', /^\/chat-settings$/, OWNER],
   ['GET', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/morning$/, OWNER],
   ['PATCH', /^\/heartbeat$/, OWNER],
@@ -130,9 +133,17 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/dependencies$/, OWNER],
   // F-168 part 2: every MCP server on each PC and the register-only install: the owner of the app, and the route itself also needs a signed-in CRM administrator.
   ['GET', /^\/mcp-inventory$/, OWNER],
+  // F-350: which Claude subscription each PC runs on (the first owner of the app; the route itself also needs a signed-in CRM person and the first owner by id).
+  ['GET', /^\/claude-pcs$/, OWNER],
+  ['POST', /^\/claude-pcs\/preview$/, OWNER],
+  ['POST', /^\/claude-pcs\/switch$/, OWNER],
+  ['POST', /^\/claude-pcs\/restart$/, OWNER],
+  ['GET', /^\/claude-pcs\/restart\/([^/]+)$/, OWNER],
   ['POST', /^\/mcp-install\/plan$/, OWNER],
   ['POST', /^\/mcp-install$/, OWNER],
   ['POST', /^\/mcp-remove$/, OWNER],
+  // F-349: give a server of a PC's own list to every chat that starts on it (the owner's page only; the route asks for a signed-in human)
+  ['POST', /^\/mcp-default$/, OWNER],
   ['GET', /^\/codex\/settings$/, SIGNED],
   ['PUT', /^\/codex\/settings$/, OWNER],
   ['PUT', /^\/offline-chats$/, OWNER],

@@ -169,6 +169,11 @@ export interface ClaudeSubscription {
   check(opts?: { replace?: boolean }): Promise<ClaudeInfo>
   /** Takes out the token the app put in and forgets the session. */
   signOut(): Promise<ClaudeInfo>
+  /**
+   * F-350: this PC's CRM sign-in in three words, for the Subscriptions table. 'signed-in': a login is held. 'ended': there was one and it is over (the CRM ended it, its 7 days passed, or it was made at another address than this run's): sign in
+   * again on this PC. 'none': nobody was ever signed in here, or the person signed out. No cookie, no address.
+   */
+  crmState(): 'signed-in' | 'ended' | 'none'
   /** Reads the office's subscriptions, the person's own and (with `readings`) each one's week again. Reads only. */
   refreshSwitch(opts?: { readings?: boolean }): Promise<ClaudeInfo>
   /** What a switch to `to` would do and what the person is warned of. `chats` are the running chats that would restart. Reads only. */
@@ -253,6 +258,8 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   let lastCheck: ClaudeInfo['check'] = !session && loadSession(o.paths.crmSession) ? { at: new Date(now()).toISOString(), result: 'error', message: 'The CRM sign-in saved on this PC was made at a different address and has ended. Sign in again.' } : null
   let busy = false
   let closed = false
+  /** F-350: a login that was held has ended (the CRM said so, or its 7 days passed): cleared by the next sign-in, a sign-out or the app's last sign-out. */
+  let crmEnded = false
   // One thing at a time: a sign-in, a check, a switch and a sign-out never interleave.
   let queue: Promise<unknown> = Promise.resolve()
   const serial = <T>(fn: () => Promise<T>): Promise<T> => {
@@ -304,6 +311,7 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   }
   function saveSession(next: CrmSession | null) {
     session = next
+    if (next) crmEnded = false
     // The cookie is a bearer credential for the person's CRM account: owner-only.
     if (next) writeAtomic(o.paths.crmSession, JSON.stringify(next, null, 2) + '\n', 0o600)
     else rmSync(o.paths.crmSession, { force: true })
@@ -447,6 +455,7 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   function endSession(s: CrmSession) {
     log.info(`the CRM ended the session for ${s.user.name}; sign in again`)
     saveSession(null)
+    crmEnded = true
     lastCheck = { at: iso(now()), result: 'error', message: 'The CRM ended this session. Sign in again.' }
     choices = []
     allowed = null
@@ -470,6 +479,7 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     if (now() >= expiresAt(session)) {
       log.info(`the CRM session for ${session.user.name} ended (they last 7 days); sign in again`)
       saveSession(null)
+      crmEnded = true
       return
     }
     busy = true
@@ -777,6 +787,7 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
         await unplace('the app signed out for the last time')
         log.info(`this PC's CRM login (made from ${session.user.name}'s sign-in to the app) ended with the app's last sign-out`)
         saveSession(null)
+        crmEnded = false
         lastCheck = null
         forgetSwitch()
         o.onChange()
@@ -794,11 +805,14 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
         await unplace('signed out here')
         if (session) log.info(`signed out of the CRM (${session.user.name})`)
         saveSession(null)
+        crmEnded = false
         lastCheck = null
         forgetSwitch()
         o.onChange()
         return status()
       }),
+
+    crmState: () => (session ? 'signed-in' : crmEnded || loadSession(o.paths.crmSession) !== null ? 'ended' : 'none'),
 
     refreshSwitch: (opts = {}) =>
       serial(async () => {

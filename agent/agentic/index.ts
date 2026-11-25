@@ -84,7 +84,8 @@ import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge, uiWhoOf, type UiWho } from './ui-bridge.ts'
-import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
+import { chosen, mcpConfigFor, readRegistry, restrictedNames, strictConfigFor } from './mcp-registry.ts'
+import { MachineMcpsError, readMachineMcps, setMachineMcp, wantedForChat } from './machine-mcps.ts'
 import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, untappedMark, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress, type Untapped } from './orders.ts'
 import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
 import { BUSY_WORDS, createLatchFiles, createLineQueue, createLockRecord, createSpokenLatch, HELD_WORDS, holdsChat, LINE_POLL_MS, latchVerdict, lockHook, noLockWords, REFUSED_WORDS } from './talk-latch.ts'
@@ -149,9 +150,12 @@ import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexE
 import type { CodexManager } from '../codex/index.ts'
 import { parseVersion } from '../codex/find.ts'
 import { dependencyReport } from './dependencies.ts'
+import { buildClaudePcStatus, joinChats, safeWords, type ClaudeSubSlice, type SlicePreview, type SliceSwitch } from '../claude/pc-status.ts'
+import { planRestart, type RestartCandidate } from './claude-restart.ts'
+import { OLDER_BUILD_WORDS, crmSignInEndedWords, readClaudePcStatus, readClaudePreviewWire, readClaudeSwitchWire, readSwitchPreview, type ClaudePcPreview, type ClaudePcRow, type ClaudePcRunning, type ClaudePcStatus, type ClaudePcSwitched, type ClaudePcsAnswer, type ClaudePreviewWire, type ClaudeSwitchWire, type RestartJob, type RestartLine } from '../../shared/claude-pcs.ts'
 import type { DependenciesAnswer, DependencyPc, DependencyReport } from '../../shared/dependencies.ts'
 import { buildMcpInventory, findRunner, planInstall, registerCurated, removeCurated, type InventoryChat } from './mcp-inventory.ts'
-import { MCP_CURATED, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
+import { MCP_CURATED, readMcpDefaultDone, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpDefaultDone, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { readLaunched, readRunning, type DriftReading } from '../codex/drift.ts'
@@ -171,6 +175,8 @@ import { createInstanceMessages, instanceTextProblem } from './instance-messages
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
+import { createChatSettings } from './chat-settings.ts'
+import { createGoalAddCap, GOAL_ADD_ALL_CAP_WORDS, GOAL_ADD_CAP_WORDS, GOAL_ADD_OTHER_PERSON_WORDS } from './goal-add-cap.ts'
 import { createQuickForwarding } from './quick-forwarding.ts'
 import { quickUntappedSender } from '../../shared/quick-forwarding.ts'
 import { createToolsSeen, needsRefresh, toolsVersion } from './tools-seen.ts'
@@ -483,6 +489,11 @@ export interface AgenticOptions {
    * Order of130: with the id of the CRM subscription it belongs to (claude/index.ts credentialWithSubscription: ONE read), which the usage of a chat started on it is filed under.
    */
   credential?: () => { name: string; value: string; subscriptionId?: string } | null
+  /**
+   * F-350: this PC's own Claude subscription for the Subscriptions page (GET /claude-pcs, the owner's) and for the Server's question `claude-status`: its status, its CRM sign-in in three words and its build. A thunk: the
+   * Claude module is made before this section, but what a later step adds is not. Left out (tests): this PC reports none.
+   */
+  claudeSub?: () => ClaudeSubSlice | null
   /** F-127, tests: how long the Server must be out of reach before new chats are made here (default 20 s). */
   offlineAfterMs?: number
   /** F-127, tests: how long after a failed joining it is tried again (default 30 s). */
@@ -843,6 +854,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
+  // F-345: "Chats put tasks in Goals" (the hub's one choice, default on; see tasksToGoalsFor). Declared here, before any chat can start.
+  const tasksToGoalsStore = createChatSettings(path.join(o.dir, 'chat-settings.json'))
+  if (tasksToGoalsStore.unreadable()) log?.warn('chats put tasks in Goals: the saved choice (chat-settings.json) could not be read; chats start the old way (no standing paragraph) until he chooses again in Settings')
+  // F-345 (Agent 14's read): at most 20 new goals an hour from one agent's chat, and 60 across all chats (toolFor's crm_goal_add case, the one place; the owner's hand-add is a person's tap and is not counted).
+  const goalAddCap = createGoalAddCap()
   const mcpConfig = path.join(o.dir, 'mcp.json')
   const heldFile = path.join(o.dir, 'sessions.json')
   const replicaFile = path.join(o.dir, 'replica.json')
@@ -852,6 +868,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   writeAtomic(mcpConfig, `${json({ mcpServers: appMcpServers })}\n`)
   /** Other MCP servers, given to single agents by name (mcp-registry.ts). */
   const mcpRegistryFile = path.join(o.dir, 'mcp-servers.json')
+  // F-349: the servers THIS PC gives to every chat that starts on it (names only; read at each chat start, never written into floors.json)
+  const machineMcpsFile = path.join(o.dir, 'machine-mcps.json')
+  const machineMcpNames = () => readMachineMcps(machineMcpsFile, self().id)
+  /**
+   * The MCP names a chat of this agent starts with: the agent's own, then this PC's defaults, each once (`chosen` then keeps only the ones in this PC's own list). The defaults reach ONLY the first owner's own chats: not a second
+   * owner's, not another person's, not a person's staff Assistant (Agent 14's read: a default can drive this PC's desktop). Every one of the six chat starts asks this one function.
+   */
+  const wantedMcps = (agent: FloorAgent) => wantedForChat(agent.mcpServers, machineMcpNames(), !isStaffAssistant(agent) && isFirstOwner(access.asChat(agent)))
   // F-051: the memory's hook (memory-hook.ts), for every chat's --settings, which claude adds to
   // the user's own settings. One command line, run by claude's shell: both paths quoted, with
   // forward slashes (a folder like "Shubham's Agent" has a space and an apostrophe).
@@ -2173,9 +2197,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
         prepareClaudeConfig(cwd, claudeJson, poolOptions.addDirs)
         // memory-door: B4
-        const brief = composeAgentBrief(floor, { ...agent, model: '' }, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies())
+        const brief = composeAgentBrief(floor, { ...agent, model: '' }, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), tasksToGoalsFor(agent))
           + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
-        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
+        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, wantedMcps(agent))
         return { sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: writeBrief(briefsDir, sid, brief),
           mcpConfig: built.file, strictMcp: true, model: 'gpt-6.1-sol', effort: 'max', resume: !!findClaudeTranscript(sid, projectsDir), cols: request.cols, rows: request.rows }
       },
@@ -2614,13 +2638,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
       requireConfirmedThread()
       const dflt = defaultsNow()
       // memory-door: B2
-      const brief = composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), 'Codex')
+      const brief = composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), tasksToGoalsFor(agent), 'Codex')
       const mcp: Record<string, McpServerToml> = {
         // The shim is told whose chat it is by the terminal's environment, never by a file.
         [MCP_SERVER_NAME]: { command: process.execPath, args: [shim], env_vars: ['SAD_AGENTIC_KEY', 'SAD_AGENTIC_URL'] },
       }
       const registry = readRegistry(mcpRegistryFile)
-      for (const name of chosen(registry, agent.mcpServers)) {
+      for (const name of chosen(registry, wantedMcps(agent))) {
         const def = registry[name]
         mcp[name] = { command: def.command, args: def.args, ...(def.env && Object.keys(def.env).length ? { env: def.env } : {}) }
       }
@@ -2919,9 +2943,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (agent.opencodeSession && agent.homePc && agent.homePc !== self().id) throw apiError(409, 'OpenCode conversations resume on their home PC.')
       const mcp: NonNullable<import('../opencode/backend.ts').BackendOptions['mcp']> = {}
       const registry = readRegistry(mcpRegistryFile)
-      for (const name of chosen(registry, agent.mcpServers)) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
+      for (const name of chosen(registry, wantedMcps(agent))) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
       // memory-door: B3
-      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), 'OpenCode'), mcp })
+      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), tasksToGoalsFor(agent), 'OpenCode'), mcp })
       heartbeat.opened(sid)
       chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new', ...startedBy(sid) })
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -2939,7 +2963,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on: this chat's OWNER's, never another person's.
     // memory-door: B1
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies()))
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), tasksToGoalsFor(agent)))
     // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
     const dflt = defaultsNow()
     const effort = agent.effort || dflt.effort
@@ -2950,16 +2974,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     let strictMcp = false
     if (o.strictMcp ?? process.env.SAD_MCP_STRICT !== '0') {
       try {
-        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
+        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, wantedMcps(agent))
         mcp = built.file
         strictMcp = true
         log?.info(`chat ${sid.slice(0, 8)}: MCP servers ${built.names.join(', ')}`)
       } catch (e) {
         log?.warn(`couldn't write chat ${sid.slice(0, 8)}'s MCP file, starting it the old way: ${message(e)}`)
-        mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
+        mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), wantedMcps(agent), mcpConfig)
       }
     } else {
-      mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
+      mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), wantedMcps(agent), mcpConfig)
     }
     voiceLockGiven = null
     // Order occ4c: a managed native Claude run starts at the executable its capability proved (nativeExecutable), never a fresh lookup.
@@ -3771,7 +3795,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (a.homePc !== self().id) continue
       chatList.push({ floor: floor.name, agent: a.name, cwd: floor.codeDir || defaultCodeDir, mcpServers: a.mcpServers, running: !!(a.sessionId && nativeChats.info(a.sessionId)) })
     }
-    return buildMcpInventory({ ...mcpDeps(), claudeJson, appServerNames: Object.keys(appMcpServers), chats: chatList, chatsWithoutHome })
+    return buildMcpInventory({ ...mcpDeps(), claudeJson, appServerNames: Object.keys(appMcpServers), machineDefaults: machineMcpNames(), chats: chatList, chatsWithoutHome })
   }
   async function mcpInventoryAnswer(): Promise<McpInventoryAnswer> {
     return { version: 1, pcs: await Promise.all(pcs().map(async (pc): Promise<McpInventoryPc> => {
@@ -3809,6 +3833,252 @@ export function createAgentic(o: AgenticOptions): Agentic {
       throw apiError(/doesn't do mcp-/.test(message(e)) ? 409 : 503, /doesn't do mcp-/.test(message(e)) ? 'That PC runs an older build: update it to change its MCP list.' : `Can't reach that PC right now (${message(e)}).`)
     }))
     if (!done || done.pc.id !== t.pc || done.id !== t.id) throw apiError(502, "That PC answered something this page can't read. Check its MCP list before trying again.")
+    return done
+  }
+  // ---- F-350: which Claude subscription each PC runs on (the Subscriptions page), read-only. Every PC says it of ITSELF (peer op claude-status, from its own subscription file and cache: no CRM call, no secret); the Server
+  // adds each chat's name and floor and says plainly when a PC is unreachable or on an older build.
+  function localClaudeStatus(): ClaudePcStatus | null {
+    const slice = o.claudeSub?.()
+    if (!slice) return null
+    const running: ClaudePcRunning[] = chats.live().map(c => ({ sessionId: c.sessionId, state: c.state, startedAt: c.startedAt, engine: c.engine }))
+    return buildClaudePcStatus({ pc: { id: self().id, name: self().name }, build: slice.build(), info: slice.info(), crmState: slice.crmState(), running, now: () => new Date() })
+  }
+  const claudeChatNames = (sid: string) => { const at = floors.bySession(sid); return at ? { name: at.agent.name, floor: at.floor.name } : null }
+  async function claudePcsAnswer(): Promise<ClaudePcsAnswer> {
+    // A PC the Server KNOWS (its devices list) but is not connected to right now is still a row, saying so: that is exactly when its subscription may be stale. Only a PC nobody knows is absent.
+    const linked = pcs()
+    const offline = mode() === 'hub' ? controlDeviceCatalogue().filter(d => d.id !== self().id && !linked.some(p => p.id === d.id)).map(d => ({ id: d.id, name: d.name, here: false })) : []
+    return { version: 1, pcs: await Promise.all([...linked, ...offline].map(async (pc): Promise<ClaudePcRow> => {
+      const none = (error: string, older = false): ClaudePcRow => ({ ...pc, status: null, chats: [], error, older })
+      if (offline.includes(pc)) return none("Can't reach it right now (it is not connected to the Server). What it runs on may be out of date.")
+      if (pc.here) {
+        const status = localClaudeStatus()
+        return status ? { ...pc, status, chats: joinChats(status, claudeChatNames), error: null, older: false } : none("This PC doesn't report its Claude subscription.")
+      }
+      try {
+        const status = readClaudePcStatus(await request<unknown>(peerOf(pc.id), 'claude-status', {}, 20_000))
+        return status && status.pc.id === pc.id ? { ...pc, status, chats: joinChats(status, claudeChatNames), error: null, older: false } : none("It answered something this page can't read: update that PC.")
+      } catch (e) {
+        const older = /doesn't do claude-status/.test(message(e))
+        return none(older ? OLDER_BUILD_WORDS : `Can't reach it right now (${safeWords(message(e))}).`, older)
+      }
+    })) }
+  }
+  /** The Subscriptions page's door: a signed-in CRM person (a chat's key is refused), an app administrator, and the FIRST owner by id: it shows which account every PC runs on, and (next) changes it. */
+  function claudePcsOwnerOnly(r: MountRequest): Caller {
+    const c = requireCrmHuman(o.auth, r, true)
+    firstOwnerOnly(c, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, 'Which Claude subscription each PC runs on is for the first owner of this app.')
+    return c
+  }
+  /** This PC's own status. `detail` false (a PC that is not the owner's own asks the Server): no running chat (their session ids, states and start times) and no CRM account name. */
+  const answerClaudeStatus = (detail = true): ClaudePcStatus => {
+    const status = localClaudeStatus()
+    if (!status) throw apiError(409, "This PC doesn't report its Claude subscription.")
+    return detail ? status : { ...status, running: [], crm: { ...status.crm, name: null } }
+  }
+
+  // ---- F-350 (change + restart): the Server only ASKS. Each PC runs its OWN preview and its OWN switch (peer ops claude-preview / claude-switch, answered by a member to the Server's link only) and fetches its own token with
+  // its own CRM sign-in: the Server never holds or moves a token. What the Server does itself is restart a PC's chats, one at a time, stopping and opening the SAME conversation on the SAME PC so it reads the freshly placed token.
+  const claudeToOf = (raw: unknown): string => {
+    if (!isObject(raw) || typeof raw.to !== 'string' || !UUID_RE.test(raw.to)) throw apiError(400, "Expected {to}: the id of one of the office's Claude subscriptions")
+    return raw.to.toLowerCase()
+  }
+  /** Which PC a change or a restart is for: one the Server is linked to now (or itself). From a member's page: refused, as MCP does. A PC the Server knows but is not connected to: said so, nothing is sent. */
+  function claudePcOf(body: unknown): { id: string; name: string; here: boolean } {
+    if (!isObject(body) || typeof body.pc !== 'string') throw apiError(400, 'Expected {pc}')
+    if (mode() !== 'hub') throw apiError(409, "Another PC's Claude subscription is changed from the Server's page, not from here.")
+    const pc = pcs().find(p => p.id === body.pc)
+    if (pc) return pc
+    const known = controlDeviceCatalogue().find(d => d.id === body.pc)
+    if (known) throw apiError(503, `Can't reach ${known.name} right now.`)
+    throw apiError(404, 'No such PC')
+  }
+  function claudePeerError(e: unknown, pcName: string): Error {
+    const m = message(e)
+    if (/doesn't do (claude-|draft-read)/.test(m)) return apiError(409, 'That PC runs an older build: update it to change its subscription.')
+    const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+    if (status >= 400 && status < 500) return apiError(status, safeWords(m))
+    return apiError(503, `Can't reach ${pcName} right now (${safeWords(m)}).`)
+  }
+  /** What a PC says of itself now, read strictly (this PC's own, or asked of the linked one). */
+  async function claudeStatusOf(pc: { id: string; name: string; here: boolean }): Promise<ClaudePcStatus> {
+    if (pc.here) return answerClaudeStatus()
+    const s = readClaudePcStatus(await request<unknown>(peerOf(pc.id), 'claude-status', {}, 20_000).catch(e => { throw claudePeerError(e, pc.name) }))
+    if (!s || s.pc.id !== pc.id) throw apiError(502, "That PC answered something this page can't read: update it.")
+    return s
+  }
+  async function claudePreviewHere(raw: unknown): Promise<ClaudePreviewWire> {
+    const slice = o.claudeSub?.()
+    if (!slice?.preview) throw apiError(409, "This PC can't change its Claude subscription from here.")
+    const r: SlicePreview = await slice.preview(claudeToOf(raw))
+    return r.kind === 'ok' ? { version: 1, kind: 'ok', preview: r.preview } : r.kind === 'error' ? { version: 1, kind: 'error', message: safeWords(r.message, 500) } : { version: 1, kind: 'crm-signin-ended' }
+  }
+  async function claudeSwitchHere(raw: unknown): Promise<ClaudeSwitchWire> {
+    const slice = o.claudeSub?.()
+    if (!slice?.switchOnly) throw apiError(409, "This PC can't change its Claude subscription from here.")
+    const r: SliceSwitch = await slice.switchOnly(claudeToOf(raw))
+    return r.kind === 'crm-signin-ended' ? { version: 1, kind: 'crm-signin-ended' } : { version: 1, kind: r.kind, message: safeWords(r.message, 500) }
+  }
+  /** POST /claude-pcs/preview: what changing that PC to subscription `to` would do, by that PC's own preview (every warning of the per-PC switch). Nothing is changed. */
+  async function claudePcPreview(body: unknown): Promise<ClaudePcPreview> {
+    const pc = claudePcOf(body)
+    const to = claudeToOf(body)
+    const wire = pc.here ? await claudePreviewHere({ to }) : readClaudePreviewWire(await request<unknown>(peerOf(pc.id), 'claude-preview', { to }, 60_000).catch(e => { throw claudePeerError(e, pc.name) }))
+    if (!wire) throw apiError(502, "That PC answered something this page can't read: update it.")
+    if (wire.kind === 'crm-signin-ended') throw Object.assign(apiError(409, crmSignInEndedWords(pc.name)), { code: 'crm-signin-ended' })
+    if (wire.kind === 'error') throw apiError(409, wire.message)
+    const preview = readSwitchPreview(wire.preview)
+    if (!preview) throw apiError(502, "That PC answered something this page can't read: update it.")
+    return { version: 1, pc: { id: pc.id, name: pc.name }, preview }
+  }
+  /** POST /claude-pcs/switch: that PC runs its OWN switch (no chat restarted); the answer says what it reports as in place AFTER it, asked again and not assumed. */
+  async function claudePcSwitch(body: unknown): Promise<ClaudePcSwitched> {
+    const pc = claudePcOf(body)
+    const to = claudeToOf(body)
+    const wire = pc.here ? await claudeSwitchHere({ to }) : readClaudeSwitchWire(await request<unknown>(peerOf(pc.id), 'claude-switch', { to }, 120_000).catch(e => { throw claudePeerError(e, pc.name) }))
+    if (!wire) throw apiError(502, "That PC answered something this page can't read: update it.")
+    const ref = { id: pc.id, name: pc.name }
+    if (wire.kind === 'crm-signin-ended') return { version: 1, pc: ref, ok: false, code: 'crm-signin-ended', message: crmSignInEndedWords(pc.name), placed: null }
+    const placed = (await claudeStatusOf(pc).catch(() => null))?.placed ?? null
+    const there = placed?.id === to
+    if (wire.kind === 'switched' && there) return { version: 1, pc: ref, ok: true, code: 'switched', message: wire.message, placed }
+    return { version: 1, pc: ref, ok: false, code: 'refused', message: wire.kind === 'switched' ? `${wire.message} But ${pc.name} does not report the new subscription as in place.` : wire.message, placed }
+  }
+
+  interface ClaudeRestartRun { job: RestartJob; running: boolean }
+  let claudeRestartRun: ClaudeRestartRun | null = null
+  /** Set at the very top of claudeRestartStart, before any await, and cleared in its finally: a second post arriving while the first still waits for the PC's status is refused. */
+  let claudeRestartStarting = false
+  const claudeSnapshot = (job: RestartJob): RestartJob => JSON.parse(JSON.stringify(job)) as RestartJob
+  function claudeRestartCandidate(r: ClaudePcRunning, pc: { id: string; here: boolean }, status: ClaudePcStatus): RestartCandidate {
+    const at = floors.bySession(r.sessionId)
+    const setAt = status.placed ? Date.parse(status.placed.setAt) : Number.NaN
+    const started = r.startedAt ? Date.parse(r.startedAt) : Number.NaN
+    return {
+      sessionId: r.sessionId, name: at ? at.agent.name : r.sessionId.slice(0, 8), floor: at?.floor.name ?? null, engine: r.engine, state: r.state,
+      onOldToken: Number.isFinite(setAt) && Number.isFinite(started) ? started < setAt : null,
+      homeOk: !!at && (pc.here || at.agent.homePc === pc.id),
+      fenced: runFenced(r.sessionId),
+      special: !at ? 'It is not on any floor of this app.' : isStaffAssistant(at.agent) ? "A person's own Assistant is not restarted from here." : isPcControl(at.floor) ? 'PC Control chats are not restarted from here.' : null,
+    }
+  }
+  /** POST /claude-pcs/restart: verifies the token NOW (asking the PC again), plans, answers at once with the job; the chats are then restarted one at a time in the background. */
+  async function claudeRestartStart(body: unknown, by: ChatActor): Promise<RestartJob> {
+    if (claudeRestartRun?.running || claudeRestartStarting) throw apiError(409, 'A restart is already running. Wait for it to finish.')
+    claudeRestartStarting = true
+    try {
+      return await claudeRestartBegin(body, by)
+    } finally {
+      claudeRestartStarting = false
+    }
+  }
+  async function claudeRestartBegin(body: unknown, by: ChatActor): Promise<RestartJob> {
+    const pc = claudePcOf(body)
+    const ids = isObject(body) && Array.isArray(body.chats) && body.chats.length <= 100 && body.chats.every(x => typeof x === 'string' && x.length > 0 && x.length <= 200) ? (body.chats as string[]) : null
+    if (!ids) throw apiError(400, 'Expected {pc, chats: [session ids]}')
+    const status = await claudeStatusOf(pc)
+    const plan = planRestart({ pcName: pc.name, status, candidates: status.running.map(r => claudeRestartCandidate(r, pc, status)), requested: ids })
+    const now = new Date().toISOString()
+    const lines: RestartLine[] = plan.lines.map(l => ({ sessionId: l.sessionId, name: l.name, floor: l.floor, state: l.action === 'restart' ? 'waiting' : 'skipped', note: l.note }))
+    const todo = lines.some(l => l.state === 'waiting')
+    const job: RestartJob = { version: 1, id: randomUUID(), pc: { id: pc.id, name: pc.name }, startedAt: now, finishedAt: plan.refused || !todo ? now : null, refused: plan.refused, lines }
+    const run: ClaudeRestartRun = { job, running: job.finishedAt === null }
+    claudeRestartRun = run
+    if (run.running) void runClaudeRestart(run, pc, by, new Map(status.running.map(r => [r.sessionId, r.state])))
+    return claudeSnapshot(job)
+  }
+  function claudeRestartJob(id: string): RestartJob {
+    if (!claudeRestartRun || claudeRestartRun.job.id !== id) throw apiError(404, 'No such restart')
+    return claudeSnapshot(claudeRestartRun.job)
+  }
+  async function runClaudeRestart(run: ClaudeRestartRun, pc: { id: string; name: string; here: boolean }, by: ChatActor, states: ReadonlyMap<string, string>) {
+    try {
+      for (const line of run.job.lines) {
+        if (line.state !== 'waiting') continue
+        if (closing) { line.state = 'skipped'; line.note = 'The app is closing.'; continue }
+        line.state = 'restarting'
+        try {
+          line.note = await restartClaudeChatOn(pc, line.sessionId, by, states.get(line.sessionId))
+          line.state = 'done'
+        } catch (e) {
+          line.state = 'failed'
+          line.note = safeWords(message(e)) || 'It could not be restarted.'
+          log?.warn(`claude restart: chat ${line.sessionId.slice(0, 8)} on ${pc.name} was not restarted: ${line.note}`)
+        }
+      }
+    } finally {
+      run.job.finishedAt = new Date().toISOString()
+      run.running = false
+    }
+  }
+  /** One chat of one PC restarted so it reads the token placed there now: this PC's own through restartChat; a linked PC's stopped and opened again by the Server (the same conversation, its home PC). Throws the reason in words. */
+  async function restartClaudeChatOn(pc: { id: string; name: string; here: boolean }, sid: string, by: ChatActor, reported: string | undefined): Promise<string> {
+    const at = floors.bySession(sid)
+    if (!at) throw new Error('It is not on any floor of this app any more.')
+    if (pc.here) {
+      if (!(await restartChat(sid, by))) throw new Error('It did not come back up (it may be held by the safety rules, or not running).')
+      return 'Back up on the new token.'
+    }
+    const link = peerOf(pc.id)
+    // The PC's own report (a moment ago, when the job began) says it runs there; the Server's view of where chats run may lag behind it, so only a view that puts it on ANOTHER PC stops the restart.
+    const seen = whereAll()[sid]
+    if (seen && seen.id !== pc.id) throw new Error(`It is not running on ${pc.name} any more.`)
+    const state = seen?.state ?? reported
+    // Unsent words in its box are never lost: the same rule as every restart (restartChat).
+    const view = await request<{ draft?: boolean } | null>(link, 'draft-read', { sessionId: sid }, 10_000).catch(e => { throw new Error(claudePeerError(e, pc.name).message) })
+    if (view?.draft) throw new Error('It has unsent text in its box; nothing was restarted.')
+    if (state === 'idle') {
+      const typed = await request<unknown>(link, 'type', { sessionId: sid, text: '/exit', refuseDraft: true }, 15_000)
+      if (typed === 'draft') throw new Error('It has unsent text in its box; nothing was restarted.')
+      const until = Date.now() + (o.restartGraceMs ?? 15_000)
+      while (whereAll()[sid] && Date.now() < until) await new Promise(r => setTimeout(r, 200))
+    }
+    await stopAt(pc.id, sid)
+    // The Server's view of where a chat runs follows that PC's own report: it is opened again only once that view says the chat is gone (else it could be started on the wrong PC).
+    const gone = Date.now() + 15_000
+    while (whereAll()[sid] && Date.now() < gone) await new Promise(r => setTimeout(r, 100))
+    if (whereAll()[sid]) throw new Error(`${pc.name} still shows it as running: it was stopped but not opened again. Open it from its own chat window.`)
+    const opened = await openChat(at.floor.id, at.agent.id, {}, undefined, undefined, by)
+    const until = Date.now() + 30_000
+    while (whereAll()[opened.sessionId]?.id !== pc.id && Date.now() < until) await new Promise(r => setTimeout(r, 200))
+    if (whereAll()[opened.sessionId]?.id !== pc.id) throw new Error(`It did not come back up on ${pc.name}.`)
+    return 'Back up on the new token.'
+  }
+
+  /** F-349: the route: a signed-in human, and the FIRST owner by id (a second owner or any other administrator may not decide which servers every chat of the first owner starts with), before anything else. */
+  function mcpDefaultRoute(r: MountRequest) {
+    const caller = requireCrmHuman(o.auth, r, true)
+    firstOwnerOnly(caller, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, "Only the first owner of this app gives a PC's servers to its chats.")
+    return mcpDefaultApply(r.body)
+  }
+  /** F-349: which PC a give / take-away is for: this one, or (from the Server only) a linked one; and the checked body {pc, name, on, understood?}. */
+  function mcpDefaultTarget(body: unknown): { pc: string; name: string; on: boolean; understood: boolean; here: boolean } {
+    if (!isObject(body) || Object.keys(body).some(k => !['pc', 'name', 'on', 'understood'].includes(k)) || typeof body.pc !== 'string' || typeof body.name !== 'string' || typeof body.on !== 'boolean' || (body.understood !== undefined && typeof body.understood !== 'boolean')) throw apiError(400, 'Expected {pc, name, on, understood?}')
+    const here = body.pc === self().id
+    if (!here && mode() !== 'hub') throw apiError(409, "Another PC's MCP list is changed from the Server's page, not from here.")
+    if (!here && !pcs().some(p => p.id === body.pc)) throw apiError(404, 'No such PC')
+    return { pc: body.pc, name: body.name, on: body.on, understood: body.understood === true, here }
+  }
+  /** F-349: THIS PC gives (or stops giving) one server of its own list to every chat that starts on it. Fixed sentences; nothing of a server's command is in an answer or a log line. */
+  function localMcpDefault(name: string, on: boolean, understood: boolean): McpDefaultDone {
+    try {
+      const registry = readRegistry(mcpRegistryFile)
+      const names = setMachineMcp(machineMcpsFile, self().id, new Set(Object.keys(registry)), restrictedNames(mcpRegistryFile, registry), name, on, understood)
+      log?.warn(`MCP: ${on ? 'gave' : 'stopped giving'} one server to every chat on this PC (now ${names.length} given)`)
+      return { version: 1, pc: { id: self().id, name: self().name }, name, on, servers: names }
+    } catch (e) {
+      if (e instanceof MachineMcpsError) throw apiError(e.kind === 'unknown' ? 409 : 400, e.message)
+      throw e
+    }
+  }
+  async function mcpDefaultApply(body: unknown): Promise<McpDefaultDone> {
+    const t = mcpDefaultTarget(body)
+    if (t.here) return localMcpDefault(t.name, t.on, t.understood)
+    const done = readMcpDefaultDone(await request<unknown>(peerOf(t.pc), 'mcp-default', { name: t.name, on: t.on, understood: t.understood }, 20_000).catch(e => {
+      if (isObject(e) && typeof e.status === 'number' && e.status >= 400 && e.status < 500) throw e
+      throw apiError(/doesn't do mcp-/.test(message(e)) ? 409 : 503, /doesn't do mcp-/.test(message(e)) ? 'That PC runs an older build: update it to change its MCP list.' : `Can't reach that PC right now (${message(e)}).`)
+    }))
+    if (!done || done.pc.id !== t.pc || done.name !== t.name || done.on !== t.on) throw apiError(502, "That PC answered something this page can't read. Check its MCP list before trying again.")
     return done
   }
   const mcpIdOf = (raw: unknown) => { if (!isObject(raw) || typeof raw.id !== 'string' || !MCP_CURATED.some(c => c.id === raw.id)) throw apiError(400, 'Expected {id} from the list'); return raw.id }
@@ -4716,6 +4986,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
   })
   function orderReplies(): boolean {
     return o.orderReplies ?? !(process.env.SAD_ORDER_REPLIES === '0' || existsSync(path.join(o.dir, 'order-replies.off')))
+  }
+  /**
+   * F-345: whether this chat's start brief carries the standing "tasks go into Goals" paragraph (composeAgentBrief's tasksToGoals argument, at the four chat starts: Claude, Codex, OpenCode and the Claude Code harness
+   * of a Codex execution). THE ONLY place that decides. All three hold: the hub's switch is on (default on; off or unreadable = today's brief); the chat belongs to the app's FIRST owner by id, the one person whose
+   * chats have the goal tools (the same test toolFor asks for them: ADMIN_TOOLS, FIRST_OWNER_TOOLS), so a second owner's or a person's chat never gets words about tools it cannot call; and it is no person's own
+   * staff Assistant (those have their own start and their own tool list). On a member PC it is off: the switch is the Server's file, which a member does not read.
+   */
+  function tasksToGoalsFor(agent: FloorAgent): boolean {
+    if (mode() === 'member' || isStaffAssistant(agent)) return false
+    if (!isFirstOwner(access.asChat(agent))) return false
+    return tasksToGoalsStore.get().tasksToGoals
   }
   // F-221 (T4): after each tick the voice lock's files say what the latch holds now (an order answered or closed lets its chat go below the model too).
   // T4 phase 2: the residual holds are looked at after the orders (one let go when a turn end is seen in its chat), before the files are synced.
@@ -5799,6 +6080,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     humanOnly(r)
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
     return goalFloors
+  }
+  /**
+   * F-345: the hub's choice "Chats put tasks in Goals", the first owner's page only, and THE ONLY place `tasksToGoalsStore` is read or changed by a route. A chat's key is refused for both (an agent does not read or
+   * flip the words of its own brief); a second owner is refused by id (his chats never get the paragraph, and the switch is for Shubham's chats); the PUT also needs a signed-in CRM person (humanOnly: a machine token
+   * or an expired cookie writes nothing). The answer is only the one boolean and whether the file could be read.
+   */
+  function chatSettingsOwner(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, 'Only the owner\'s page may do this; not a chat tool.', 'not-yours')
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    return tasksToGoalsStore
   }
 
   /**
@@ -6950,11 +7242,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
         // F-343: the goal goes on the floor the chat NAMES (resolved above against the app's own list, owner-only tool), else its own; the origin floor sent to the CRM and the link file below use the SAME resolved floor.
         const target = goalFloorFor(args.floor, floor, args.parentGoalId)
-        const out = await crmGoals.add(args, { floorId: target.id, agentId: agent.id })
+        // F-345 (Agent 14's read): (a) at most GOAL_ADD_CAP new goals an hour from one AGENT's chat (keyed by the agent's id: it survives a restart), and GOAL_ADD_ALL_CAP across all chats: a fixed refusal, nothing sent; the place is given back when no goal was made (a refusal, the CRM down, a duplicate answer);
+        // (b) the CRM login must be the first owner's (F-343's expect, as the hand-add route): another person's kept login never makes a chat's goals AS them.
+        const slot = goalAddCap.take(agent.id)
+        if (!slot.ok) throw apiError(429, slot.why === 'all' ? GOAL_ADD_ALL_CAP_WORDS : GOAL_ADD_CAP_WORDS)
+        let out: string
+        try {
+          out = await crmGoals.add(args, { floorId: target.id, agentId: agent.id }, { userId: SBSKRRT_ID })
+        } catch (e) {
+          slot.undo()
+          if (isObject(e) && e.code === 'crm-other-person') throw Object.assign(apiError(409, GOAL_ADD_OTHER_PERSON_WORDS), { code: 'crm-other-person' })
+          throw e
+        }
         log?.info(`${agent.name} added a CRM goal`)
         // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.
         // Only the answer of the call that MADE the goal has an id here; a call that only found it already made (a duplicate) answers without one and links nothing (and logs nothing).
         const madeId = goalIdOfAnswer(out)
+        if (madeId === null) slot.undo()
         if (madeId !== null) goalFloors.link(madeId, { floorId: target.id, agentId: agent.id })
         return out
       }
@@ -8735,6 +9039,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Lead (16 Nov): like /fast/forwarding, the answer says when the saved choice could not be read (the old way is in force until he chooses again).
     ['GET', /^\/fast\/settings$/, () => quickSettings.answer(!!fastHost)],
     ['PUT', /^\/fast\/settings$/, (_, r) => (quickSettings.set(r.body), quickSettings.answer(!!fastHost))],
+    // F-345: "Chats put tasks in Goals" (the first owner's, default on; a chat gets the paragraph when it next starts). The old way is the switch off.
+    ['GET', /^\/chat-settings$/, (_, r) => chatSettingsOwner(r).answer()],
+    ['PUT', /^\/chat-settings$/, (_, r) => {
+      const store = chatSettingsOwner(r)
+      const was = store.get().tasksToGoals
+      store.set(r.body)
+      if (store.get().tasksToGoals !== was) log?.info(`chats put tasks in Goals: ${store.get().tasksToGoals ? 'on' : 'off'} (a chat gets it when it next starts)`)
+      return store.answer()
+    }],
     [
       'POST',
       /^\/fast\/names$/,
@@ -8792,9 +9105,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/dependencies$/, () => dependenciesAnswer(), 'local'],
     // F-168 part 2: every MCP server on each PC within reach, and the register-only install. A signed-in app administrator only (the CRM cookie).
     ['GET', /^\/mcp-inventory$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpInventoryAnswer()), 'local'],
+    // F-350: which Claude subscription each PC runs on (read-only here): the first owner of the app, a signed-in CRM person.
+    ['GET', /^\/claude-pcs$/, (_, r) => (claudePcsOwnerOnly(r), claudePcsAnswer()), 'local'],
+    // F-350 (change + restart): the same door. The change is made BY the PC itself (peer ops); the restart is the Server's, one chat at a time.
+    ['POST', /^\/claude-pcs\/preview$/, (_, r) => (claudePcsOwnerOnly(r), claudePcPreview(r.body)), 'local'],
+    ['POST', /^\/claude-pcs\/switch$/, (_, r) => (claudePcsOwnerOnly(r), claudePcSwitch(r.body)), 'local'],
+    ['POST', /^\/claude-pcs\/restart$/, (_, r) => claudeRestartStart(r.body, actorOfCaller(claudePcsOwnerOnly(r))), 'local'],
+    ['GET', /^\/claude-pcs\/restart\/([^/]+)$/, ([id], r) => (claudePcsOwnerOnly(r), claudeRestartJob(id)), 'local'],
     ['POST', /^\/mcp-install\/plan$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpPlanAnswer(r.body)), 'local'],
     ['POST', /^\/mcp-install$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('register', r.body)), 'local'],
     ['POST', /^\/mcp-remove$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('remove', r.body)), 'local'],
+    // F-349 (his "in the mcp tab for each machine i should be able to inject mcp for all chats for that machine"): give a server of a PC's own list to every chat that starts on it, or stop. The owner's page only.
+    ['POST', /^\/mcp-default$/, (_, r) => mcpDefaultRoute(r), 'local'],
     ['POST', /^\/codex\/refresh$/, async () => {
         await o.codex?.check()
         return codexAnswer()
@@ -9922,6 +10244,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-168 part 2: a member's MCP page asks for the hub's own servers (reading only; changes to the hub's list are made on the hub).
         case 'mcp-inventory':
           return answer(() => localMcpInventory())
+        // F-350: a member's Subscriptions page asks for the Server's own row (read-only: names, percentages and times).
+        case 'claude-status':
+          return answer(() => answerClaudeStatus(ownerPcs.has(from.id)))
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         // Order o7e6d (plan A): a member asks, before it passes a staff Assistant's first open here, whether this Server runs the staff policy.
@@ -10059,12 +10384,26 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // look at, add or remove ONE curated entry in this PC's own list. Only the Server's link reaches this switch.
         case 'mcp-inventory':
           return answer(() => localMcpInventory())
+        // F-350: the Server's Subscriptions page asks this PC which Claude subscription it runs on, from its own file and cache (no CRM call, no secret).
+        case 'claude-status':
+          return answer(() => answerClaudeStatus())
+        // F-350 (change): the Server's click on Change reaches this PC's OWN preview and OWN switch, from the Server's link only; the switch restarts no chat.
+        case 'claude-preview':
+          return answer(raw => claudePreviewHere(raw))
+        case 'claude-switch':
+          return answer(raw => claudeSwitchHere(raw))
         case 'mcp-plan':
           return answer(raw => planInstall(mcpDeps(), mcpIdOf(raw)))
         case 'mcp-register':
           return answer(raw => registerCurated(mcpDeps(), mcpIdOf(raw), isObject(raw) ? raw.fingerprint : undefined))
         case 'mcp-remove':
           return answer(raw => removeCurated(mcpDeps(), mcpIdOf(raw)))
+        // F-349: the Server's page asks this PC to give (or stop giving) one server of its own list to every chat that starts on it; names only
+        case 'mcp-default':
+          return answer(raw => {
+            if (!isObject(raw) || Object.keys(raw).some(k => !['name', 'on', 'understood'].includes(k)) || typeof raw.name !== 'string' || typeof raw.on !== 'boolean' || (raw.understood !== undefined && typeof raw.understood !== 'boolean')) throw apiError(400, 'Expected {name, on, understood?}')
+            return localMcpDefault(raw.name, raw.on, raw.understood === true)
+          })
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         case 'delivery-status':

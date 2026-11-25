@@ -369,6 +369,24 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).
     // Order of130: with the id of the subscription it belongs to, from the same read (the chats file their usage under it); everything else reads name and value as before.
     credential: () => claude.credentialWithSubscription(),
+    // F-350: this PC's own Claude subscription for the Subscriptions page and the Server's question (agent/claude/pc-status.ts): its status, its CRM sign-in in three words, its build. Read only.
+    // Change (the Server's Subscriptions page, F-350 commit 2): this PC runs its OWN preview and its OWN switch (failover.ts, claude/index.ts switchTo); the switch restarts no chat (the Server does that, one at a time).
+    claudeSub: () => ({
+      info: () => claude.status(),
+      crmState: () => claude.crmState(),
+      build: () => extras.currentBuild?.() ?? null,
+      preview: async to => {
+        if (claude.crmState() !== 'signed-in') return { kind: 'crm-signin-ended' }
+        await claude.refreshSwitch()
+        const p = await failover.preview(to)
+        return 'error' in p ? { kind: 'error', message: p.error } : { kind: 'ok', preview: p }
+      },
+      switchOnly: async to => {
+        if (claude.crmState() !== 'signed-in') return { kind: 'crm-signin-ended' }
+        const r = await failover.switchNow({ to, restart: [] })
+        return r.ok ? { kind: 'switched', message: r.message } : { kind: 'refused', message: r.message }
+      },
+    }),
     auth,
     featureAccess,
     // F-297 (his order od8e2, "yes let ravis be on since start"): the one-time turning-on of Ravi's staff-send switch is the real app's, never a test's (agentic/index.ts seedStaffSend).

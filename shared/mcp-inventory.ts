@@ -87,9 +87,17 @@ export interface McpInventory {
   }
   servers: McpInventoryServer[]
   curated: McpCuratedState[]
+  /** F-349: what this PC gives to EVERY chat that starts on it (names only), and how many of its chats are running now (the page says so before giving). Null: that PC's build does not know this yet. */
+  machine: { defaults: string[]; chatsRunning: number } | null
   /** What this list cannot see, in words. */
   cannotSee: string[]
 }
+
+/** F-349: the answer of giving a server to every chat on one PC, or taking it away: the names that PC now gives. */
+export interface McpDefaultDone { version: 1; pc: { id: string; name: string }; name: string; on: boolean; servers: string[] }
+export const MCP_DEFAULT_MAX = 32
+/** F-349: the servers that drive the whole PC: giving one to every chat needs the person to say "I understand" (the page asks, the PC's own agent checks). */
+export const MCP_DRIVES_PC: readonly string[] = ['windows-mcp']
 
 export interface McpInventoryPc { id: string; name: string; here: boolean; inventory: McpInventory | null; error: string | null }
 export interface McpInventoryAnswer { version: 1; pcs: McpInventoryPc[] }
@@ -136,16 +144,24 @@ function readCurated(v: unknown): McpCuratedState | null {
 }
 /** The strict reader: anything unknown or oversized makes the whole answer unreadable, never a quietly shorter list. */
 export function readMcpInventory(value: unknown): McpInventory | null {
-  if (!only(value, ['version', 'pc', 'builtAt', 'read', 'servers', 'curated', 'cannotSee']) || value.version !== 1 || !pcOk(value.pc) || !text(value.builtAt, 40) || !Number.isFinite(Date.parse(value.builtAt))
+  if (!only(value, ['version', 'pc', 'builtAt', 'read', 'servers', 'curated', 'machine', 'cannotSee']) || value.version !== 1 || !pcOk(value.pc) || !text(value.builtAt, 40) || !Number.isFinite(Date.parse(value.builtAt))
     || !only(value.read, ['userConfig', 'registry', 'foldersChecked', 'projectFilesRead', 'localFolderEntries', 'chatsCounted', 'chatsWithoutHome'])
     || !['read', 'missing', 'unreadable'].includes(String(value.read.userConfig)) || !['read', 'missing', 'unreadable'].includes(String(value.read.registry))
     || !['foldersChecked', 'projectFilesRead', 'localFolderEntries', 'chatsCounted', 'chatsWithoutHome'].every(k => Number.isInteger((value.read as Record<string, unknown>)[k]) && ((value.read as Record<string, unknown>)[k] as number) >= 0)
     || !Array.isArray(value.servers) || value.servers.length > MCP_INVENTORY_LIMIT || !Array.isArray(value.curated) || value.curated.length > MCP_CURATED.length
     || !Array.isArray(value.cannotSee) || value.cannotSee.length > 20 || !value.cannotSee.every(s => text(s, 400))) return null
+  // F-349: optional (an older PC's answer has none); when there it is exactly names and a count
+  let machine: McpInventory['machine'] = null
+  if (value.machine !== undefined && value.machine !== null) {
+    const m = value.machine
+    if (!only(m, ['defaults', 'chatsRunning']) || !Array.isArray(m.defaults) || m.defaults.length > MCP_DEFAULT_MAX || !m.defaults.every(n => typeof n === 'string' && MCP_NAME_RE.test(n)) || new Set(m.defaults).size !== m.defaults.length
+      || !Number.isInteger(m.chatsRunning) || (m.chatsRunning as number) < 0 || (m.chatsRunning as number) > 100000) return null
+    machine = { defaults: m.defaults as string[], chatsRunning: m.chatsRunning as number }
+  }
   const servers = value.servers.map(readServer)
   const curated = value.curated.map(readCurated)
   if (servers.some(s => s === null) || curated.some(c => c === null) || new Set(servers.map(s => s!.name)).size !== servers.length) return null
-  return { version: 1, pc: { id: value.pc.id, name: value.pc.name }, builtAt: value.builtAt, read: value.read as unknown as McpInventory['read'], servers: servers as McpInventoryServer[], curated: curated as McpCuratedState[], cannotSee: value.cannotSee as string[] }
+  return { version: 1, pc: { id: value.pc.id, name: value.pc.name }, builtAt: value.builtAt, read: value.read as unknown as McpInventory['read'], servers: servers as McpInventoryServer[], curated: curated as McpCuratedState[], machine, cannotSee: value.cannotSee as string[] }
 }
 /** The whole answer of GET /mcp-inventory: one entry per PC within reach, each with its list or the plain reason it has none. */
 export function readMcpInventoryAnswer(value: unknown): McpInventoryAnswer | null {
@@ -170,4 +186,11 @@ export function readMcpInstallDone(value: unknown): McpInstallDone | null {
   if (!only(value, ['version', 'pc', 'id', 'name', 'changed', 'action']) || value.version !== 1 || !pcOk(value.pc) || !MCP_CURATED.some(c => c.id === value.id) || !text(value.name, 64)
     || value.changed !== true || (value.action !== 'added' && value.action !== 'removed')) return null
   return { version: 1, pc: { id: value.pc.id, name: value.pc.name }, id: value.id as string, name: value.name, changed: true, action: value.action }
+}
+
+/** F-349: the answer of one PC to "give / take away this server for every chat on you". Exactly these keys; the names are valid, distinct and few. */
+export function readMcpDefaultDone(value: unknown): McpDefaultDone | null {
+  if (!only(value, ['version', 'pc', 'name', 'on', 'servers']) || value.version !== 1 || !pcOk(value.pc) || typeof value.name !== 'string' || !MCP_NAME_RE.test(value.name) || typeof value.on !== 'boolean'
+    || !Array.isArray(value.servers) || value.servers.length > MCP_DEFAULT_MAX || !value.servers.every(n => typeof n === 'string' && MCP_NAME_RE.test(n)) || new Set(value.servers).size !== value.servers.length) return null
+  return { version: 1, pc: { id: value.pc.id, name: value.pc.name }, name: value.name, on: value.on, servers: value.servers as string[] }
 }

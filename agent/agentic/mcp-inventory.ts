@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync } from 
 import path from 'node:path'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
-import { MCP_CHATS_LIMIT, MCP_CURATED, MCP_INVENTORY_LIMIT, MCP_NAME_RE, type McpCuratedState, type McpInstallDone, type McpInstallPlan, type McpInventory,
+import { MCP_CHATS_LIMIT, MCP_CURATED, MCP_DEFAULT_MAX, MCP_INVENTORY_LIMIT, MCP_NAME_RE, type McpCuratedState, type McpInstallDone, type McpInstallPlan, type McpInventory,
   type McpInventoryChat, type McpInventoryServer, type McpSource, type McpTransport } from '../../shared/mcp-inventory.ts'
 import { projectKey } from './claude-config.ts'
 import { DEFAULT_RESTRICTED, type McpServerDef } from './mcp-registry.ts'
@@ -55,6 +55,8 @@ export interface InventoryDeps {
   claudeJson: string
   registryFile: string
   appServerNames: readonly string[]
+  /** F-349: the names this PC gives to every chat (machine-mcps.json), read now. */
+  machineDefaults: readonly string[]
   chats: readonly InventoryChat[]
   chatsWithoutHome: number
   runner: (name: 'uvx' | 'npx') => string | null
@@ -132,6 +134,7 @@ export function buildMcpInventory(d: InventoryDeps): McpInventory {
     version: 1, pc: { id: d.pc.id, name: d.pc.name }, builtAt: (d.now ?? (() => new Date()))().toISOString(),
     read: { userConfig: user.state, registry: reg.state, foldersChecked: folders.size, projectFilesRead, localFolderEntries, chatsCounted, chatsWithoutHome: d.chatsWithoutHome },
     servers, curated: curatedStates(d, registry, addedHere),
+    machine: { defaults: [...d.machineDefaults].filter(n => MCP_NAME_RE.test(n)).slice(0, MCP_DEFAULT_MAX), chatsRunning: d.chats.filter(c => c.running).length },
     cannotSee: [
       'Whether a server is actually connected right now: the app reads what each chat was given, it does not open a connection to any server. A chat that is running was started with the servers listed for it.',
       "Servers Claude adds by itself from a plugin or from a claude.ai connector, and a .mcp.json above a chat's folder.",

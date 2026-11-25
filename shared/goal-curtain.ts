@@ -111,14 +111,25 @@ export function curtainOf(goals: readonly Goal[], members: readonly Member[], li
 
 // ---- the words, the filters and the dates of the curtain (pure; the page only draws them)
 
-export type CurtainFailure = 'signin' | 'offline' | 'slow' | 'links' | 'other'
+export type CurtainFailure = 'signin' | 'appsignin' | 'notowner' | 'offline' | 'slow' | 'links' | 'other'
 /** One fixed sentence per way the curtain can fail: never the CRM's own words, never an address or a key. */
 export const FAILURE_WORDS: Record<CurtainFailure, string> = {
   signin: 'The CRM is not signed in on this PC.',
+  appsignin: 'Sign in to the app here to see these goals.',
+  notowner: "Only the first owner's page can show these goals.",
   offline: "The CRM can't be reached right now.",
   slow: 'The CRM took too long to answer.',
   links: 'The app could not say which goals belong to this floor.',
   other: 'The goals could not be read.',
+}
+
+/**
+ * Which fixed sentence a refused GET /goal-floors gets. The door is for a signed-in person who is the first owner: a 401 is a page that is not signed in to the app (not a person here), a 403 a person who is not the first
+ * owner. Anything else (the agent down, a wrong answer, no status at all) stays "links". Only the number is read: the answer's own words are never shown.
+ */
+export function linkFailureOf(e: unknown): CurtainFailure {
+  const status = typeof e === 'object' && e !== null ? (e as { status?: unknown }).status : undefined
+  return status === 401 ? 'appsignin' : status === 403 ? 'notowner' : 'links'
 }
 
 /** What the page took from GET /goal-floors: only well-formed goal id -> floor id pairs; anything else is refused (null), so a wrong answer cannot put text on the page. */
