@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-Bzjsu5-w.js";function t(){e(`/goals`)}export{t as default};
