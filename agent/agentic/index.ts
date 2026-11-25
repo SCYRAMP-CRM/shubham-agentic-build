@@ -6515,7 +6515,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * F-332 step 1: the new standalone memory (memory-door.ts), his page only, and THE ONLY place `memoryDoor` is used. In this order, before anything is awaited and before the door's config or key is read:
    * a chat's key and every caller who is not a signed-in CRM person are refused (humanOnly = requireCrmHuman: the agents on the Server must not read his secrets through the app), then every
    * administrator who is not the first owner by id (firstOwnerOnly: a second owner too). The F-051 guard (another administrator => off for everybody) is asked by the module itself at the top of each call.
-   * The two /memory/new routes call this first.
+   * The /memory/new routes (status and brain, and F-333's add) call this first.
    */
   function memoryDoorOwner(r: MountRequest) {
     humanOnly(r)
@@ -10537,10 +10537,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     // memory-door: R8
     ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await routeLayer(r)).setSettings(r.body) })],
-    // F-332 step 1: the NEW standalone memory (memory-door.ts), READ ONLY, his page only: each calls memoryDoorOwner first (a signed-in human, the first owner by id), before any await; the F-051 guard is asked by
+    // F-332 step 1: the NEW standalone memory (memory-door.ts), his page only; these two routes only READ (F-333 adds ONE write, the add route, just below): each calls memoryDoorOwner first (a signed-in human, the first owner by id), before any await; the F-051 guard is asked by
     // the module. They call no accessor of the F-051 layer, so they carry no `memory-door` marker (matrix rows R9 and R10 have no sites). The brain answers for the one caller; the scope is the only value that goes on.
     ['GET', /^\/memory\/new\/status$/, async (_, r) => memoryDoorOwner(r).status()],
     ['GET', /^\/memory\/new\/brain$/, async (_, r) => memoryDoorOwner(r).brain(r.query.get('scope'))],
+    // F-333 (his order ofa0b): ADD ONLY, the one write: POST { text, requestId } -> { ok, id, scope }. The same owner checks first (before anything is awaited); the person is the first owner BY ID, which memoryDoorOwner just proved, so
+    // the scope, subject, predicate and source are built in memory-door.ts from SBSKRRT_OWNER: nothing of them comes from the page. The text is not logged, not echoed and not kept anywhere here.
+    ['POST', /^\/memory\/new\/add$/, async (_, r) => memoryDoorOwner(r).add(r.body, SBSKRRT_OWNER)],
     // F-309 N1: the agent notebooks, the OWNER's (notebookOwner: never a chat's key, the first owner by id). Each has its marker (notebook-door: K4..K9), so a tenth route is a red test.
     // notebook-door: K4
     ['GET', /^\/notebooks$/, (_, r) => notebookOwner(r).status()],

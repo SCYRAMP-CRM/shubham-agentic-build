@@ -303,6 +303,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // F-332 step 1: the NEW standalone memory (memory-door.ts), read only: the owner's only (no ROUTES rule opens it to a feature or a share); the routes themselves ask for a signed-in human and the first owner by id.
   ['GET', /^\/memory\/new\/status$/, OWNER],
   ['GET', /^\/memory\/new\/brain$/, OWNER],
+  // F-333: ADD ONLY (the one write to the new memory): the owner's only; the route asks for a signed-in human and the first owner by id first.
+  ['POST', /^\/memory\/new\/add$/, OWNER],
   // F-309 N1: the agent notebooks (memory-notebook.ts): the table, the notes, the held list, the refusals log. The owner of the app's only: the routes themselves ask for the first owner
   // (a second owner does not read or erase them) and refuse a chat's key (index.ts notebookOwner).
   ['GET', /^\/notebooks$/, OWNER],

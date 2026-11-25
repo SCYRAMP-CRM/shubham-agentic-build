@@ -1771,14 +1771,19 @@ as any non-local route.
   and tool names; every /talk row of POLICY, found by its pattern; a small lexer under all of it; red and green stubs), `memory-doors-rig.test.ts` (the real app, a sign-in, a second administrator), `memory-doors-quick.test.ts` (Quick through the real fastCall).
   **A new door goes in the matrix before it merges** (Lead's rule): a call with no marker, a marker with no call, an alias or a new importer is a red test.
   **F-332 step 1, the NEW standalone memory (doors S1 and S2; his order o4d57):** the Memory page also reads the standalone service F-331 (its own repo, store and loopback door; this app never imports its code).
-  `memory-door.ts` is the app's ONLY client of it and can send exactly two requests, written as two literals: `GET /v1/health` and `POST /v1/brain` (no function takes a method name, so erase, grant, write and the
+  `memory-door.ts` is the app's ONLY client of it and can send exactly three requests, written as three literals: `GET /v1/health`, `POST /v1/brain` and (F-333, ADD ONLY) `POST /v1/assertFact` (no function takes a method name, so erase, grant, write and the
   rest of the door's 31 methods are unreachable). Config: `<state>/agent/agentic/memory-door.json` = `{ "url": "http://127.0.0.1:<port>", "tokenFile": "<absolute path>" }` (a PATH, never the key); anything else
   (a missing or odd file, https, a host that is not 127.0.0.1 or [::1], a user, a path, a query, no port, an unreadable key file) is "not connected", never a request. The key is read fresh per call and lives in one
   local variable for the one header; no error, log line or answer holds the key, its path, the address or the door's text (one log line per call: route, status, outcome, ms). 8 s timeout, no redirects, 5 MB cap.
   Routes: `GET /memory/new/status` and `GET /memory/new/brain?scope=`, in this order before anything is awaited or any file is read: a chat's key refused, a signed-in CRM human (`requireCrmHuman`), the first owner
   by id (`firstOwnerOnly`), then the F-051 guard inside the module (another administrator => 409 `memory-admins`, off for everybody). They call no accessor of the F-051 layer, so they have no marker (the matrix
-  rows have no sites); `memoryDoor` is used from `memoryDoorOwner` only. READ ONLY: step 2 (correct, retract, dispute, add) is planned in C:/saw/f332-new-memory-page-20261124-PLAN.md and NOT built.
-  Doors (the matrix's IDs): R1 R2 R3 R4 R5 R6 R7 R8 S1 S2 H1 X1 X2 T1 T2 T3 T4 T5 B1 B2 B3 B4 B5 B6 L1 L2 L3 Q1 Q2 Q3 Q4 Q5 E1 N1 N2 N3 I1 I2 I3 I4 P1 P2 P3 P4.
+  rows have no sites); `memoryDoor` is used from `memoryDoorOwner` only. Step 1 is READ ONLY; of step 2 only ADD is built (F-333, the next paragraph); correct, retract and dispute are planned in C:/saw/f332-new-memory-page-20261124-PLAN.md and NOT built.
+  **F-333 (his order ofa0b), ADD ONLY (door S3):** `POST /memory/new/add { text, requestId }` -> `{ ok, id, scope }`, the ONE write to the new memory: the same owner checks first, then ONE door request, `POST /v1/assertFact`
+  (the door allow-list in `memory-door.ts` is now THREE literals: health, brain, assertFact; erase, grant, write, correct, retract and the rest stay unreachable by construction). The browser sends nothing but the text and a
+  client-made request id (any other key is refused before anything is read or sent); the scope `people/<slug of the name>`, the subject (the name), a UNIQUE predicate `note-YYYYMMDD-HHMMSS-mmm` (a predicate the memory does
+  not know is cardinality `one`: a fixed one would SUPERSEDE the earlier memory) and the source (person, `memory-page`) are built in `shared/new-memory.ts` from the signed-in first owner. One tap, one record: the request
+  id is remembered for ten minutes. The text is stored as typed and is never in a log line, an error, a refusal, an answer or an address.
+  Doors (the matrix's IDs): R1 R2 R3 R4 R5 R6 R7 R8 S1 S2 S3 H1 X1 X2 T1 T2 T3 T4 T5 B1 B2 B3 B4 B5 B6 L1 L2 L3 Q1 Q2 Q3 Q4 Q5 E1 N1 N2 N3 I1 I2 I3 I4 P1 P2 P3 P4.
   **Not closed by S2:** the app's token and any process on the Server that can read it; the disk (a Server-resident chat with file tools reads the layer's files); an
   administrator in the chat plane (the guard above); a paired member PC is trusted for four things (by, tool session ids, adopt, ui-page by); a chat holding recalled text can copy it
   out (a floor note, a message, a card, the CRM conversation copy: F-211 uploads the raw chat JSONL); the notes of EVERY floor are ingested whatever "learns from chats" says

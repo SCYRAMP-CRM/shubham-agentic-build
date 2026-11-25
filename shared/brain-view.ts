@@ -5,7 +5,14 @@
 //   - A backslash escape is undone ONLY AFTER the text has been cut into nodes, so an escaped `\*\*x\*\*` stays plain text and can never become bold.
 //   - It never throws, whatever it is given, and it reads each line once (no backtracking): a 5 MB brain is a linear pass.
 
-export type Inline = { t: 'text'; s: string } | { t: 'bold'; s: string } | { t: 'code'; s: string } | { t: 'em'; s: string } | { t: 'id'; id: number }
+export type Inline =
+  | { t: 'text'; s: string }
+  | { t: 'bold'; s: string }
+  | { t: 'code'; s: string }
+  | { t: 'em'; s: string }
+  | { t: 'id'; id: number }
+  /** F-333: the predicate of a memory he ADDED (`note-20261124-130501-123`): its raw name and the UTC time in it (ISO). The page draws it as "Note, 24 Nov 13:05" and keeps the raw name only in a tooltip. */
+  | { t: 'note'; raw: string; at: string }
 
 export interface BrainItem {
   nodes: Inline[]
@@ -128,7 +135,40 @@ export function parseInline(line: string): Inline[] {
   return out
 }
 
-const plain = (nodes: Inline[]) => nodes.map(n => (n.t === 'id' ? `#${n.id}` : n.s)).join('')
+const plain = (nodes: Inline[]) => nodes.map(n => (n.t === 'id' ? `#${n.id}` : n.t === 'note' ? n.raw : n.s)).join('')
+
+// F-333: a memory he added is a fact whose predicate is `note-YYYYMMDD-HHMMSS-mmm` (UTC; shared/new-memory.ts notePredicate). In an item the predicate stands right after the bold subject ("**Shubham Bhole** · note-...: \"...\""):
+// ONLY there, and only when the stamp is a real date, it becomes a `note` node. Any other predicate, and the same words anywhere else in a line (inside what he typed), stay exactly as they are: text.
+const NOTE_AFTER_SUBJECT = /^( · )(note-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-(\d{3}))(?=: )/
+
+function noteStamp(m: RegExpExecArray): string | null {
+  const [y, mo, d, h, mi, s, ms] = [m[3], m[4], m[5], m[6], m[7], m[8], m[9]].map(Number)
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi, s, ms))
+  if (Number.isNaN(t.getTime()) || t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d || t.getUTCHours() !== h || t.getUTCMinutes() !== mi || t.getUTCSeconds() !== s) return null
+  return t.toISOString()
+}
+
+/** The nodes of an item, with the predicate of an added memory (right after the bold subject) made a `note` node. Nothing else changes. */
+export function noteify(nodes: Inline[]): Inline[] {
+  const out: Inline[] = []
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i]
+    const m = i > 0 && nodes[i - 1].t === 'bold' && n.t === 'text' ? NOTE_AFTER_SUBJECT.exec(n.s) : null
+    const at = m ? noteStamp(m) : null
+    if (m && at && n.t === 'text') {
+      out.push({ t: 'text', s: m[1] }, { t: 'note', raw: m[2], at })
+      if (n.s.length > m[0].length) out.push({ t: 'text', s: n.s.slice(m[0].length) })
+    } else out.push(n)
+  }
+  return out
+}
+
+/** "Note, 24 Nov 13:05": the time in a note's predicate, shown in `timeZone` (the page passes none: the reader's own). */
+export function noteLabel(at: string, timeZone?: string): string {
+  const parts = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23', ...(timeZone ? { timeZone } : {}) }).formatToParts(new Date(at))
+  const get = (k: string) => parts.find(p => p.type === k)?.value ?? ''
+  return `Note, ${get('day')} ${get('month')} ${get('hour')}:${get('minute')}`
+}
 
 /** The brain as a document. Any text at all gives a document (an empty one for nothing). */
 export function parseBrain(markdown: string): BrainDoc {
@@ -170,12 +210,12 @@ export function parseBrain(markdown: string): BrainDoc {
     }
     const nested = /^ {2,}- (.*)$/.exec(line)
     if (nested && lastItem) {
-      lastItem.children.push({ nodes: parseInline(nested[1]), children: [] })
+      lastItem.children.push({ nodes: noteify(parseInline(nested[1])), children: [] })
       continue
     }
     const item = /^- (.*)$/.exec(line)
     if (item) {
-      lastItem = { nodes: parseInline(item[1]), children: [] }
+      lastItem = { nodes: noteify(parseInline(item[1])), children: [] }
       if (section) section.items.push(lastItem)
       else if (scope) {
         section = { title: '', items: [lastItem], notes: [] }

@@ -12,7 +12,7 @@ export const MEMORY_INFO_ABOUT = 'What it is meant to be, in Shubham’s own wor
 /** The header: what the memory is, in the Lead's words. */
 export const MEMORY_IS_TITLE = 'What the memory is'
 export const MEMORY_IS_LINES: readonly string[] = [
-  'Standalone memory on the Server; the Memory page reads it, read only.',
+  'Standalone memory on the Server; the Memory page reads it and can add a memory to it (add only).',
   "Keys and passwords you give it are kept in plain text on the Server's disk (Shubham's decision).",
 ]
 
@@ -119,6 +119,6 @@ export const MEMORY_NOT_YET_TITLE = 'Not made yet'
 export const MEMORY_NOT_YET: readonly string[] = [
   'A real meaning-based search model (today a simple stand-in is used).',
   'Chats and agents using this memory.',
-  'Fixing or correcting a memory from the phone, and the Add memory button (built, not in this build).',
+  'Fixing or correcting a memory from the phone (only adding is built: the Add memory button).',
   "Akash's memory page (it is separate and not connected to this one).",
 ]

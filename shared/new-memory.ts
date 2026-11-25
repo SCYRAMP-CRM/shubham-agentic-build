@@ -45,6 +45,10 @@ export const DOOR_CODES = {
   slow: 'memory-door-slow',
   bad: 'memory-door-bad',
   scope: 'memory-door-scope',
+  /** F-333: the text of an add is refused before anything is sent (empty, too long, a bad request id, a key the browser may not send). */
+  text: 'memory-door-text',
+  /** F-333: the memory's own secret policy refused the text (the owner set it to refuse). */
+  refused: 'memory-door-refused',
   /** The F-051 guard's own code, the same one the old Memory routes answer: another administrator exists, so the memory is off for everybody. */
   guard: 'memory-admins',
 } as const
@@ -60,7 +64,7 @@ export function isDoorScope(s: unknown): s is string {
 
 // ---- the words, one set per state (never the door's own text; never a path, an address or a key)
 
-export type NewFailureKind = 'sign-in' | 'not-yours' | 'off' | 'not-connected' | 'denied' | 'down' | 'slow' | 'bad' | 'scope' | 'error'
+export type NewFailureKind = 'sign-in' | 'not-yours' | 'off' | 'not-connected' | 'denied' | 'down' | 'slow' | 'bad' | 'scope' | 'text' | 'refused' | 'error'
 
 export interface NewFailureWords {
   kind: NewFailureKind
@@ -96,6 +100,8 @@ const STATE_WORDS: Record<'down' | 'slow' | 'bad', NewFailureWords> = {
   bad: { kind: 'bad', title: 'The new memory gave an answer this app could not read', text: 'Try again; if it keeps happening the owner has to look at it on the Server.', retry: true },
 }
 const DENIED_WORDS: NewFailureWords = { kind: 'denied', title: 'The new memory refused this app’s key', text: 'This is a setup problem, not yours: the owner has to fix it on the Server.', retry: false }
+const TEXT_WORDS: NewFailureWords = { kind: 'text', title: 'That could not be saved', text: 'Check the text and try again.', retry: false }
+const REFUSED_WORDS: NewFailureWords = { kind: 'refused', title: 'The new memory refused this text', text: 'Its own rules about secrets do not keep text like this. Nothing was saved.', retry: false }
 const SCOPE_WORDS: NewFailureWords = { kind: 'scope', title: 'That scope cannot be asked for', text: 'Pick another one from the list.', retry: false }
 
 /** The error of a call as the page's store raises it: the status, the agent's code and its words. */
@@ -112,6 +118,8 @@ export function newMemoryFailure(e: CallFailure): NewFailureWords {
   if (e.status === 409 && e.code === DOOR_CODES.off) return notConnectedWords('no-config')
   if (e.status === 403) return NOT_YOURS_WORDS
   if (e.status === 400 && e.code === DOOR_CODES.scope) return SCOPE_WORDS
+  if (e.status === 400 && e.code === DOOR_CODES.text) return TEXT_WORDS
+  if (e.status === 422 && e.code === DOOR_CODES.refused) return REFUSED_WORDS
   if (e.status === 502 && e.code === DOOR_CODES.denied) return DENIED_WORDS
   if (e.status === 502 && e.code === DOOR_CODES.down) return STATE_WORDS.down
   if (e.status === 504 && e.code === DOOR_CODES.slow) return STATE_WORDS.slow
@@ -136,3 +144,86 @@ export const EMPTY_BRAIN_WORDS = 'Nothing is kept yet.'
 
 /** The status line over the brain: the door answered; whether this look found something new; when. (The page gives the time already written for a person.) */
 export const connectedLine = (change: EtagChange, at: string): string => (change === 'updated' ? `Connected · updated, read ${at}` : change === 'same' ? `Connected · nothing new, checked ${at}` : `Connected · read ${at}`)
+
+// ============================================================================================================================================================================================
+// F-333 (Shubham's order ofa0b: "add button add memory in the each people"): ADD ONLY, into the NEW memory. The browser sends ONLY { text, requestId }; the scope, the subject, the predicate and the source are built
+// ON THE SERVER from the signed-in person with the PURE functions below (so a test can pin every one), never typed, never sent. One fact per add, with a UNIQUE predicate per add: a predicate the memory does not
+// know is cardinality "one" (facts.mjs), so a fixed predicate like "note" would SUPERSEDE his first memory with his second; a unique one can never clash, and nothing depends on a one-time defineAttribute.
+// ============================================================================================================================================================================================
+
+/** The memory's own cap on a body (records.mjs: 20000); the page and the server use this one number. */
+export const NEW_MEMORY_ADD_MAX = 20000
+/** The page shows a counter from here. */
+export const NEW_MEMORY_ADD_COUNT_FROM = 18000
+/** The route's body: exactly these two keys. */
+export const ADD_KEYS = ['text', 'requestId'] as const
+export const SAVED_LINE = 'Saved to the new memory.'
+
+export type AddProblem = 'empty' | 'too-long' | 'nul' | 'not-text'
+
+/** What is wrong with a typed text, or null. The same function runs on the page (before sending) and on the server (before anything is sent to the door). */
+export function addTextProblem(text: unknown): AddProblem | null {
+  if (typeof text !== 'string') return 'not-text'
+  if (text.includes('\u0000')) return 'nul'
+  if (!text.trim()) return 'empty'
+  if (text.length > NEW_MEMORY_ADD_MAX) return 'too-long'
+  return null
+}
+
+export const ADD_PROBLEM_WORDS: Record<AddProblem, string> = {
+  empty: 'Write something first.',
+  'too-long': `That is too long: at most ${NEW_MEMORY_ADD_MAX} characters.`,
+  nul: 'That text has a character the memory cannot keep.',
+  'not-text': 'Write something first.',
+}
+
+/** A client-made id for ONE dialog: one tap, one record, however many times Save is pressed or retried. */
+export const isRequestId = (s: unknown): s is string => typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+
+/** What the route answers: the new record's id and the scope it went into (a scope NAME, never a word of the text). */
+export interface NewMemoryAdded {
+  ok: true
+  id: number
+  scope: string
+}
+
+/** The person an add is for, as the server knows them (the CRM row): never from the browser. */
+export interface AddPerson {
+  id: string
+  name?: string | null
+  username?: string | null
+}
+
+const fold = (s: string) => s.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+
+/** `shubham-bhole`: the name, accents folded, anything but letters and digits a hyphen, at most 60; with nothing left, `person-<first 8 of the id>`. */
+export function personSlug(p: AddPerson): string {
+  const make = (s: string | null | undefined) => fold(String(s ?? '')).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '')
+  return make(p.name) || make(p.username) || `person-${String(p.id).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8) || 'unknown'}`
+}
+
+/** The scope of a person's memories: `people/shubham-bhole` (a path-like name the door accepts). */
+export const personScope = (p: AddPerson): string => `people/${personSlug(p)}`
+
+/** The subject of an add: the person's name (the door allows 300), else their username, else a plain word. */
+export function personSubject(p: AddPerson): string {
+  const name = String(p.name ?? '').replace(/\s+/g, ' ').trim() || String(p.username ?? '').replace(/\s+/g, ' ').trim() || `person ${String(p.id).slice(0, 8)}`
+  return name.slice(0, 300)
+}
+
+const pad = (n: number, w: number) => String(n).padStart(w, '0')
+
+/** `note-20261124-130501-123`: UTC, to the millisecond (at most 100 characters: the door's limit); unique per add. */
+export function notePredicate(at: Date): string {
+  return `note-${pad(at.getUTCFullYear(), 4)}${pad(at.getUTCMonth() + 1, 2)}${pad(at.getUTCDate(), 2)}-${pad(at.getUTCHours(), 2)}${pad(at.getUTCMinutes(), 2)}${pad(at.getUTCSeconds(), 2)}-${pad(at.getUTCMilliseconds(), 3)}`
+}
+
+/** Where an add says it came from: a person, on the Memory page (the door finds or makes the source by kind and ref). */
+export const addSource = (name: string) => ({ kind: 'person' as const, ref: 'memory-page', title: `added by ${name.slice(0, 120)} on the Memory page`, weight: 1 })
+
+/** The ONE input the server sends to the door for an add: exactly these five keys, all built here. The body is the text as typed. */
+export function addFactInput(p: AddPerson, text: string, at: Date) {
+  const subject = personSubject(p)
+  return { scope: personScope(p), subject, predicate: notePredicate(at), body: text, source: addSource(subject) }
+}
+export type AddFactInput = ReturnType<typeof addFactInput>
