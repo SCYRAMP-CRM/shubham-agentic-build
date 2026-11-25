@@ -42,6 +42,7 @@ import { createFeatureAccess } from './auth/feature-access.ts'
 import { CrmError, crmUrlOf } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
+import { openPcKeyStore } from './claude/pc-key.ts'
 import { findCodex, parseVersion } from './codex/find.ts'
 import { createCodex } from './codex/index.ts'
 import { startRowWatch } from './claude/rowwatch.ts'
@@ -312,7 +313,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready, ...(role === 'member' ? { stableBlock: stable.mine() } : {}) })
   // F-339: the ONE CRM address of this run (crm.ts crmUrlOf). The app's sign-in, the Devices sign-in and every reader of a stored CRM login use this one value; a stored login made at another address is ended.
   const crmUrl = crmUrlOf(process.env)
-  const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
+  // F-351: this PC's OWN key from the CRM (pc-key.ts): with one, the Claude check and the usage report use it, with nobody signed in; with none, everything is as before.
+  const pcKey = openPcKeyStore({ file: paths.pcKey, deviceId: () => identity.id })
+  const claude = createClaudeSubscription({ paths, deviceId: identity.id, keys: pcKey, log: log.child('claude'), onChange: () => changed() })
   // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
   // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
   // F-342 (one sign-in): the first owner's sign-in to the app also makes this PC's CRM login, through the Claude module (the one writer of it, built above); it is renewed only when less than 2 days of its 7 remain, and his
@@ -360,6 +363,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     crmUrl,
+    pcKey,
     // Order o68f0: the overlay Assistant's SSH tools use the Server's terminals (made further down; only called once the agent runs).
     ssh: () => (role === 'hub' ? sshTerm.assistant : null),
     pcControlDevices: () => [{ id: identity.id, name: config.name, online: true }, ...(role === 'hub' ? devices.members().map(p => ({ id: p.id, name: p.name, online: !!hub?.links.mux(p.id) })) : (() => { const h = devices.hub(); return h ? [{ id: h.id, name: h.name, online: !!member?.links.mux() }] : [] })())],
@@ -374,6 +378,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     claudeSub: () => ({
       info: () => claude.status(),
       crmState: () => claude.crmState(),
+      // F-351: the Server asks this PC to fetch its credential NOW (after the owner changed the person's subscription or gave the PC a key).
+      refresh: async () => void (await claude.check()),
       build: () => extras.currentBuild?.() ?? null,
       preview: async to => {
         if (claude.crmState() !== 'signed-in') return { kind: 'crm-signin-ended' }

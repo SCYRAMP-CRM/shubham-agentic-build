@@ -151,8 +151,10 @@ import type { CodexManager } from '../codex/index.ts'
 import { parseVersion } from '../codex/find.ts'
 import { dependencyReport } from './dependencies.ts'
 import { buildClaudePcStatus, joinChats, safeWords, type ClaudeSubSlice, type SlicePreview, type SliceSwitch } from '../claude/pc-status.ts'
+import { crmUrlOf } from '../claude/crm.ts'
+import { KEY_SHAPE, keyedReport, type PcKeyStore } from '../claude/pc-key.ts'
 import { planRestart, type RestartCandidate } from './claude-restart.ts'
-import { OLDER_BUILD_WORDS, crmSignInEndedWords, readClaudePcStatus, readClaudePreviewWire, readClaudeSwitchWire, readSwitchPreview, type ClaudePcPreview, type ClaudePcRow, type ClaudePcRunning, type ClaudePcStatus, type ClaudePcSwitched, type ClaudePcsAnswer, type ClaudePreviewWire, type ClaudeSwitchWire, type RestartJob, type RestartLine } from '../../shared/claude-pcs.ts'
+import { OLDER_BUILD_WORDS, crmSignInEndedWords, readClaudePcStatus, type ClaudePcKeyAnswer, type ClaudePcRefreshAnswer, readClaudePreviewWire, readClaudeSwitchWire, readSwitchPreview, type ClaudePcPreview, type ClaudePcRow, type ClaudePcRunning, type ClaudePcStatus, type ClaudePcSwitched, type ClaudePcsAnswer, type ClaudePreviewWire, type ClaudeSwitchWire, type RestartJob, type RestartLine } from '../../shared/claude-pcs.ts'
 import type { DependenciesAnswer, DependencyPc, DependencyReport } from '../../shared/dependencies.ts'
 import { buildMcpInventory, findRunner, planInstall, registerCurated, removeCurated, type InventoryChat } from './mcp-inventory.ts'
 import { MCP_CURATED, readMcpDefaultDone, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpDefaultDone, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
@@ -215,7 +217,7 @@ import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
 import { GOAL_ID_RE, LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
 import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../shared/goal-add.ts'
-import { GOAL_EDIT_WORDS, checkGoalEdit, checkGoalNest, isNestBody, type GoalEditCode } from '../../shared/goal-edit.ts'
+import { GOAL_EDIT_WORDS, checkGoalDisable, checkGoalEdit, checkGoalNest, isDisableBody, isNestBody, type GoalEditCode } from '../../shared/goal-edit.ts'
 import { TREE_MAX_DEPTH } from '../../shared/goal-tree.ts'
 import { HISTORY_WORDS, type HistoryCode } from '../../shared/goal-history.ts'
 import { checkOrderIds } from '../../shared/floor-goal-order.ts'
@@ -627,6 +629,8 @@ export interface AgenticOptions {
   crmSession?: string
   /** F-339: the CRM address of this run (claude/crm.ts crmUrlOf, given by main.ts). A stored CRM login made at any other address is ended: every reader of the login (the proxy, the owner checks) treats it as no login. Left out (a test's scratch app), no address is checked. */
   crmUrl?: string
+  /** F-351: this PC's OWN key from the CRM (claude/pc-key.ts). With one, this PC's usage report goes to the CRM with it (nobody need be signed in) and the owner's "Give this PC a key" can hand it one. Left out (tests): none. */
+  pcKey?: PcKeyStore
   /** order o4d14: how the Accounts page opens its database connection (accounts-db.ts); only tests give their own, so no test ever reaches a real database. */
   accountsDbOpen?: typeof import('./accounts-db.ts').openAccountsDb
   /**
@@ -1264,8 +1268,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     pc: {
       device: () => ({ id: self().id, name: self().name }),
       placed: () => { const i = o.claudeSub?.()?.info(); return i?.token === 'set' && i.subscription ? { key: i.subscription.id, name: i.subscription.name } : null },
-      signedIn: () => crmProxy.session().signedIn,
-      post: async (p, body) => { const r = await crmProxy.request('POST', p, { json: body }); await r.arrayBuffer().catch(() => undefined); return { status: r.status } },
+      // F-351: with this PC's OWN key the report goes to the CRM's /v1/device/usage with the key (nobody need be signed in); the Server's list of PCs is the super admin's PERSON session and keeps that way.
+      signedIn: () => !!o.pcKey?.read() || crmProxy.session().signedIn,
+      post: async (p, body) => {
+        const held = o.pcKey?.read()
+        if (held && !(isObject(body) && 'knownDevices' in body)) return keyedReport(o.crmUrl ?? crmUrlOf(process.env), held.key, body)
+        const r = await crmProxy.request('POST', p, { json: body })
+        await r.arrayBuffer().catch(() => undefined)
+        return { status: r.status }
+      },
       knownDevices: () => (mode() === 'hub' ? controlDeviceCatalogue().map(d => ({ id: d.id, name: d.name })) : []),
     } }) : null
   if (usage && !process.env.NODE_TEST_CONTEXT) usage.start()
@@ -3971,6 +3982,121 @@ export function createAgentic(o: AgenticOptions): Agentic {
       special: !at ? 'It is not on any floor of this app.' : isStaffAssistant(at.agent) ? "A person's own Assistant is not restarted from here." : isPcControl(at.floor) ? 'PC Control chats are not restarted from here.' : null,
     }
   }
+  // ---- F-351: the PC's OWN key. The Server mints it at the CRM with the OWNER'S session (the super admin's: POST /v1/org/agentic-pc-usage/devices/<id>/key; the secret is in that one answer) and hands it to that PC over the
+  // paired link (peer op pc-key-set, from the Server's link only); this PC keeps it (claude/pc-key.ts, mode 0600) and the Server drops it: no copy, no log line, no answer to a page holds it. A key that could not be delivered is
+  // taken away again at the CRM (nobody holds it). Taking it away revokes it at the CRM; the PC finds out by being refused at its next check (and the owner can ask it to check now: claude-refresh).
+  const keyRoute = (pc: { id: string }) => `v1/org/agentic-pc-usage/devices/${encodeURIComponent(pc.id)}/key`
+  function keyRefusal(status: number, doing: string): Error {
+    if (status === 403) return apiError(403, `The CRM says this sign-in is not its super admin: only the super admin can ${doing}.`)
+    if (status === 404) return apiError(404, 'The CRM has no row for that PC yet: a PC appears there after its first report, or when the Server lists it (within an hour).')
+    if (status === 503) return apiError(503, 'The CRM has not set up PC keys yet (the owner applies apply-agentic-pc-keys.sql).')
+    if (status === 401) return apiError(409, "This PC's CRM sign-in has ended: sign in again, then try again.")
+    return apiError(502, `The CRM answered ${status}.`)
+  }
+  /** Asks that PC to check its Claude subscription now (this PC: directly; another: its own peer op). Never throws: a PC that is off checks at its next hour. */
+  async function claudeRefreshOf(pc: { id: string; name: string; here: boolean }): Promise<boolean> {
+    try {
+      if (pc.here) {
+        const s = o.claudeSub?.()
+        if (!s?.refresh) return false
+        await s.refresh()
+        return s.info().check?.result === 'ok'
+      }
+      const a = await request<unknown>(peerOf(pc.id), 'claude-refresh', {}, 60_000)
+      return isObject(a) && a.checked === true
+    } catch {
+      return false
+    }
+  }
+  /** POST /claude-pcs/refresh: {pc}: that PC checks its Claude subscription NOW (after the owner changed the assigned person's subscription in the CRM, or gave the PC a key). Reads and places only: nothing in the CRM changes. */
+  async function claudePcRefresh(body: unknown): Promise<ClaudePcRefreshAnswer> {
+    const pc = claudePcOf(body)
+    const checked = await claudeRefreshOf(pc)
+    return { version: 1, pc: { id: pc.id, name: pc.name }, checked, message: checked ? `${pc.name} checked its Claude subscription and it went well.` : `${pc.name} could not be asked, or its check did not go well: see its row.` }
+  }
+  /** The PCs a key is being given to or taken from RIGHT NOW: a second request for the same PC is refused (two gives at once would mint two keys, and the PC could end up holding the dead one), as the restart's single job is. */
+  const keyInFlight = new Set<string>()
+  const keyBusy = (pc: { name: string }) => apiError(409, `A key for ${pc.name} is being given or taken away right now. Wait for it to finish.`)
+  /** POST /claude-pcs/key: {pc}. */
+  async function claudePcKeyGive(body: unknown): Promise<ClaudePcKeyAnswer> {
+    const pc = claudePcOf(body)
+    if (pc.here && !o.pcKey) throw apiError(409, "This PC can't hold a key.")
+    if (keyInFlight.has(pc.id)) throw keyBusy(pc)
+    keyInFlight.add(pc.id)
+    try {
+      return await claudePcKeyGiveOne(pc)
+    } finally {
+      keyInFlight.delete(pc.id)
+    }
+  }
+  async function claudePcKeyGiveOne(pc: { id: string; name: string; here: boolean }): Promise<ClaudePcKeyAnswer> {
+    let r: Response
+    try {
+      r = await crmProxy.request('POST', keyRoute(pc), { json: {} })
+    } catch (e) {
+      throw apiError(409, e instanceof Error && e.name === 'CrmNotSignedIn' ? "This PC has no CRM sign-in, so the Server can't ask the CRM for a key. Sign in, then try again." : `Can't reach the CRM right now (${safeWords(message(e))}).`)
+    }
+    const j: unknown = await r.json().catch(() => null)
+    if (r.status !== 200 || !isObject(j)) throw keyRefusal(r.status, 'give a PC a key')
+    const key = typeof j.key === 'string' && KEY_SHAPE.exec(j.key)?.[1] === pc.id ? j.key : null
+    const expiresAt = typeof j.expiresAt === 'string' && Number.isFinite(Date.parse(j.expiresAt)) ? j.expiresAt : null
+    if (!key) throw apiError(502, 'The CRM answered something that is not a key for that PC.')
+    try {
+      if (pc.here) o.pcKey!.save(key, { expiresAt })
+      else await request<unknown>(peerOf(pc.id), 'pc-key-set', { key, expiresAt }, 30_000)
+    } catch (e) {
+      // not delivered: nobody holds this key, so it is taken away again rather than left alive
+      await crmProxy.request('DELETE', keyRoute(pc)).then(x => x.arrayBuffer(), () => undefined).catch(() => undefined)
+      throw pc.here ? apiError(500, "This PC couldn't keep the key.") : claudePeerError(e, pc.name)
+    }
+    const checked = await claudeRefreshOf(pc)
+    o.log?.info(`PC key: given to ${pc.name}${checked ? '' : ' (its Claude check is still to come)'}`)
+    return { version: 1, pc: { id: pc.id, name: pc.name }, action: 'given', expiresAt, checked, message: checked ? `${pc.name} has its key and fetched its Claude subscription.` : `${pc.name} has its key; it fetches its Claude subscription at its next check (within the hour).` }
+  }
+  /** POST /claude-pcs/key/take-away: {pc}. */
+  async function claudePcKeyTakeAway(body: unknown): Promise<ClaudePcKeyAnswer> {
+    const pc = claudePcOf(body)
+    if (keyInFlight.has(pc.id)) throw keyBusy(pc)
+    keyInFlight.add(pc.id)
+    try {
+      return await claudePcKeyTakeAwayOne(pc)
+    } finally {
+      keyInFlight.delete(pc.id)
+    }
+  }
+  async function claudePcKeyTakeAwayOne(pc: { id: string; name: string; here: boolean }): Promise<ClaudePcKeyAnswer> {
+    let r: Response
+    try {
+      r = await crmProxy.request('DELETE', keyRoute(pc))
+    } catch (e) {
+      throw apiError(409, e instanceof Error && e.name === 'CrmNotSignedIn' ? "This PC has no CRM sign-in, so the Server can't ask the CRM to take the key away. Sign in, then try again." : `Can't reach the CRM right now (${safeWords(message(e))}).`)
+    }
+    await r.arrayBuffer().catch(() => undefined)
+    // 404: the PC had no key at the CRM: the PC's own copy (if any) is stale, and its next check says so
+    if (r.status !== 200 && r.status !== 404) throw keyRefusal(r.status, "take a PC's key away")
+    const checked = await claudeRefreshOf(pc)
+    o.log?.info(`PC key: taken away from ${pc.name}`)
+    return { version: 1, pc: { id: pc.id, name: pc.name }, action: 'taken-away', expiresAt: null, checked, message: checked ? `${pc.name} no longer has a key.` : `The CRM no longer accepts ${pc.name}'s key; the PC finds out at its next check (within the hour), or when it is next on.` }
+  }
+  /** F-351, on the PC: keeps the key the Server hands it (the Server's link only reaches this). The answer never holds the key. */
+  function pcKeySetHere(raw: unknown): { version: 1; held: true } {
+    if (!o.pcKey) throw apiError(409, "This PC can't hold a key.")
+    if (!isObject(raw) || typeof raw.key !== 'string' || Object.keys(raw).some(k => k !== 'key' && k !== 'expiresAt')) throw apiError(400, 'Expected {key, expiresAt?}')
+    try {
+      o.pcKey.save(raw.key, { expiresAt: typeof raw.expiresAt === 'string' ? raw.expiresAt : null })
+    } catch {
+      throw apiError(400, 'That is not a key for this PC.')
+    }
+    return { version: 1, held: true }
+  }
+  /** F-351, on the PC: fetch the Claude credential now (the Server's link only). */
+  async function claudeRefreshHere(): Promise<{ version: 1; checked: boolean }> {
+    const s = o.claudeSub?.()
+    if (!s?.refresh) throw apiError(409, "This PC can't check its Claude subscription from here.")
+    await s.refresh()
+    return { version: 1, checked: s.info().check?.result === 'ok' }
+  }
+
   /** POST /claude-pcs/restart: verifies the token NOW (asking the PC again), plans, answers at once with the job; the chats are then restarted one at a time in the background. */
   async function claudeRestartStart(body: unknown, by: ChatActor): Promise<RestartJob> {
     if (claudeRestartRun?.running || claudeRestartStarting) throw apiError(409, 'A restart is already running. Wait for it to finish.')
@@ -6207,11 +6333,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const refuse = (status: number, code: GoalEditCode) => Object.assign(apiError(status, GOAL_EDIT_WORDS[code]), { code })
     // F-353: the ONE other request of this route is exactly { parentGoalId } (a goal of THIS floor, or null: the top level); it is never mixed with the edit keys
     const nesting = isNestBody(r.body)
+    // F-356: the THIRD exact request is { disabled } (switch the goal off, or on again); it is never mixed with the other two
+    const disabling = !nesting && isDisableBody(r.body)
     let fields: Record<string, unknown>
     if (nesting) {
       const n = checkGoalNest(r.body)
       if (!n.ok) throw refuse(400, 'goal-text')
       fields = { ...n.value }
+    } else if (disabling) {
+      const d = checkGoalDisable(r.body)
+      if (!d.ok) throw refuse(400, 'goal-text')
+      fields = { ...d.value }
     } else {
       const checked = checkGoalEdit(r.body)
       if (!checked.ok) throw refuse(400, 'goal-text')
@@ -6233,6 +6365,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     }
     const t = Date.now()
+    if (disabling) {
+      try {
+        await crmGoals.setDisabled(goalId, fields.disabled === true, { userId: SBSKRRT_ID })
+      } catch (e) {
+        if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'goal-signin-other')
+        const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+        throw status === 409 ? refuse(409, 'goal-signin') : status === 404 ? refuse(404, 'goal-gone') : status >= 400 && status < 500 ? refuse(400, 'goal-refused') : refuse(502, 'goal-down')
+      }
+      o.log?.info(`goal changed by hand: floor ${floorId.slice(0, 64)}, goal ${goalId.slice(0, 64)}, fields disabled, ${Date.now() - t} ms`)
+      return { ok: true, goal: null }
+    }
     let out: string
     try {
       out = await crmGoals.update({ id: goalId, ...fields }, nesting ? { userId: SBSKRRT_ID, maxLevels: TREE_MAX_DEPTH } : { userId: SBSKRRT_ID })
@@ -9143,6 +9286,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/claude-pcs\/switch$/, (_, r) => (claudePcsOwnerOnly(r), claudePcSwitch(r.body)), 'local'],
     ['POST', /^\/claude-pcs\/restart$/, (_, r) => claudeRestartStart(r.body, actorOfCaller(claudePcsOwnerOnly(r))), 'local'],
     ['GET', /^\/claude-pcs\/restart\/([^/]+)$/, ([id], r) => (claudePcsOwnerOnly(r), claudeRestartJob(id)), 'local'],
+    // F-351: the PC's own key. The owner gives a PC one (the Server mints it with the owner's CRM session and hands it over the paired link: it is in no answer, no log, no page) and takes it away.
+    ['POST', /^\/claude-pcs\/key$/, (_, r) => (claudePcsOwnerOnly(r), claudePcKeyGive(r.body)), 'local'],
+    ['POST', /^\/claude-pcs\/key\/take-away$/, (_, r) => (claudePcsOwnerOnly(r), claudePcKeyTakeAway(r.body)), 'local'],
+    ['POST', /^\/claude-pcs\/refresh$/, (_, r) => (claudePcsOwnerOnly(r), claudePcRefresh(r.body)), 'local'],
     ['POST', /^\/mcp-install\/plan$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpPlanAnswer(r.body)), 'local'],
     ['POST', /^\/mcp-install$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('register', r.body)), 'local'],
     ['POST', /^\/mcp-remove$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('remove', r.body)), 'local'],
@@ -10423,6 +10570,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(raw => claudePreviewHere(raw))
         case 'claude-switch':
           return answer(raw => claudeSwitchHere(raw))
+        // F-351: the Server hands this PC its own key (minted with the owner's CRM session) and asks it to check its Claude subscription at once; from the Server's link only. The key is not in any answer or line.
+        case 'pc-key-set':
+          return answer(raw => pcKeySetHere(raw))
+        case 'claude-refresh':
+          return answer(() => claudeRefreshHere())
         case 'mcp-plan':
           return answer(raw => planInstall(mcpDeps(), mcpIdOf(raw)))
         case 'mcp-register':

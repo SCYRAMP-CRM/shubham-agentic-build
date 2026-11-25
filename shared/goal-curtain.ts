@@ -144,6 +144,10 @@ export function cleanLinks(raw: unknown): Record<string, string> | null {
 
 export const FILTERS = ['todo', 'done', 'abandoned'] as const
 export const FILTER_WORDS: Record<GoalStatus, string> = { todo: 'Open', done: 'Done', abandoned: 'Dropped' }
+/** F-360 (Shubham: "and make all goals button also"): a fourth view beside Open / Done / Dropped that shows every goal of the floor together (the trees whole). */
+export const ALL_VIEW = 'all'
+export const ALL_WORDS = 'All'
+export type CurtainView = GoalStatus | typeof ALL_VIEW
 /** What the curtain shows first: the open goals, or (when there are none) the first kind there is. */
 export const firstFilter = (counts: Record<GoalStatus, number>): GoalStatus => FILTERS.find(f => counts[f] > 0) ?? 'todo'
 

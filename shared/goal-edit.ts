@@ -43,6 +43,25 @@ export function checkGoalNest(body: unknown): GoalNestChecked {
   return typeof v === 'string' && GOAL_ID_RE.test(v) ? { ok: true, value: { parentGoalId: v } } : { ok: false }
 }
 
+/**
+ * F-356 (Shubham: "no opeiton to disable goal"): the THIRD exact request the same route takes: exactly `{ disabled }` (true: switch the goal off, false: switch it on again). The CRM keeps it as a soft delete (isDisabled) and
+ * records it in the goal's trail. Never mixed with the keys above or with { parentGoalId }.
+ */
+export interface GoalDisable {
+  disabled: boolean
+}
+/** True for a request that names `disabled` at all (then it is a disable request and nothing else). */
+export const isDisableBody = (body: unknown): boolean => typeof body === 'object' && body !== null && !Array.isArray(body) && Object.hasOwn(body, 'disabled')
+export type GoalDisableChecked = { ok: true; value: GoalDisable } | { ok: false }
+/** The disable request as the route takes it: an object with exactly the one key, a boolean. */
+export function checkGoalDisable(body: unknown): GoalDisableChecked {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { ok: false }
+  const keys = Object.keys(body)
+  if (keys.length !== 1 || keys[0] !== 'disabled') return { ok: false }
+  const v = (body as { disabled?: unknown }).disabled
+  return typeof v === 'boolean' ? { ok: true, value: { disabled: v } } : { ok: false }
+}
+
 /** The fixed sentences. `code` is what the route answers with; the page shows only these. The sign-in and refusal ones are the add form's own words. */
 export const GOAL_EDIT_CODES = ['goal-text', 'goal-signin', 'goal-signin-other', 'goal-not-here', 'goal-gone', 'goal-refused', 'goal-down', 'goal-parent-not-here', 'goal-nest-loop', 'goal-nest-deep', 'goal-nest-gone'] as const
 export type GoalEditCode = (typeof GOAL_EDIT_CODES)[number]

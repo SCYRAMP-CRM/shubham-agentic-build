@@ -237,6 +237,8 @@ export function mainsOf<T extends TreeInput>(rows: readonly T[]): T[] {
  * main goal is done the whole tree is in the Done view, every sub-goal as it is).
  */
 export function treeView<T extends TreeInput & { status: string }>(rows: readonly T[], status: string): T[] {
+  // F-360: the ALL view is every tree of every status, in the list's own order (open trees first, then done, then dropped)
+  if (status === 'all') return [...rows]
   const parents = parentsOf(rows)
   const own = new Map(rows.map(r => [r.id, r.status] as const))
   const mainOf = (id: string): string => {
@@ -304,3 +306,39 @@ export const DONE_NO = 'No'
 export const doneWords = (title: string): string => `Marked ${capTitle(title) || 'The goal'} done.`
 export const undoneWords = (title: string): string => `Marked ${capTitle(title) || 'The goal'} not done.`
 export const allDoneWords = (title: string, n: number): string => `Marked ${capTitle(title) || 'The goal'} and its ${n} sub-goal${n === 1 ? '' : 's'} done.`
+
+// ---- F-356 (Shubham: "no opeiton to disable goal"): switching a goal off (the CRM's soft delete). PURE: the sub-goals a "disable it and its sub-goals" would switch off, and the fixed words around the question and the lines after.
+
+/** Every sub-goal of every level under `id` on the list, the DEEPEST first (the order a whole branch is switched off in: the children before their parent). */
+export function descendantsDeepFirst<T extends TreeInput>(rows: readonly T[], parents: ReadonlyMap<string, string | null>, id: string): T[] {
+  const out: T[] = []
+  const walk = (parent: string, depth: number) => {
+    if (depth > 64) return
+    for (const k of childrenOf(rows, parents, parent)) {
+      walk(k.id, depth + 1)
+      out.push(k)
+    }
+  }
+  walk(id, 0)
+  return out
+}
+
+/** The question before a goal is switched off: with sub-goals, they can stay (listed at the top) or go with it. */
+export const disableConfirmWords = (title: string, n: number): string => {
+  const t = capTitle(title) || 'this goal'
+  return n === 0 ? `Disable ${t}?` : `Disable ${t}? Its ${n} sub-goal${n === 1 ? '' : 's'} can stay (listed at the top) or go with it.`
+}
+export const DISABLE_ONLY = 'Disable only this goal'
+export const DISABLE_YES = 'Disable'
+/** Said plainly in the question: what a switch-off is for the CRM and for other people, and how long it can be undone from here. */
+export const DISABLE_EVERYONE = "Disabling is the CRM's soft delete, for everyone: the people it is assigned to stop seeing it. After the 8-second Undo it can be turned back on only in the CRM."
+export const disableAllLabel = (n: number): string => `Disable it and its ${n} sub-goal${n === 1 ? '' : 's'}`
+/** More sub-goals than one batch may switch off: the second choice is not offered, and this says why. */
+export const disableTooManyWords = (n: number): string => `This goal has ${n} sub-goals; at most ${DONE_BATCH_MAX} can be disabled with it at once. Disable only this goal, or some of them first.`
+export const disabledWords = (title: string): string => `Disabled ${capTitle(title) || 'The goal'}.`
+export const disabledAllWords = (title: string, n: number): string => `Disabled ${capTitle(title) || 'The goal'} and its ${n} sub-goal${n === 1 ? '' : 's'}.`
+export const ENABLED_AGAIN = 'Enabled again.'
+/** A batch that stopped part-way (the first refusal): how many were switched off, and the line the Undo carries. */
+export const partialOffWords = (written: number, of: number): string => `${written} of ${of} were disabled before it stopped; the rest were not.`
+export const partialOffUndoWords = (written: number, of: number): string => `${written} of ${of} disabled.`
+export const partialOnWords = (written: number, of: number): string => `${written} of ${of} were enabled before it stopped; the rest were not.`

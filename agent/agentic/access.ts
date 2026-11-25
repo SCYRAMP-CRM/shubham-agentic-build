@@ -139,6 +139,10 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/claude-pcs\/switch$/, OWNER],
   ['POST', /^\/claude-pcs\/restart$/, OWNER],
   ['GET', /^\/claude-pcs\/restart\/([^/]+)$/, OWNER],
+  // F-351: the PC's own key: the owner gives a PC one and takes it away (the route itself also asks for the first owner, by id, like the ones above).
+  ['POST', /^\/claude-pcs\/key$/, OWNER],
+  ['POST', /^\/claude-pcs\/key\/take-away$/, OWNER],
+  ['POST', /^\/claude-pcs\/refresh$/, OWNER],
   ['POST', /^\/mcp-install\/plan$/, OWNER],
   ['POST', /^\/mcp-install$/, OWNER],
   ['POST', /^\/mcp-remove$/, OWNER],

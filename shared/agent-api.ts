@@ -239,6 +239,8 @@ export interface ClaudeInfo {
   busy: boolean
   /** Claude subscription failover and the manual switch (agent/SPEC.md › Claude subscription failover). Absent from an older agent. */
   switch?: ClaudeSwitchInfo
+  /** F-351: whether this PC holds its OWN key from the CRM (it fetches its credential and reports its usage with it, with nobody signed in), and since when. Never the key. Absent from an older agent. */
+  key?: { given: boolean; savedAt: string | null; rotatedAt: string | null; expiresAt: string | null } | null
 }
 
 /** POST /claude/sign-in: the person's own CRM username (or email) and password, used once. */

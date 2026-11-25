@@ -21,6 +21,7 @@ import {
   type Moved,
   type Read,
 } from './crm.ts'
+import { keyedApi, rotateDue, type KeyedApi, type PcKeyHeld, type PcKeyStore } from './pc-key.ts'
 import { AUTO_COOLDOWN_MS, openSwitchStore, type SwitchStore } from './state.ts'
 import { loadUserEnv, userEnvStore, type UserEnv } from './userenv.ts'
 
@@ -61,6 +62,8 @@ export const TOKEN_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
 export const API_KEY_VAR = 'ANTHROPIC_API_KEY'
 const varOf = (kind: ClaudeKind) => (kind === 'api_key' ? API_KEY_VAR : TOKEN_VAR)
 export const CHECK_EVERY_MS = 60 * 60 * 1000
+/** F-351: a key renewal that did not come through is tried again after this (the check itself is hourly). */
+export const ROTATE_RETRY_MS = 5 * 60 * 1000
 /** F-342: the first owner's app sign-in renews the PC's CRM login only when less than this is left of its 7 days (it is never renewed before, so signing in from another device restarts nothing). */
 export const RENEW_BELOW_MS = 2 * 24 * 60 * 60 * 1000
 /** The CRM's own codes for a person whose subscription's week is used up, or that was turned off. */
@@ -202,6 +205,12 @@ export interface ClaudeOptions {
   userEnv?: UserEnv | null
   /** Tests: a stand-in CRM. */
   crm?: CrmApi
+  /** F-351: this PC's own key (pc-key.ts). With one, the check fetches the credential by the key (the person's login, if any, is not used for it); with none, everything is as before. */
+  keys?: PcKeyStore
+  /** F-351 tests: a stand-in for the CRM's /v1/device calls. */
+  keyed?: KeyedApi
+  /** F-351 tests: how long after a renewal that did not come through it is tried again (default 5 minutes). */
+  rotateRetryMs?: number
   now?: () => number
   onChange(): void
 }
@@ -248,6 +257,7 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   const now = o.now ?? Date.now
   const userEnv = o.userEnv !== undefined ? o.userEnv : loadUserEnv()
   const crm: CrmApi = o.crm ?? crmApi
+  const keyed: KeyedApi = o.keyed ?? keyedApi
   const url = crmUrlOf(env)
   const build = `sad-${o.deviceId}`
   const store: SwitchStore = openSwitchStore(o.paths.claudeSwitch ?? null)
@@ -371,6 +381,8 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
       check: lastCheck,
       busy,
       switch: switchInfo(),
+      // F-351: whether this PC holds its own key and since when (never the key)
+      ...(o.keys ? { key: o.keys.status() } : {}),
     }
   }
 
@@ -474,7 +486,69 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     log.info(line)
   }
 
+  /**
+   * F-351: the check of a PC that holds its OWN key: the credential of the subscription of the person this PC is ASSIGNED to (the CRM's Usage for Server Agentic), fetched by the key, with no person signed in and no 7-day session.
+   * The key WINS over a person's login on the same PC (giving a PC a key is the owner's explicit choice); a key the CRM no longer accepts (taken away, ended) is forgotten here and what it placed comes out, and the next check is the
+   * person-login way again. Switching by itself (failover) is the person's: a keyed PC does not run it (a week used up takes the token out, with the CRM's own words, and says so).
+   */
+  async function askByKey(held: PcKeyHeld, replace: boolean) {
+    busy = true
+    o.onChange()
+    try {
+      const cred = await keyed.credentialByKey(url, held.key, build)
+      const at = iso(now())
+      if (cred.kind === 'ok') {
+        await place(cred, replace)
+        lastCheck = { at, result: 'ok', message: null }
+        await rotateIfDue()
+      } else if (cred.kind === 'expired') {
+        o.keys?.clear()
+        await unplace("this PC's key ended or was taken away")
+        log.info("the CRM does not accept this PC's key (taken away or ended): the key is forgotten here")
+        lastCheck = { at, result: 'error', message: "This PC's key was taken away or has ended. Ask the owner to give it a new key." }
+      } else {
+        log.info(`the CRM gives this PC no Claude subscription: ${scrub(cred.message)}`)
+        await unplace(cred.message)
+        lastCheck = { at, result: 'none', message: cred.message, code: cred.code }
+      }
+    } catch (e) {
+      // the error text of a request holds an address at most, never the key (the key rides in a header)
+      log.warn(`couldn't ask the CRM with this PC's key: ${scrub(message(e))}`)
+      lastCheck = { at: iso(now()), result: 'error', message: scrub(message(e)) }
+    } finally {
+      busy = false
+      o.onChange()
+    }
+  }
+
+  /**
+   * The key is renewed by this PC itself after 30 days (the CRM lets one live 90): the new one is kept before the old one is let go (the CRM keeps the old one working for hours, ROTATE_GRACE_SECONDS).
+   * A renewal that did not come through (the request failed, or the new key could not be saved) is TRIED AGAIN within minutes, not at the next hourly check: the CRM's grace for the old key is finite, and a PC
+   * that only retried at the hour could strand itself at the very end of it.
+   */
+  let rotateTimer: ReturnType<typeof setTimeout> | null = null
+  async function rotateIfDue() {
+    const held = o.keys?.read()
+    if (!o.keys || !held || !rotateDue(held, now())) return
+    try {
+      const next = await keyed.rotateKey(url, held.key)
+      o.keys.save(next.key, { expiresAt: next.expiresAt, rotated: true })
+      log.info("this PC's key was renewed")
+    } catch (e) {
+      log.warn(`couldn't renew this PC's key (trying again in a few minutes): ${scrub(message(e))}`)
+      if (!rotateTimer && !closed) {
+        rotateTimer = setTimeout(() => {
+          rotateTimer = null
+          void serial(rotateIfDue).catch(() => {})
+        }, o.rotateRetryMs ?? ROTATE_RETRY_MS)
+        rotateTimer.unref?.()
+      }
+    }
+  }
+
   async function ask(replace: boolean) {
+    const held = o.keys?.read() ?? null
+    if (held) return askByKey(held, replace)
     if (!session) return
     if (now() >= expiresAt(session)) {
       log.info(`the CRM session for ${session.user.name} ended (they last 7 days); sign in again`)
@@ -898,6 +972,8 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     close() {
       closed = true
       checkHook = null
+      if (rotateTimer) clearTimeout(rotateTimer)
+      rotateTimer = null
     },
   }
 }

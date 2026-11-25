@@ -85,6 +85,8 @@ export interface StatePaths {
   crmSession: string
   /** F-007: which CRM subscription the app put in CLAUDE_CODE_OAUTH_TOKEN (a hash and its last four characters, never the token). */
   claudeSubscription: string
+  /** F-351: this PC's OWN key from the CRM (agent/claude/pc-key.ts): a secret, mode 0600, beside crm-session.json. Never shown, never logged. */
+  pcKey: string
   /** Claude subscription failover: the switch log, whether to switch by itself, and the caps the app has seen (no token, no cookie). */
   claudeSwitch: string
   /** F-008: other PCs' passwords this PC remembers for Control, as SHA256(password ‖ salt) (agent/saved-passwords.ts). */
@@ -146,6 +148,7 @@ export function statePaths(root: string = stateRoot(), env: Env = process.env): 
     screenPassword: path.join(agent, 'screen-password.json'),
     crmSession: path.join(agent, 'crm-session.json'),
     claudeSubscription: path.join(agent, 'claude-subscription.json'),
+    pcKey: path.join(agent, 'pc-key.json'),
     claudeSwitch: path.join(agent, 'claude-switch.json'),
     savedPasswords: path.join(agent, 'saved-passwords.json'),
     powerButtons: path.join(agent, 'power-buttons.json'),

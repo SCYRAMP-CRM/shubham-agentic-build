@@ -384,6 +384,20 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
       return mapHistory(await crm<unknown>('GET', `v1/org/goals/${goalId}/activity`))
     },
+
+    /**
+     * F-356 (Shubham: "no opeiton to disable goal"): switches ONE goal off (the CRM's soft delete, isDisabled) or on again, by a PERSON from the curtain: a login check (the change is made AS the person the CRM login on this PC
+     * belongs to: only when that is who the caller expects, the first owner), then ONE PATCH of `is_disabled`; the CRM records it in the goal's trail. Nothing else is read or written, and no chat tool reaches it. The log
+     * line is the goal id and the word, never a title.
+     */
+    async setDisabled(goalId: string, disabled: boolean, expect: { userId: string } | null = null): Promise<{ ok: true }> {
+      if (typeof goalId !== 'string' || !ID_RE.test(goalId)) throw apiError(400, 'id is not a goal id')
+      if (typeof disabled !== 'boolean') throw apiError(400, 'disabled must be true or false')
+      if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
+      await crm<unknown>('PATCH', `v1/org/goals/${goalId}`, { is_disabled: disabled })
+      o.log?.info(`goal switched ${disabled ? 'off' : 'on'}: ${goalId.slice(0, 64)}`)
+      return { ok: true }
+    },
   }
 }
 

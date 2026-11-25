@@ -44,6 +44,14 @@ export interface ClaudePcRunning {
   engine: ClaudeChatEngine
 }
 
+/** F-351: whether this PC holds its OWN key from the CRM, and since when. Never the key. */
+export interface ClaudePcKeyState {
+  given: boolean
+  savedAt: string | null
+  rotatedAt: string | null
+  expiresAt: string | null
+}
+
 /** What a PC says of itself. */
 export interface ClaudePcStatus {
   version: 1
@@ -57,6 +65,8 @@ export interface ClaudePcStatus {
   /** The weekly reading of the placed subscription, only when the PC's own status holds it. */
   week: ClaudePcWeek | null
   crm: { state: ClaudeCrmState; name: string | null; expiresAt: string | null }
+  /** F-351: absent from a PC on an older build. */
+  key?: ClaudePcKeyState
   choices: ClaudePcChoice[]
   running: ClaudePcRunning[]
 }
@@ -74,6 +84,26 @@ export interface ClaudePcChat {
   restartable: boolean
   /** Why it is not restartable, in words; null otherwise. */
   note: string | null
+}
+
+/** F-351: the answer of "Give this PC a key" / "Take the key away": what was done, never the key. */
+export interface ClaudePcKeyAnswer {
+  version: 1
+  pc: { id: string; name: string }
+  action: 'given' | 'taken-away'
+  /** When the CRM lets the key lapse (a key is given for 90 days; the PC renews it itself), or null. */
+  expiresAt: string | null
+  /** Whether the PC was asked to check its Claude subscription at once and said it went well (the PC may be off: the key is valid all the same). */
+  checked: boolean
+  message: string
+}
+
+/** F-351: the answer of "Fetch now": the PC was asked to check its Claude subscription at once. */
+export interface ClaudePcRefreshAnswer {
+  version: 1
+  pc: { id: string; name: string }
+  checked: boolean
+  message: string
 }
 
 export interface ClaudePcRow {
@@ -117,7 +147,7 @@ function readWeek(v: unknown): ClaudePcWeek | null | undefined {
 }
 
 export function readClaudePcStatus(v: unknown): ClaudePcStatus | null {
-  if (!only(v, ['version', 'pc', 'build', 'builtAt', 'token', 'placed', 'week', 'crm', 'choices', 'running']) || v.version !== 1 || !pcOk(v.pc) || !(v.build === null || text(v.build, 64)) || !when(v.builtAt)
+  if (!only(v, ['version', 'pc', 'build', 'builtAt', 'token', 'placed', 'week', 'crm', 'key', 'choices', 'running']) || v.version !== 1 || !pcOk(v.pc) || !(v.build === null || text(v.build, 64)) || !when(v.builtAt)
     || !['set', 'taken', 'empty', 'unsupported'].includes(String(v.token))) return null
   let placed: ClaudePcStatus['placed'] = null
   if (v.placed !== null) {
@@ -130,6 +160,12 @@ export function readClaudePcStatus(v: unknown): ClaudePcStatus | null {
   if (week === undefined || (week !== null && placed === null)) return null
   const c = v.crm
   if (!only(c, ['state', 'name', 'expiresAt']) || !['signed-in', 'ended', 'none'].includes(String(c.state)) || !(c.name === null || name(c.name)) || !whenOrNull(c.expiresAt)) return null
+  let key: ClaudePcKeyState | undefined
+  if (v.key !== undefined) {
+    const k = readKeyState(v.key)
+    if (!k) return null
+    key = k
+  }
   if (!Array.isArray(v.choices) || v.choices.length > CLAUDE_PC_CHOICES_LIMIT || !Array.isArray(v.running) || v.running.length > CLAUDE_PC_CHATS_LIMIT) return null
   const choices: ClaudePcChoice[] = []
   for (const x of v.choices) {
@@ -144,8 +180,25 @@ export function readClaudePcStatus(v: unknown): ClaudePcStatus | null {
   if (new Set(running.map(r => r.sessionId)).size !== running.length || new Set(choices.map(x => x.id)).size !== choices.length) return null
   return {
     version: 1, pc: { id: v.pc.id, name: v.pc.name }, build: v.build as string | null, builtAt: v.builtAt, token: v.token as ClaudeTokenState, placed, week,
-    crm: { state: c.state as ClaudeCrmState, name: c.name as string | null, expiresAt: c.expiresAt as string | null }, choices, running,
+    crm: { state: c.state as ClaudeCrmState, name: c.name as string | null, expiresAt: c.expiresAt as string | null }, ...(key ? { key } : {}), choices, running,
   }
+}
+
+function readKeyState(v: unknown): ClaudePcKeyState | null {
+  if (!only(v, ['given', 'savedAt', 'rotatedAt', 'expiresAt']) || typeof v.given !== 'boolean' || !whenOrNull(v.savedAt) || !whenOrNull(v.rotatedAt) || !whenOrNull(v.expiresAt)) return null
+  if (!v.given && (v.savedAt !== null || v.rotatedAt !== null || v.expiresAt !== null)) return null
+  return { given: v.given, savedAt: v.savedAt as string | null, rotatedAt: v.rotatedAt as string | null, expiresAt: v.expiresAt as string | null }
+}
+
+/** F-351: the answers of the key buttons, read strictly (a key can never be in one: there is no field for it). */
+export function readClaudePcKeyAnswer(v: unknown): ClaudePcKeyAnswer | null {
+  if (!only(v, ['version', 'pc', 'action', 'expiresAt', 'checked', 'message']) || v.version !== 1 || !pcOk(v.pc) || !['given', 'taken-away'].includes(String(v.action)) || !whenOrNull(v.expiresAt) || typeof v.checked !== 'boolean' || !text(v.message, 600)) return null
+  return { version: 1, pc: { id: v.pc.id, name: v.pc.name }, action: v.action as ClaudePcKeyAnswer['action'], expiresAt: v.expiresAt as string | null, checked: v.checked, message: v.message }
+}
+
+export function readClaudePcRefreshAnswer(v: unknown): ClaudePcRefreshAnswer | null {
+  if (!only(v, ['version', 'pc', 'checked', 'message']) || v.version !== 1 || !pcOk(v.pc) || typeof v.checked !== 'boolean' || !text(v.message, 600)) return null
+  return { version: 1, pc: { id: v.pc.id, name: v.pc.name }, checked: v.checked, message: v.message }
 }
 
 function readChat(v: unknown): ClaudePcChat | null {

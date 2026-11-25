@@ -50,6 +50,8 @@ export interface ClaudeSubSlice {
    * one at a time, when the person asks). The Server never holds or moves a token.
    */
   switchOnly?(to: string): Promise<SliceSwitch>
+  /** F-351: fetch this PC's credential NOW (the Server asks after the owner changed the person's subscription or gave the PC a key). Left out (a test's slice): the PC cannot be asked. */
+  refresh?(): Promise<void>
 }
 
 export type SlicePreview = { kind: 'ok'; preview: SwitchPreview } | { kind: 'crm-signin-ended' } | { kind: 'error'; message: string }
@@ -102,6 +104,8 @@ export function buildClaudePcStatus(i: PcStatusInput): ClaudePcStatus {
     placed,
     week: week && week.percent === null && week.resetsAt === null && week.observedAt === null ? null : week,
     crm: { state: i.crmState, name: info.crm ? cleanName(info.crm.name) || null : null, expiresAt: iso(info.crm?.expiresAt) },
+    // F-351: whether this PC holds its OWN key and since when: four named fields, never the key (which the Claude module's status does not carry either)
+    ...(info.key ? { key: { given: info.key.given === true, savedAt: iso(info.key.savedAt), rotatedAt: iso(info.key.rotatedAt), expiresAt: iso(info.key.expiresAt) } } : {}),
     choices,
     running: i.running.slice(0, CLAUDE_PC_CHATS_LIMIT).map(r => ({ sessionId: r.sessionId, state: r.state, startedAt: iso(r.startedAt), engine: r.engine })),
   }
