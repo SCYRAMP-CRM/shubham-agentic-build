@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-Do91PwTf.js";function t(){e(`/goals`)}export{t as default};

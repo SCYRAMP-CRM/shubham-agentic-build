@@ -1198,7 +1198,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log, ...(o.crmUrl !== undefined ? { crmUrl: o.crmUrl } : {}) })
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
-  const crmGoals = createCrmGoals({ proxy: crmProxy })
+  const crmGoals = createCrmGoals({ proxy: crmProxy, ...(o.log ? { log: o.log } : {}) })
   // F-334: which CRM goal was made by which floor's chat (the app's own small file; the CRM keeps no such field). Written only by the crm_goal_add case of toolFor, read only by GET /goal-floors.
   const goalFloors = createGoalFloors({ dir: o.dir, log: o.log, ...(o.goalFloorsTest?.readText ? { readText: o.goalFloorsTest.readText } : {}) })
   // F-334 addendum: the order of a floor's goals in its curtain (ids and positions only, in the order module's own file). Written only by PUT /floors/:id/goal-order, read only by GET /goal-floors. The CRM is never touched.
@@ -1552,11 +1552,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * the app's own list of floors, never trusted as given: an exact id, else an exact name without regard to capitals; a name more than one floor has is refused with the candidates (id, name, number of agents), so the chat
    * can call again with an id; an unknown one is refused and lists nothing; a floor is never made. Only the owner's chats have crm_goal_add at all (ADMIN_TOOLS), and that gate is asked before this.
    */
-  function goalFloorFor(want: unknown, own: Floor): Floor {
-    if (want === undefined || want === null) return own
+  function goalFloorFor(want: unknown, own: Floor, parentGoalId?: unknown): Floor {
+    // F-344: a sub-goal with no floor named goes on the floor its PARENT is linked to (the app's link file) when that is still a floor of this app; a parent that is not linked, or an unknown one, leaves it with the calling chat's own floor
+    const home = (): Floor => {
+      if (typeof parentGoalId !== 'string') return own
+      const links = goalFloors.links()
+      const linked = Object.hasOwn(links, parentGoalId) ? links[parentGoalId] : undefined
+      return (linked !== undefined ? allFloors().find(f => f.id === linked) : undefined) ?? own
+    }
+    if (want === undefined || want === null) return home()
     if (typeof want !== 'string') throw apiError(400, 'floor must be the name or the id of a floor')
     const t = want.trim()
-    if (!t) return own
+    if (!t) return home()
     const all = allFloors()
     const byId = all.find(f => f.id === t)
     if (byId) return byId
@@ -5841,6 +5848,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch {
       throw refuse(400, 'goal-text')
     }
+    // F-344: a sub-goal's parent must be a goal LINKED to THIS floor in the app's own file (never trusted from the page), else nothing is sent
+    if (fields.parentGoalId !== undefined) {
+      const links = goalFloors.links()
+      if (!Object.hasOwn(links, fields.parentGoalId) || links[fields.parentGoalId] !== floorId) throw refuse(400, 'goal-parent')
+    }
     const t = Date.now()
     for (const [k, v] of handGoals) if (t - v.at > 600_000) handGoals.delete(k)
     const kept = handGoals.get(requestId)
@@ -6863,7 +6875,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'crm_goal_add': {
         // F-334-1: the goal carries the floor and the agent of the calling chat in the CRM too (origin_floor_id, origin_agent_id; an older backend that does not know them is told once more without), AND the app keeps its own link below.
         // F-343: the goal goes on the floor the chat NAMES (resolved above against the app's own list, owner-only tool), else its own; the origin floor sent to the CRM and the link file below use the SAME resolved floor.
-        const target = goalFloorFor(args.floor, floor)
+        const target = goalFloorFor(args.floor, floor, args.parentGoalId)
         const out = await crmGoals.add(args, { floorId: target.id, agentId: agent.id })
         log?.info(`${agent.name} added a CRM goal`)
         // F-334: the goal exists in the CRM now; this chat's floor made it. Never throws, so a file that cannot be written never fails the tool. Only this call stamps a link: a goal made any other way has no floor.

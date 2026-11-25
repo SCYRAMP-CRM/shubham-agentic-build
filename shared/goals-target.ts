@@ -18,6 +18,9 @@ export interface WindowFloor {
   floorId: string
 }
 
+/** F-344: where the goals curtain opens: 'middle' (a centred panel over the page, the default) or 'pane' (the old way: over the chat window it is about). */
+export type CurtainPlace = 'middle' | 'pane'
+
 export interface CurtainTarget {
   host: CurtainHost
   floorId: string
@@ -29,8 +32,13 @@ const usable = (w: WindowFloor | null | undefined): w is WindowFloor => !!w && N
  * `pane`: a window named by the caller (the row in THAT window's menu: that window, whatever has the focus). Else `focused`: the window with the focus (the one drawn with the ring). Else the page's own floor,
  * with the curtain over the page as before: no window is on screen (another tab, a phone showing only the list) or the focused one is empty. Null when there is nothing to open on.
  */
-export function curtainTargetOf(o: { focused: WindowFloor | null; pageFloorId: string | null; pane?: WindowFloor | null }): CurtainTarget | null {
+export function curtainTargetOf(o: { focused: WindowFloor | null; pageFloorId: string | null; pane?: WindowFloor | null; place?: CurtainPlace }): CurtainTarget | null {
   const w = usable(o.pane) ? o.pane : usable(o.focused) ? o.focused : null
+  // F-344: IN THE MIDDLE (the default) every target opens on the ONE page host, carrying the floor the target names: the floor of the window that has the focus (or the menu row's window), else the page's. WHICH floor is decided exactly as before.
+  if (o.place === 'middle') {
+    const floorId = w ? w.floorId : o.pageFloorId
+    return floorId ? { host: 'page', floorId } : null
+  }
   if (w) return { host: paneHost(w.pane), floorId: w.floorId }
   return o.pageFloorId ? { host: 'page', floorId: o.pageFloorId } : null
 }

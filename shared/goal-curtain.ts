@@ -1,6 +1,7 @@
 import { GOAL_ID_RE, LINK_ID_RE } from './goal-floors.ts'
 import { rankByOrderNewFirst } from './goal-order.ts'
-import { assigneesOf, dueDay, normaliseStatus, normalisePriority, rankGoals, PRIORITY_WORDS, type Goal, type GoalStatus, type Member } from './goals.ts'
+import { assigneesOf, dueDay, normaliseStatus, normalisePriority, PRIORITY_WORDS, type Goal, type GoalStatus, type Member } from './goals.ts'
+import { INVISIBLE } from './invisible.ts'
 
 // F-334: what the curtain of ONE floor shows. Pure: the CRM's goals (as the Goals page reads them), the CRM's people, and the app's links (goal id -> floor id) go in; the rows of this floor, their
 // counts and the two honest numbers come out. Goals are other people's words: everything here is plain text for the page to draw as text nodes, and the only cut is a length cap.
@@ -23,6 +24,8 @@ export interface CurtainRow {
   who: string[]
   /** How many more assignees there are than `who` shows. */
   whoMore: number
+  /** F-344: the goal this one is a sub-goal of (the CRM's parent_goal_id, when it is a well-formed goal id), else null. The curtain nests a row under its parent only when the parent is on the same list. */
+  parentId: string | null
 }
 
 export interface Curtain {
@@ -34,9 +37,6 @@ export interface Curtain {
   /** CRM goals (switched on) that no floor made: "N older goals are not linked to any floor". A number only. */
   unlinked: number
 }
-
-/** Characters that draw nothing but can hide or reorder what is around them (a zero-width space, direction marks and overrides, isolates, the byte-order mark, invisible operators). The joiners U+200C and U+200D stay: emoji and some scripts need them. */
-const INVISIBLE = /[​‎‏‪-‮⁠-⁤⁦-⁩﻿]/g
 
 export function capTitle(title: unknown): string {
   const t = typeof title === 'string' ? title.replace(INVISIBLE, '').replace(/\s+/g, ' ').trim() : ''
@@ -53,6 +53,27 @@ export function capName(name: unknown): string {
 const ORDER: Record<GoalStatus, number> = { todo: 0, done: 1, abandoned: 2 }
 
 /**
+ * F-344a (Shubham: "give sort keep latest top and oldest bottom by default ok, and i can reorder, all latest go to the top"): when a goal was made, in ms. The CRM's own `createdAt` when the card has one; else the time the
+ * CRM's goal ids carry (they are UUIDv7: the first 48 bits are the Unix time in ms, so a larger id is a newer goal); else null (unknown: goes last).
+ */
+export function madeAt(g: Pick<Goal, 'id' | 'createdAt'>): number | null {
+  if (g.createdAt) {
+    const t = Date.parse(g.createdAt)
+    if (Number.isFinite(t)) return t
+  }
+  const m = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-/i.exec(g.id)
+  return m ? parseInt(m[1]! + m[2]!, 16) : null
+}
+
+/** Newest first; a goal whose time is unknown goes last; a tie keeps the larger id first (a stable, total order). */
+export function newestFirst(a: Pick<Goal, 'id' | 'createdAt'>, b: Pick<Goal, 'id' | 'createdAt'>): number {
+  const ta = madeAt(a)
+  const tb = madeAt(b)
+  if (ta !== tb) return ta === null ? 1 : tb === null ? -1 : tb - ta
+  return a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+}
+
+/**
  * The ONE place that says which floor a goal belongs to: the floor id of the app's OWN link first (goal id -> floor id, agent/agentic/goal-floors.ts, written by this app when a chat adds a goal: nobody else can
  * change it); only for a goal with no link, the floor id the CRM carries on the goal itself (originFloorId, sent by this app when a chat adds a goal, an older backend or another PC), when it is a well-formed id;
  * else null, no floor made it. The CRM's field is only a fallback to SHOW the goal (anyone who may edit a goal in the CRM could write any floor id there, so it never overrules the app's own record, and a goal
@@ -66,19 +87,20 @@ export function floorOfGoal(goal: Pick<Goal, 'id' | 'originFloorId'>, links: Rea
 
 /**
  * What a floor's curtain shows. `order` is the floor's saved order (the person's own, from the app's order file): with one, the goals never placed come FIRST (the newest first: a new goal goes to the top), then the placed
- * ones in their saved order, all statuses in ONE list (a status filter then shows its goals in their relative order, so the hidden ones keep their place). Without one, the Goals page's own ranking, open goals first.
+ * ones in their saved order, all statuses in ONE list (a status filter then shows its goals in their relative order, so the hidden ones keep their place). Without one (and for sub-goals among their siblings), NEWEST FIRST, open goals first: the Goals page's own ranking (priority, due) is for the Goals page.
  */
 export function curtainOf(goals: readonly Goal[], members: readonly Member[], links: Readonly<Record<string, string>>, floorId: string, order: readonly string[] = []): Curtain {
   const listed = new Map(goals.map(g => [g.id, g]))
   const on = goals.filter(g => !g.isDisabled)
   const here = on.filter(g => floorOfGoal(g, links) === floorId)
   const named = (id: string) => capName(members.find(m => m.userId === id)?.fullName) || 'Someone'
-  const byDefault = rankGoals(here).sort((a, b) => ORDER[normaliseStatus(a.status)] - ORDER[normaliseStatus(b.status)])
-  const ranked = order.length ? rankByOrderNewFirst(byDefault, order, g => (g.createdAt && Number.isFinite(Date.parse(g.createdAt)) ? Date.parse(g.createdAt) : null)) : byDefault
+  // NEWEST FIRST (oldest at the bottom), open goals before done before dropped; with a saved order his manual order stays and every goal it does not name (a new one) goes ABOVE it, newest first
+  const byDefault = [...here].sort(newestFirst).sort((a, b) => ORDER[normaliseStatus(a.status)] - ORDER[normaliseStatus(b.status)])
+  const ranked = order.length ? rankByOrderNewFirst(byDefault, order, madeAt) : byDefault
   const rows = ranked.map<CurtainRow>(g => {
     const all = assigneesOf(g)
     const priority = normalisePriority(g.priority)
-    return { id: g.id, title: capTitle(g.title), status: normaliseStatus(g.status), priority, priorityWord: PRIORITY_WORDS[priority], due: dueDay(g.dueDate), who: all.slice(0, WHO_MAX).map(named), whoMore: Math.max(0, all.length - WHO_MAX) }
+    return { id: g.id, title: capTitle(g.title), status: normaliseStatus(g.status), priority, priorityWord: PRIORITY_WORDS[priority], due: dueDay(g.dueDate), who: all.slice(0, WHO_MAX).map(named), whoMore: Math.max(0, all.length - WHO_MAX), parentId: typeof g.parentGoalId === 'string' && GOAL_ID_RE.test(g.parentGoalId) ? g.parentGoalId : null }
   })
   const counts: Record<GoalStatus, number> = { todo: 0, done: 0, abandoned: 0 }
   for (const r of rows) counts[r.status]++

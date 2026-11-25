@@ -1,4 +1,5 @@
 import { isMine, normaliseStatus, rankGoals, assigneesOf, dueDay, type Goal, type Member } from '../../shared/goals.ts'
+import { hasVisible } from '../../shared/invisible.ts'
 import { apiError } from '../api.ts'
 import { UUID } from '../claude/crm.ts'
 import { createCrmCall, isObject } from './crm-call.ts'
@@ -22,12 +23,16 @@ const MAX_TITLE = 500
 const MAX_DESCRIPTION = 5000
 /** The same goal added again within this long, by this server, is the one already added (a retry, a chat repeating itself). */
 const DUPLICATE_MS = 10 * 60_000
+/** F-344: how far up a parent chain is walked to refuse a loop (a longer chain is refused, never guessed at). */
+const NEST_DEPTH_CAP = 64
 
 const json = (v: unknown) => JSON.stringify(v, null, 2)
 
 export interface CrmGoalsOptions {
   proxy: Pick<CrmProxy, 'request' | 'session'>
   now?: () => number
+  /** F-344: one line of ids when a goal is nested under another (never a word of a goal). */
+  log?: { info(message: string): void }
 }
 
 /** F-334-1: the floor and the agent of the chat that is making the goal. The CRM keeps them on the goal (origin_floor_id, origin_agent_id) so the goals curtain can tell which floor made it, whoever reads it. */
@@ -49,7 +54,8 @@ function words(v: unknown, what: string, max: number, required: boolean): string
   }
   if (typeof v !== 'string') throw apiError(400, `${what} must be text`)
   const t = v.trim()
-  if (!t) {
+  // a text with nothing that draws (spaces, zero-width characters) is empty: a title of it is refused like no title (the by-hand route says the same, shared/invisible.ts)
+  if (!t || !hasVisible(t)) {
     if (required) throw apiError(400, `${what} is empty`)
     return ''
   }
@@ -156,8 +162,11 @@ export function createCrmGoals(o: CrmGoalsOptions) {
   const named = (g: Pick<Goal, 'ownerId' | 'assigneeIds'>, all: readonly Member[]) =>
     assigneesOf(g).map(id => ({ userId: id, name: all.find(m => m.userId === id)?.fullName ?? 'Someone' }))
 
-  const card = (g: Goal, all: readonly Member[]) => ({
+  /** F-344: `parentGoalId` (null or the goal it is a sub-goal of) is on every card; `subGoalCount` only where the whole list is at hand (crm_goals). */
+  const card = (g: Goal, all: readonly Member[], subGoalCount?: number) => ({
     id: g.id,
+    parentGoalId: typeof g.parentGoalId === 'string' && g.parentGoalId ? g.parentGoalId : null,
+    ...(subGoalCount === undefined ? {} : { subGoalCount }),
     title: g.title,
     status: normaliseStatus(g.status),
     priority: g.priority,
@@ -193,7 +202,16 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       let assignee: string | null = null
       if (args.assignee !== undefined) assignee = person(args.assignee, who, all)
       const total = rows.length
+      // F-344: how many sub-goals each goal has (every goal the CRM lists and has switched on), and the optional `parentGoalId`: only that goal's children (walk the tree one level at a time)
+      const subs = new Map<string, number>()
+      for (const g of rows) if (typeof g.parentGoalId === 'string' && g.parentGoalId) subs.set(g.parentGoalId, (subs.get(g.parentGoalId) ?? 0) + 1)
+      let under: string | null = null
+      if (args.parentGoalId !== undefined) {
+        if (typeof args.parentGoalId !== 'string' || !ID_RE.test(args.parentGoalId.trim())) throw apiError(400, 'parentGoalId must be a goal id from crm_goals')
+        under = args.parentGoalId.trim()
+      }
       rows = rows.filter(g => {
+        if (under !== null && g.parentGoalId !== under) return false
         const s = normaliseStatus(g.status)
         if (status === 'open' || status === 'todo' ? s !== 'todo' : status !== 'all' && s !== status) return false
         if (assignee && !assigneesOf(g).includes(assignee)) return false
@@ -206,7 +224,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         matching: ranked.length,
         ofGoals: total,
         mine: ranked.filter(g => isMine(g, who.id)).length,
-        goals: ranked.slice(0, limit).map(g => card(g, all)),
+        goals: ranked.slice(0, limit).map(g => card(g, all, subs.get(g.id) ?? 0)),
         ...(ranked.length > limit ? { note: `Only the first ${limit} are shown; narrow it with query, status or assignee.` } : {}),
       })
     },
@@ -292,10 +310,36 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       if (priority) body.priority = priority
       if (args.dueDate !== undefined) body.due_date = args.dueDate === null || (typeof args.dueDate === 'string' && !args.dueDate.trim()) ? null : dayOf(args.dueDate, now())
       if (args.assignees !== undefined) body.assignee_ids = await people(args.assignees, await me())
+      // F-344: nest an EXISTING goal under another (or null / empty: out to the top). Only the owner's chats reach this tool (ADMIN_TOOLS). Refused, in fixed sentences and before anything is sent: a goal under itself, under one of its
+      // own sub-goals (the parent chain is walked from the CRM's own list, depth-capped) and a parent the CRM does not list. Nothing but parent_goal_id changes; the goal's floor (link file, origin) is not touched.
+      let nested: { under: string | null } | null = null
+      if (args.parentGoalId !== undefined) {
+        if (args.parentGoalId === null || (typeof args.parentGoalId === 'string' && !args.parentGoalId.trim())) {
+          body.parent_goal_id = null
+          nested = { under: null }
+        } else {
+          if (typeof args.parentGoalId !== 'string' || !ID_RE.test(args.parentGoalId.trim())) throw apiError(400, 'parentGoalId must be a goal id from crm_goals, or null to take the goal out of its parent')
+          const parent = args.parentGoalId.trim()
+          if (parent.toLowerCase() === id.toLowerCase()) throw apiError(400, 'A goal cannot be put under itself.')
+          const listed = await crm<Goal[] | { goals?: Goal[] }>('GET', 'v1/org/goals')
+          const byId = new Map((Array.isArray(listed) ? listed : (listed.goals ?? [])).filter(g => !g.isDisabled).map(g => [g.id.toLowerCase(), g] as const))
+          if (!byId.has(parent.toLowerCase())) throw apiError(404, 'There is no such goal to put it under: crm_goals gives the ids.')
+          // walk up from the new parent: if the goal itself is on the way, the new parent is one of its own sub-goals
+          let up: Goal | undefined = byId.get(parent.toLowerCase())
+          for (let depth = 0; up; depth++) {
+            if (depth > NEST_DEPTH_CAP) throw apiError(400, 'The goals are nested too deep to check that safely.')
+            if (up.id.toLowerCase() === id.toLowerCase()) throw apiError(400, 'That would put the goal under one of its own sub-goals.')
+            up = typeof up.parentGoalId === 'string' && up.parentGoalId ? byId.get(up.parentGoalId.toLowerCase()) : undefined
+          }
+          body.parent_goal_id = parent
+          nested = { under: parent }
+        }
+      }
       const board = await boardOf(args, 'update')
       if (board) Object.assign(body, board)
-      if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees, targetType')
+      if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees, parentGoalId, targetType')
       const got = await crm<Goal>('PATCH', `v1/org/goals/${id}`, body)
+      if (nested) o.log?.info(`goal nested: ${id.slice(0, 64)} ${nested.under === null ? 'taken out of its parent' : `under ${nested.under.slice(0, 64)}`}`)
       const all = await members().catch(() => [] as Member[])
       return json({ updated: id, goal: card(got, all) })
     },
