@@ -22,6 +22,8 @@ const ID_RE = /^[0-9a-fA-F-]{8,64}$/
 const DAY_RE = /^(\d{4})-(\d{2})-(\d{2})$/
 const MAX_TITLE = 500
 const MAX_DESCRIPTION = 5000
+/** F-354: the longest note a person adds to a goal's history (what the History shows of a comment, shared/goal-note.ts). */
+const MAX_NOTE = 500
 /** The same goal added again within this long, by this server, is the one already added (a retry, a chat repeating itself). */
 const DUPLICATE_MS = 10 * 60_000
 /** F-344: how far up a parent chain is walked to refuse a loop (a longer chain is refused, never guessed at). */
@@ -396,6 +398,21 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
       await crm<unknown>('PATCH', `v1/org/goals/${goalId}`, { is_disabled: disabled })
       o.log?.info(`goal switched ${disabled ? 'off' : 'on'}: ${goalId.slice(0, 64)}`)
+      return { ok: true }
+    },
+
+    /**
+     * F-354 (Shubham: "also when we click on the hisotyr give abiliy tto add history"): a NOTE on ONE goal, added by a PERSON from the History modal: a login check (the note is written AS the person the CRM login on
+     * this PC belongs to: only when that is who the caller expects, the first owner), then ONE POST of the CRM's own goal comment (v1/org/goals/:id/comments { content }), which the CRM also records in the goal's trail,
+     * where the History shows it. Nothing else is read or written. The text is checked again here (1 to MAX_NOTE characters that draw something). Only the route calls this: there is no chat tool for it. The log line is
+     * the goal id and a count, never a word of the note.
+     */
+    async note(goalId: string, text: string, expect: { userId: string } | null = null): Promise<{ ok: true }> {
+      if (typeof goalId !== 'string' || !ID_RE.test(goalId)) throw apiError(400, 'id is not a goal id')
+      const content = words(text, 'note', MAX_NOTE, true)!
+      if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
+      await crm<unknown>('POST', `v1/org/goals/${goalId}/comments`, { content })
+      o.log?.info(`goal note added: ${goalId.slice(0, 64)}, ${content.length} characters`)
       return { ok: true }
     },
   }

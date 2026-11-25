@@ -226,6 +226,7 @@ import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../s
 import { GOAL_EDIT_WORDS, checkGoalDisable, checkGoalEdit, checkGoalNest, isDisableBody, isNestBody, type GoalEditCode } from '../../shared/goal-edit.ts'
 import { TREE_MAX_DEPTH } from '../../shared/goal-tree.ts'
 import { HISTORY_WORDS, type HistoryCode } from '../../shared/goal-history.ts'
+import { NOTE_WORDS, checkGoalNote, type NoteCode } from '../../shared/goal-note.ts'
 import { checkOrderIds } from '../../shared/floor-goal-order.ts'
 import { GoalOrderError, createGoalOrder } from './floor-goal-order.ts'
 import { createCrmReads } from './crm-reads.ts'
@@ -6707,6 +6708,37 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /**
+   * F-354 (Shubham: "also when we click on the hisotyr give abiliy tto add history"): POST /floors/<floor>/goals/<goal>/notes { note } -> { ok }: a NOTE added to ONE goal's history BY HAND, from the History modal, in the
+   * REAL CRM as the person signed in to it on this PC (the CRM's own goal comment, which it also records in the goal's trail). In this order, and every step BEFORE the CRM is called: a chat's key, a machine token and every
+   * caller who is not a signed-in CRM person are refused (humanOnly), every administrator who is not the first owner by id (firstOwnerOnly), a floor id that is not well formed or not a floor of this app (404), a goal id
+   * that is not a goal id (404), a body that is not exactly { note } of 1 to NOTE_MAX characters that draw something (400 note-text), and a goal that is not LINKED to THIS floor in the app's own link file (400 note-not-here:
+   * the page's word is never trusted). Then ONE crmGoals.note with the CRM login checked to be the first owner's own (409 note-signin-other, nothing sent). Every refusal is one fixed sentence with a code
+   * (shared/goal-note.ts): the CRM's own words and the typed note are never in an answer, an error or a log line; the log line is the floor id, the goal id, a count of characters and the time.
+   */
+  async function noteGoalByHand(r: MountRequest, floorId: string, goalId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+    floorOf(floorId)
+    if (!GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
+    const refuse = (status: number, code: NoteCode) => Object.assign(apiError(status, NOTE_WORDS[code]), { code })
+    const checked = checkGoalNote(r.body)
+    if (!checked.ok) throw refuse(400, 'note-text')
+    const links = goalFloors.links()
+    if (!Object.hasOwn(links, goalId) || links[goalId] !== floorId) throw refuse(400, 'note-not-here')
+    const t = Date.now()
+    try {
+      await crmGoals.note(goalId, checked.value.note, { userId: SBSKRRT_ID })
+    } catch (e) {
+      if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'note-signin-other')
+      const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+      throw status === 409 ? refuse(409, 'note-signin') : status === 404 ? refuse(404, 'note-gone') : status >= 400 && status < 500 ? refuse(400, 'note-refused') : refuse(502, 'note-down')
+    }
+    o.log?.info(`goal note added by hand: floor ${floorId.slice(0, 64)}, goal ${goalId.slice(0, 64)}, ${checked.value.note.length} characters, ${Date.now() - t} ms`)
+    return { ok: true }
+  }
+
+  /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
    * the approvals and send-as-me routes) and the owner of the app; the version he was shown; once. A hand-off card is typed as an order marked "he
    * tapped Send" (and never arms the spoken latch: he confirmed it); a relay card carries out the held message as the Orchestrator's chat. The
@@ -9595,6 +9627,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-344b (his "add edit goals also"; "the view history button also with each task"): a goal changed by hand, and a goal's history read. The owner's page only; every check comes before the CRM is called; the history route only ever reads.
     ['PATCH', /^\/floors\/([^/]+)\/goals\/([^/]+)$/, ([floorId, goalId], r) => editGoalByHand(r, floorId, goalId)],
     ['GET', /^\/floors\/([^/]+)\/goals\/([^/]+)\/history$/, ([floorId, goalId], r) => goalHistory(r, floorId, goalId)],
+    // F-354 (his "also when we click on the hisotyr give abiliy tto add history"): a note added to a goal's history by hand, from the History modal. The owner's page only; every check comes before the CRM is called (noteGoalByHand).
+    ['POST', /^\/floors\/([^/]+)\/goals\/([^/]+)\/notes$/, ([floorId, goalId], r) => noteGoalByHand(r, floorId, goalId)],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).
