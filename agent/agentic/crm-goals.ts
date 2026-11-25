@@ -1,4 +1,5 @@
 import { isMine, normaliseStatus, rankGoals, assigneesOf, dueDay, type Goal, type Member } from '../../shared/goals.ts'
+import { mapHistory, type History } from '../../shared/goal-history.ts'
 import { hasVisible } from '../../shared/invisible.ts'
 import { apiError } from '../api.ts'
 import { UUID } from '../claude/crm.ts'
@@ -294,7 +295,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     },
 
     /** Changes one goal: only what is sent changes. `abandoned` takes a goal off the board and keeps it; nothing here deletes a goal. */
-    async update(args: Record<string, unknown>): Promise<string> {
+    async update(args: Record<string, unknown>, expect: { userId: string } | null = null): Promise<string> {
       const id = typeof args.id === 'string' ? args.id.trim() : ''
       if (!ID_RE.test(id)) throw apiError(400, 'id is missing or not a goal id: crm_goals gives it')
       const body: Record<string, unknown> = {}
@@ -338,10 +339,20 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       const board = await boardOf(args, 'update')
       if (board) Object.assign(body, board)
       if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees, parentGoalId, targetType')
+      // F-344b: a goal a PERSON changes by hand is changed as the person the CRM login on this PC belongs to (the same check as adding by hand): only when that is who the caller expects (the first owner). Nothing is sent otherwise.
+      if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
       const got = await crm<Goal>('PATCH', `v1/org/goals/${id}`, body)
       if (nested) o.log?.info(`goal nested: ${id.slice(0, 64)} ${nested.under === null ? 'taken out of its parent' : `under ${nested.under.slice(0, 64)}`}`)
       const all = await members().catch(() => [] as Member[])
       return json({ updated: id, goal: card(got, all) })
+    },
+
+    /** F-344b / F-346: what happened to ONE goal, from the CRM's own trail (a login check, then one GET; nothing written); the answer is shared/goal-history.ts mapHistory (plain sentences, cleaned and capped, at most 100). */
+    async history(goalId: string, expect: { userId: string } | null = null): Promise<History> {
+      if (typeof goalId !== 'string' || !ID_RE.test(goalId)) throw apiError(400, 'id is not a goal id')
+      // Agent 14's read: the trail is read with the PC's CRM login, which may be another person's (F-342 keeps a good login): the owner's page reads it only while that login is the owner's own
+      if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
+      return mapHistory(await crm<unknown>('GET', `v1/org/goals/${goalId}/activity`))
     },
   }
 }

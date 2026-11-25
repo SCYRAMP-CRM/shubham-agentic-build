@@ -207,8 +207,10 @@ import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
-import { LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
+import { GOAL_ID_RE, LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
 import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../shared/goal-add.ts'
+import { GOAL_EDIT_WORDS, checkGoalEdit, type GoalEditCode } from '../../shared/goal-edit.ts'
+import { HISTORY_WORDS, type HistoryCode } from '../../shared/goal-history.ts'
 import { checkOrderIds } from '../../shared/floor-goal-order.ts'
 import { GoalOrderError, createGoalOrder } from './floor-goal-order.ts'
 import { createCrmReads } from './crm-reads.ts'
@@ -5885,6 +5887,78 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /**
+   * F-344b (Shubham: "add edit goals also"): PATCH /floors/<floor>/goals/<goal> { title?, description?, priority?, status?, dueDate? } -> { ok, goal }: a goal changed BY HAND in the goals curtain, in the REAL CRM as the person
+   * signed in to it on this PC. In this order, and every step BEFORE the CRM is called: a chat's key, a machine token and every caller who is not a signed-in CRM person are refused (humanOnly), every administrator who is not the
+   * first owner by id (firstOwnerOnly), a floor id that is not well formed or not a floor of this app (404), a goal id that is not a goal id (404), a body that is not at least one of exactly those keys with their limits and a due
+   * date that is a real day (400 goal-text), and a goal that is not LINKED to THIS floor in the app's own link file (400 goal-not-here: the page's word is never trusted). Then ONE crmGoals.update with the CRM login checked to be the
+   * first owner's own (the same check as adding by hand: 409 goal-signin-other, nothing sent). The one other caller of crmGoals.update is the chat tool. Every refusal is one fixed sentence with a code (shared/goal-edit.ts): the
+   * CRM's own words and the typed text are never in an answer, an error or a log line; the log line is the floor id, the goal id, the NAMES of the fields and the time.
+   */
+  async function editGoalByHand(r: MountRequest, floorId: string, goalId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+    floorOf(floorId)
+    if (!GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
+    const refuse = (status: number, code: GoalEditCode) => Object.assign(apiError(status, GOAL_EDIT_WORDS[code]), { code })
+    const checked = checkGoalEdit(r.body)
+    if (!checked.ok) throw refuse(400, 'goal-text')
+    const fields = checked.value
+    try {
+      if (fields.dueDate) dayOf(fields.dueDate, Date.now())
+    } catch {
+      throw refuse(400, 'goal-text')
+    }
+    const links = goalFloors.links()
+    if (!Object.hasOwn(links, goalId) || links[goalId] !== floorId) throw refuse(400, 'goal-not-here')
+    const t = Date.now()
+    let out: string
+    try {
+      out = await crmGoals.update({ id: goalId, ...fields }, { userId: SBSKRRT_ID })
+    } catch (e) {
+      if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'goal-signin-other')
+      const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+      throw status === 409 ? refuse(409, 'goal-signin') : status === 404 ? refuse(404, 'goal-gone') : status >= 400 && status < 500 ? refuse(400, 'goal-refused') : refuse(502, 'goal-down')
+    }
+    let goal: unknown = null
+    try {
+      const answer: unknown = JSON.parse(out)
+      if (isObject(answer)) goal = answer.goal ?? null
+    } catch {
+      // an answer that is not JSON: the goal was changed all the same
+    }
+    o.log?.info(`goal changed by hand: floor ${floorId.slice(0, 64)}, goal ${goalId.slice(0, 64)}, fields ${Object.keys(fields).join(',')}, ${Date.now() - t} ms`)
+    return { ok: true, goal }
+  }
+
+  /**
+   * F-344b / F-346 (Shubham: "the view history button also with each task"): GET /floors/<floor>/goals/<goal>/history -> { events, older }: what happened to ONE goal, read from the CRM's own trail (the one GET
+   * v1/org/goals/<id>/activity; nothing is ever written). The same checks first as editing (humanOnly, the first owner, the floor, the goal id's shape, the goal LINKED to THIS floor: 400 history-not-here), so a refusal
+   * sends no request. The answer is shared/goal-history.ts mapHistory: plain sentences, other people's words cleaned and capped, at most 100 events, never the CRM's metadata. A failure is one fixed sentence with a code
+   * (history-signin 409, history-gone 404, history-down 502), never the CRM's words. The log line is the floor id, the goal id, a count and the time.
+   */
+  async function goalHistory(r: MountRequest, floorId: string, goalId: string) {
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
+    if (!LINK_ID_RE.test(floorId)) throw apiError(404, 'No such floor')
+    floorOf(floorId)
+    if (!GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
+    const refuse = (status: number, code: HistoryCode) => Object.assign(apiError(status, HISTORY_WORDS[code]), { code })
+    const links = goalFloors.links()
+    if (!Object.hasOwn(links, goalId) || links[goalId] !== floorId) throw refuse(400, 'history-not-here')
+    const t = Date.now()
+    try {
+      const history = await crmGoals.history(goalId, { userId: SBSKRRT_ID })
+      o.log?.info(`goal history read: floor ${floorId.slice(0, 64)}, goal ${goalId.slice(0, 64)}, ${history.events.length} events, ${Date.now() - t} ms`)
+      return history
+    } catch (e) {
+      if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'history-signin-other')
+      const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
+      throw status === 409 ? refuse(409, 'history-signin') : status === 404 ? refuse(404, 'history-gone') : refuse(502, 'history-down')
+    }
+  }
+
+  /**
    * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
    * the approvals and send-as-me routes) and the owner of the app; the version he was shown; once. A hand-off card is typed as an order marked "he
    * tapped Send" (and never arms the spoken latch: he confirmed it); a relay card carries out the held message as the Orchestrator's chat. The
@@ -6885,7 +6959,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return out
       }
       case 'crm_goal_update': {
-        const out = await crmGoals.update(args)
+        // F-344b (Agent 14's read): a goal is changed AS the person the CRM login on this PC belongs to; F-342 keeps another person's good login, so the owner's chat only changes goals while that login is the owner's own (the same check as the hand routes; 409 and nothing sent otherwise)
+        const out = await crmGoals.update(args, { userId: SBSKRRT_ID })
         log?.info(`${agent.name} changed a CRM goal`)
         return out
       }
@@ -8703,6 +8778,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['PUT', /^\/floors\/([^/]+)\/goal-order$/, ([floorId], r) => saveGoalOrder(r, floorId)],
     // F-343 (his "yes please do it"): a goal added by hand in a floor's goals curtain. The owner's page only; every check comes before the CRM is called (addGoalByHand); the ONE other caller of crmGoals.add is the chat tool.
     ['POST', /^\/floors\/([^/]+)\/goals$/, ([floorId], r) => addGoalByHand(r, floorId)],
+    // F-344b (his "add edit goals also"; "the view history button also with each task"): a goal changed by hand, and a goal's history read. The owner's page only; every check comes before the CRM is called; the history route only ever reads.
+    ['PATCH', /^\/floors\/([^/]+)\/goals\/([^/]+)$/, ([floorId, goalId], r) => editGoalByHand(r, floorId, goalId)],
+    ['GET', /^\/floors\/([^/]+)\/goals\/([^/]+)\/history$/, ([floorId, goalId], r) => goalHistory(r, floorId, goalId)],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).

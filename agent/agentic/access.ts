@@ -116,6 +116,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PUT', /^\/floors\/([^/]+)\/goal-order$/, OWNER],
   // F-343: a goal added by hand in the goals curtain (the owner's page only; the route asks for a signed-in human and the first owner by id before it touches the CRM).
   ['POST', /^\/floors\/([^/]+)\/goals$/, OWNER],
+  // F-344b: a goal changed by hand (the Edit goal form) and a goal's history read (the History modal): the owner's page only; the routes ask for a signed-in human and the first owner by id before the CRM is touched.
+  ['PATCH', /^\/floors\/([^/]+)\/goals\/([^/]+)$/, OWNER],
+  ['GET', /^\/floors\/([^/]+)\/goals\/([^/]+)\/history$/, OWNER],
   ['GET', /^\/offline-chats$/, SIGNED],
   // F-211: the conversations' copy in the CRM drive, chat by chat (the owner of the app only).
   ['GET', /^\/conversations-drive$/, OWNER],
