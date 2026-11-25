@@ -215,7 +215,8 @@ import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
 import { GOAL_ID_RE, LINK_ID_RE, goalIdOfAnswer } from '../../shared/goal-floors.ts'
 import { BY_HAND, GOAL_ADD_WORDS, checkGoalAdd, type GoalAddCode } from '../../shared/goal-add.ts'
-import { GOAL_EDIT_WORDS, checkGoalEdit, type GoalEditCode } from '../../shared/goal-edit.ts'
+import { GOAL_EDIT_WORDS, checkGoalEdit, checkGoalNest, isNestBody, type GoalEditCode } from '../../shared/goal-edit.ts'
+import { TREE_MAX_DEPTH } from '../../shared/goal-tree.ts'
 import { HISTORY_WORDS, type HistoryCode } from '../../shared/goal-history.ts'
 import { checkOrderIds } from '../../shared/floor-goal-order.ts'
 import { GoalOrderError, createGoalOrder } from './floor-goal-order.ts'
@@ -6185,6 +6186,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * date that is a real day (400 goal-text), and a goal that is not LINKED to THIS floor in the app's own link file (400 goal-not-here: the page's word is never trusted). Then ONE crmGoals.update with the CRM login checked to be the
    * first owner's own (the same check as adding by hand: 409 goal-signin-other, nothing sent). The one other caller of crmGoals.update is the chat tool. Every refusal is one fixed sentence with a code (shared/goal-edit.ts): the
    * CRM's own words and the typed text are never in an answer, an error or a log line; the log line is the floor id, the goal id, the NAMES of the fields and the time.
+   * F-353 (Shubham: "in the lat g the nesting of goals shoudl wokr on drag and drop ok"): the same route takes ONE other request, exactly { parentGoalId } (the goal this one goes under, or null: the top level), after the same
+   * checks: the goal AND the parent must be LINKED to THIS floor (400 goal-parent-not-here), never under itself (400 goal-nest-loop); then the same ONE crmGoals.update (same login check), which also refuses an own
+   * sub-goal (goal-nest-loop), a parent that is not listed (404 goal-nest-gone) and a result deeper than TREE_MAX_DEPTH levels (goal-nest-deep), each with its own fixed sentence.
    */
   async function editGoalByHand(r: MountRequest, floorId: string, goalId: string) {
     humanOnly(r)
@@ -6193,22 +6197,41 @@ export function createAgentic(o: AgenticOptions): Agentic {
     floorOf(floorId)
     if (!GOAL_ID_RE.test(goalId)) throw apiError(404, 'No such goal')
     const refuse = (status: number, code: GoalEditCode) => Object.assign(apiError(status, GOAL_EDIT_WORDS[code]), { code })
-    const checked = checkGoalEdit(r.body)
-    if (!checked.ok) throw refuse(400, 'goal-text')
-    const fields = checked.value
+    // F-353: the ONE other request of this route is exactly { parentGoalId } (a goal of THIS floor, or null: the top level); it is never mixed with the edit keys
+    const nesting = isNestBody(r.body)
+    let fields: Record<string, unknown>
+    if (nesting) {
+      const n = checkGoalNest(r.body)
+      if (!n.ok) throw refuse(400, 'goal-text')
+      fields = { ...n.value }
+    } else {
+      const checked = checkGoalEdit(r.body)
+      if (!checked.ok) throw refuse(400, 'goal-text')
+      fields = { ...checked.value }
+    }
     try {
-      if (fields.dueDate) dayOf(fields.dueDate, Date.now())
+      if (typeof fields.dueDate === 'string' && fields.dueDate) dayOf(fields.dueDate, Date.now())
     } catch {
       throw refuse(400, 'goal-text')
     }
     const links = goalFloors.links()
     if (!Object.hasOwn(links, goalId) || links[goalId] !== floorId) throw refuse(400, 'goal-not-here')
+    if (nesting) {
+      // a goal under itself, and a parent that is not one of THIS floor's own goals, are refused here, before the CRM (the page's word is never trusted)
+      const parent = fields.parentGoalId
+      if (typeof parent === 'string') {
+        if (parent.toLowerCase() === goalId.toLowerCase()) throw refuse(400, 'goal-nest-loop')
+        if (!Object.hasOwn(links, parent) || links[parent] !== floorId) throw refuse(400, 'goal-parent-not-here')
+      }
+    }
     const t = Date.now()
     let out: string
     try {
-      out = await crmGoals.update({ id: goalId, ...fields }, { userId: SBSKRRT_ID })
+      out = await crmGoals.update({ id: goalId, ...fields }, nesting ? { userId: SBSKRRT_ID, maxLevels: TREE_MAX_DEPTH } : { userId: SBSKRRT_ID })
     } catch (e) {
       if (isObject(e) && e.code === 'crm-other-person') throw refuse(409, 'goal-signin-other')
+      // F-353: the CRM list's own refusals of a nesting (a cycle, too deep, the new parent gone) carry a code: each has its own fixed sentence
+      if (nesting && isObject(e) && (e.code === 'nest-loop' || e.code === 'nest-deep' || e.code === 'nest-gone')) throw e.code === 'nest-gone' ? refuse(404, 'goal-nest-gone') : refuse(400, e.code === 'nest-deep' ? 'goal-nest-deep' : 'goal-nest-loop')
       const status = isObject(e) && typeof e.status === 'number' ? e.status : 0
       throw status === 409 ? refuse(409, 'goal-signin') : status === 404 ? refuse(404, 'goal-gone') : status >= 400 && status < 500 ? refuse(400, 'goal-refused') : refuse(502, 'goal-down')
     }

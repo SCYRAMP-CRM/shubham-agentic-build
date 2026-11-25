@@ -127,6 +127,79 @@ export function dropAmongSiblings<T extends TreeInput>(flat: readonly string[], 
   return next.every((x, i) => x === flat[i]) ? null : next
 }
 
+// ---- F-353 (Shubham: "in the lat g the nesting of goals shoudl wokr on drag and drop ok"): putting a goal under another by hand, or taking it out to the top level. PURE: what a drop may do and which flat order a drop among
+// siblings makes. The page asks it while a goal is carried (nothing lights up for a refused place) and again for the keyboard's Move in / Move out; the CRM list is checked again on the server.
+
+/** Why a goal may not be put there: the goal or the new parent is not on the list, a goal under itself, under one of its own sub-goals (a cycle), where it already is, or so deep that something would land below level TREE_MAX_DEPTH. */
+export type NestRefusal = 'unknown' | 'self' | 'own-sub-goal' | 'same' | 'deep'
+
+/**
+ * May `id` become a sub-goal of `targetId` (null: the top level)? `all` is EVERY goal the page has (not only the ones on show: a done sub-goal still counts for the depth and the cycle). The goal lands one level under
+ * its new parent, and its own sub-goals under it, so `levels above the target + 1 + the height of the goal's own tree` must not pass `maxLevels`. Null: it may.
+ */
+export function nestRefusal(all: readonly TreeInput[], id: string, targetId: string | null, maxLevels: number = TREE_MAX_DEPTH): NestRefusal | null {
+  const byId = new Map<string, TreeInput>(all.map(g => [g.id, g]))
+  const me = byId.get(id)
+  if (!me) return 'unknown'
+  if (targetId === null) return me.parentId === null ? 'same' : null
+  const target = byId.get(targetId)
+  if (!target) return 'unknown'
+  if (targetId === id) return 'self'
+  if (me.parentId === targetId) return 'same'
+  // up from the target: the goal itself on the way means the target is one of its own sub-goals; the number of goals on the way is the target's level
+  let above = 0
+  const seen = new Set<string>([targetId])
+  for (let up = target.parentId === null ? undefined : byId.get(target.parentId); up; up = up.parentId === null ? undefined : byId.get(up.parentId)) {
+    if (up.id === id) return 'own-sub-goal'
+    // a loop already in the data cannot be measured: refused, never guessed at
+    if (seen.has(up.id) || above > 64) return 'deep'
+    seen.add(up.id)
+    above++
+  }
+  // down from the goal: how many levels its own sub-goals take (0: none)
+  const kids = new Map<string, string[]>()
+  for (const g of all) if (g.parentId !== null && g.parentId !== g.id) kids.set(g.parentId, [...(kids.get(g.parentId) ?? []), g.id])
+  let height = 0
+  const walked = new Set<string>([id])
+  let level = kids.get(id) ?? []
+  while (level.length > 0 && height <= 64) {
+    height++
+    const next: string[] = []
+    for (const k of level) {
+      if (walked.has(k)) continue
+      walked.add(k)
+      next.push(...(kids.get(k) ?? []))
+    }
+    level = next
+  }
+  return above + 1 + height > maxLevels ? 'deep' : null
+}
+
+/** What a drop in the curtain's list can mean: put INSIDE a row, BESIDE a row (before or after it), or at the END (below the last row). The same shape the pointer engine reports (src/goals/nest.ts Drop). */
+export type CurtainDrop = { kind: 'into'; target: string } | { kind: 'beside'; target: string; side: 'before' | 'after' } | { kind: 'end' }
+
+/**
+ * A drop BESIDE a row (or at the end) as a reorder: the new flat order when the carried goal and that row are SIBLINGS, else null (a goal never changes level by a line between rows: that is the highlighted row or the
+ * top-level strip). "After" a row is "before the sibling that follows it" (the end when it is the last). Null too when the goal would land where it was.
+ */
+export function dropBesideRow<T extends TreeInput>(flat: readonly string[], rows: readonly T[], id: string, d: CurtainDrop): string[] | null {
+  if (d.kind === 'into') return null
+  if (d.kind === 'end') return dropAmongSiblings(flat, rows, id, null)
+  if (d.target === id) return null
+  const others = siblingsOf(rows, id).map(r => r.id).filter(x => x !== id)
+  const at = others.indexOf(d.target)
+  if (at < 0) return null
+  return dropAmongSiblings(flat, rows, id, d.side === 'before' ? d.target : (others[at + 1] ?? null))
+}
+
+/** The sentence of a goal put under another, or taken out to the top level: fixed words around the two titles (text, never markup), each cut as a row's title is. */
+export function nestedWords(title: string, parentTitle: string | null): string {
+  const t = capTitle(title) || 'The goal'
+  return parentTitle === null ? `Moved ${t} to the top level.` : `Moved ${t} under ${capTitle(parentTitle) || 'another goal'}.`
+}
+/** How long the Undo line stays. */
+export const NEST_UNDO_MS = 8000
+
 /** The rows drawn directly under `parentId` (null: the top level), in list order. */
 export function childrenOf<T extends TreeInput>(rows: readonly T[], parents: ReadonlyMap<string, string | null>, parentId: string | null): T[] {
   return rows.filter(r => (parents.get(r.id) ?? null) === parentId)

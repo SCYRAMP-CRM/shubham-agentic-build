@@ -3,12 +3,13 @@
 // way the one text field of the form is made from a goal's title and details and back. The route is agent/agentic/index.ts editGoalByHand; the form is src/chat/AddGoalForm.tsx in its edit mode.
 
 import { GOAL_ADD_WORDS, GOAL_DESCRIPTION_MAX, GOAL_PRIORITIES, GOAL_TITLE_MAX, goalFromText, type GoalPriority } from './goal-add.ts'
+import { GOAL_ID_RE } from './goal-floors.ts'
 import { hasVisible } from './invisible.ts'
 
 /** The statuses the CRM keeps for a goal. */
 export const GOAL_STATUSES = ['todo', 'done', 'abandoned'] as const
 export type GoalEditStatus = (typeof GOAL_STATUSES)[number]
-/** The exact keys of the request: nothing else is accepted (not the floor, the agent, the assignees, the parent: those are not changed from here). */
+/** The exact keys of the request: nothing else is accepted (not the floor, the agent, the assignees: those are not changed from here; the parent is changed only by its own request, GoalNest, never beside these keys). */
 export const GOAL_EDIT_KEYS = ['title', 'description', 'priority', 'status', 'dueDate'] as const
 
 /**
@@ -22,8 +23,28 @@ export interface GoalEdit {
   dueDate?: string
 }
 
+/**
+ * F-353 (Shubham: "in the lat g the nesting of goals shoudl wokr on drag and drop ok"): the ONE other request the same route takes: exactly `{ parentGoalId }`, the goal this one is to be a sub-goal of, or null for the top
+ * level. Never mixed with the keys above (the edit form cannot change the parent, a drag cannot change the text).
+ */
+export interface GoalNest {
+  parentGoalId: string | null
+}
+/** True for a request that names `parentGoalId` at all (then it is a nesting request and nothing else). */
+export const isNestBody = (body: unknown): boolean => typeof body === 'object' && body !== null && !Array.isArray(body) && Object.hasOwn(body, 'parentGoalId')
+export type GoalNestChecked = { ok: true; value: GoalNest } | { ok: false }
+/** The nesting request as the route takes it: an object with exactly the one key, a goal id (the CRM's own id shape) or null. */
+export function checkGoalNest(body: unknown): GoalNestChecked {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { ok: false }
+  const keys = Object.keys(body)
+  if (keys.length !== 1 || keys[0] !== 'parentGoalId') return { ok: false }
+  const v = (body as { parentGoalId?: unknown }).parentGoalId
+  if (v === null) return { ok: true, value: { parentGoalId: null } }
+  return typeof v === 'string' && GOAL_ID_RE.test(v) ? { ok: true, value: { parentGoalId: v } } : { ok: false }
+}
+
 /** The fixed sentences. `code` is what the route answers with; the page shows only these. The sign-in and refusal ones are the add form's own words. */
-export const GOAL_EDIT_CODES = ['goal-text', 'goal-signin', 'goal-signin-other', 'goal-not-here', 'goal-gone', 'goal-refused', 'goal-down'] as const
+export const GOAL_EDIT_CODES = ['goal-text', 'goal-signin', 'goal-signin-other', 'goal-not-here', 'goal-gone', 'goal-refused', 'goal-down', 'goal-parent-not-here', 'goal-nest-loop', 'goal-nest-deep', 'goal-nest-gone'] as const
 export type GoalEditCode = (typeof GOAL_EDIT_CODES)[number]
 export const GOAL_EDIT_WORDS: Record<GoalEditCode, string> = {
   'goal-text': GOAL_ADD_WORDS['goal-text'],
@@ -33,6 +54,10 @@ export const GOAL_EDIT_WORDS: Record<GoalEditCode, string> = {
   'goal-gone': 'That goal is not in the CRM any more. Nothing was changed.',
   'goal-refused': 'The CRM did not accept that change. Nothing was changed; check it and try again.',
   'goal-down': "The CRM can't be reached right now. Nothing was changed; try again.",
+  'goal-parent-not-here': "That goal is not one of this floor's goals, so nothing can be put under it here. Nothing was changed.",
+  'goal-nest-loop': 'A goal cannot go under itself or under one of its own sub-goals. Nothing was changed.',
+  'goal-nest-deep': 'That would nest the goals deeper than the curtain shows. Nothing was changed.',
+  'goal-nest-gone': 'The goal to put it under is not in the CRM any more. Nothing was changed.',
 }
 export const GOAL_EDIT_OTHER = 'The goal could not be changed.'
 export const GOAL_EDITED = 'Saved.'

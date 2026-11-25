@@ -295,9 +295,17 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     },
 
     /** Changes one goal: only what is sent changes. `abandoned` takes a goal off the board and keeps it; nothing here deletes a goal. */
-    async update(args: Record<string, unknown>, expect: { userId: string } | null = null): Promise<string> {
+    async update(args: Record<string, unknown>, expect: { userId: string; maxLevels?: number } | null = null): Promise<string> {
       const id = typeof args.id === 'string' ? args.id.trim() : ''
       if (!ID_RE.test(id)) throw apiError(400, 'id is missing or not a goal id: crm_goals gives it')
+      // F-344b: a goal a PERSON changes by hand is changed as the person the CRM login on this PC belongs to (the same check as adding by hand): only when that is who the caller expects (the first owner). Nothing is sent
+      // otherwise. F-353: a nesting asks it BEFORE the list of goals is read too (another person's kept login reads nothing for this); it is asked once.
+      let loginChecked = expect === null
+      const checkLogin = async () => {
+        if (loginChecked || expect === null) return
+        if ((await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
+        loginChecked = true
+      }
       const body: Record<string, unknown> = {}
       const title = words(args.title, 'title', MAX_TITLE, false)
       if (title !== undefined) {
@@ -321,16 +329,39 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         } else {
           if (typeof args.parentGoalId !== 'string' || !ID_RE.test(args.parentGoalId.trim())) throw apiError(400, 'parentGoalId must be a goal id from crm_goals, or null to take the goal out of its parent')
           const parent = args.parentGoalId.trim()
-          if (parent.toLowerCase() === id.toLowerCase()) throw apiError(400, 'A goal cannot be put under itself.')
+          // F-353: each refusal carries a `code` (nest-loop, nest-deep, nest-gone): the hand route (editGoalByHand) answers with its own fixed sentence for it, never this one's words
+          const refuseNest = (status: number, text: string, code: 'nest-loop' | 'nest-deep' | 'nest-gone') => Object.assign(apiError(status, text), { code })
+          if (parent.toLowerCase() === id.toLowerCase()) throw refuseNest(400, 'A goal cannot be put under itself.', 'nest-loop')
+          await checkLogin()
           const listed = await crm<Goal[] | { goals?: Goal[] }>('GET', 'v1/org/goals')
           const byId = new Map((Array.isArray(listed) ? listed : (listed.goals ?? [])).filter(g => !g.isDisabled).map(g => [g.id.toLowerCase(), g] as const))
-          if (!byId.has(parent.toLowerCase())) throw apiError(404, 'There is no such goal to put it under: crm_goals gives the ids.')
-          // walk up from the new parent: if the goal itself is on the way, the new parent is one of its own sub-goals
+          if (!byId.has(parent.toLowerCase())) throw refuseNest(404, 'There is no such goal to put it under: crm_goals gives the ids.', 'nest-gone')
+          // walk up from the new parent: if the goal itself is on the way, the new parent is one of its own sub-goals; `levels` counts the goals on the way (the new parent's level is levels - 1)
           let up: Goal | undefined = byId.get(parent.toLowerCase())
-          for (let depth = 0; up; depth++) {
-            if (depth > NEST_DEPTH_CAP) throw apiError(400, 'The goals are nested too deep to check that safely.')
-            if (up.id.toLowerCase() === id.toLowerCase()) throw apiError(400, 'That would put the goal under one of its own sub-goals.')
+          let levels = 0
+          for (; up; levels++) {
+            if (levels > NEST_DEPTH_CAP) throw refuseNest(400, 'The goals are nested too deep to check that safely.', 'nest-deep')
+            if (up.id.toLowerCase() === id.toLowerCase()) throw refuseNest(400, 'That would put the goal under one of its own sub-goals.', 'nest-loop')
             up = typeof up.parentGoalId === 'string' && up.parentGoalId ? byId.get(up.parentGoalId.toLowerCase()) : undefined
+          }
+          // F-353: a goal put there by hand may not take anything below `maxLevels` (the curtain draws three levels): the new parent's level + 1 + the height of the goal's own sub-goals
+          if (expect?.maxLevels !== undefined) {
+            const kids = new Map<string, string[]>()
+            for (const g of byId.values()) if (typeof g.parentGoalId === 'string' && g.parentGoalId) kids.set(g.parentGoalId.toLowerCase(), [...(kids.get(g.parentGoalId.toLowerCase()) ?? []), g.id.toLowerCase()])
+            let height = 0
+            const walked = new Set<string>([id.toLowerCase()])
+            let level = kids.get(id.toLowerCase()) ?? []
+            while (level.length > 0 && height <= NEST_DEPTH_CAP) {
+              height++
+              const next: string[] = []
+              for (const k of level) {
+                if (walked.has(k)) continue
+                walked.add(k)
+                next.push(...(kids.get(k) ?? []))
+              }
+              level = next
+            }
+            if (levels + height > expect.maxLevels) throw refuseNest(400, 'That would nest the goals deeper than the curtain shows.', 'nest-deep')
           }
           body.parent_goal_id = parent
           nested = { under: parent }
@@ -339,8 +370,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       const board = await boardOf(args, 'update')
       if (board) Object.assign(body, board)
       if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees, parentGoalId, targetType')
-      // F-344b: a goal a PERSON changes by hand is changed as the person the CRM login on this PC belongs to (the same check as adding by hand): only when that is who the caller expects (the first owner). Nothing is sent otherwise.
-      if (expect !== null && (await me()).id.toLowerCase() !== expect.userId.toLowerCase()) throw Object.assign(apiError(409, 'The CRM on this PC is signed in as someone else.'), { code: 'crm-other-person' })
+      await checkLogin()
       const got = await crm<Goal>('PATCH', `v1/org/goals/${id}`, body)
       if (nested) o.log?.info(`goal nested: ${id.slice(0, 64)} ${nested.under === null ? 'taken out of its parent' : `under ${nested.under.slice(0, 64)}`}`)
       const all = await members().catch(() => [] as Member[])
