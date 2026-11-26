@@ -2246,6 +2246,23 @@ mode, a setting the hub keeps. Types: `shared/crm.ts`. Shubham's words: the CRM 
   502 naming the host and the cause. The cookie, the CSRF token and the session are never logged and never in an answer.
   It is an `ApiMount` `raw` route (`agent/api.ts`: an optional `raw?(rest, url)` hook before the JSON handling),
   `/agentic/crm-proxy/*`, local to this PC (not passed to the hub: each PC has its own session).
+- **One wait for every call to the CRM (F-371, 26 Nov 2026)** (`agent/claude/crm-cooldown.ts`). The CRM's firewall (an AWS WAF rule, 300 requests a minute for ALL callers together) answered 429 to everyone and counts what it blocks, so
+  a caller that asks again at once keeps it shut, and this app was one: every reader of the CRM drive that met a refusal asked two or three more times, a dozen sessions polled `claude-access/me`, and each conversation copy asked again.
+  Now ONE module-wide cooldown: TWO busy answers (429 or 503) within 10 s from at least TWO DIFFERENT paths (a path without its query or ids; one route's own 503, such as an AI or email provider the CRM relays being down, is not the CRM's
+  trouble and stops nothing; a firewall storm answers every path and starts it at once) mean no call to it is sent until a time T (its `Retry-After`, seconds or an HTTP date, clamped to 1 s .. 5 min; else 30 s, doubling for each further 429
+  that comes after a wait, to 5 min; the probe that follows a wait is judged alone: one busy answer restarts the wait, doubled). A busy answer for a request that STARTED before the last wait ended (a slow one, in flight) is ignored: it
+  cannot double a wait it was not part of. The sign-in route `/v1/auth/login` is OUTSIDE this wait both ways (the CRM's login limit answers 429 per ACCOUNT, so a stranger who knows a username could otherwise stall every CRM call of the app and
+  slip past the app's own five-a-minute throttle): this wait never gates it and what it answers never starts or ends this wait; `/v1/auth/me` and the others are gated like any path. But a sign-in that is outside every wait and uncounted when busy would
+  let a visitor, a CRM-page call through the proxy or a stale-password retry loop send unlimited calls to a CRM that is answering busy (and the firewall counts what it blocks), so sign-in has a wait of ITS OWN, a separate instance (`crmLoginCooldown`,
+  `withCooldown(f, cd, login)`: which cooldown is asked is the only difference): ONE busy answer from the one path starts it, 10 s doubling to 60 s (its `Retry-After` is honoured up to 60 s), any other answer (a 401 too) ends it and starts over, one
+  sign-in probes after the wait and the rest are answered locally; it never touches the global wait and the global wait never gates it (about six sign-ins a minute at most in a storm; one log line at its start and one at its end,
+  "sign-in calls"). Every call before T is answered at once, locally, with a 429 (an empty JSON body and a `Retry-After`, header `x-sad-cooldown: 1`), so each caller says what it already says for a CRM refusal, and NOTHING goes over the
+  network. After T ONE call goes out as a probe and the rest are answered locally until its answer comes. Any answer that is not 429/503 (a 2xx, but also a 401 or a 404: the CRM is answering) ends it; a 401 is never a cooldown. One log
+  line when a wait starts and one when it ends (`crm:`), never one per call. The three files that fetch from the CRM go through it (`claude/crm.ts` call(), `agentic/crmproxy.ts`, `agentic/views.ts`), and a test pins that no other file of
+  the agent names a CRM path and fetches. The CRM drive (`crm-files/service.ts`) serves its last listing during the wait (or the calm "The CRM is busy for a moment" when there is none) and does not ask for the upload token; a 429 or 503 is
+  that calm sentence, not "refused (429)"; the conversation copies log nothing per chat meanwhile. The app's own sign-in says a CRM 429/503 is "busy", never "wrong password", and does not count it toward the five wrong tries a minute.
+  The firewall's ceiling itself is an AWS setting and not this app's. Tests: `claude/crm-cooldown.test.ts`, `claude/crm-cooldown-wiring.test.ts`, `crm-files/crm-cooldown.test.ts`; tests that make a CRM answer 429/503 on purpose end the
+  cooldown before each test (`crmCooldown.reset()`).
 - **Routes** (`/agentic`): `GET /crm?origin=<the page's origin>&fresh=1` -> `{mode, url, check}` (`mode` is `bundled`, the
   default, or `frame`; `url` and `check` are for the frame way: the check of the address, kept 30 s per address and
   origin unless `fresh`; both null while there is no address); `PATCH /crm {url?, mode?}` (400 for a bad address or a

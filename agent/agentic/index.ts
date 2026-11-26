@@ -7556,7 +7556,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (fromFile && (mode() === 'member' || (w && w.id !== self().id))) {
           throw apiError(409, `A file can be shown from chats running on the main PC (the Server) for now; this chat runs on ${w?.name ?? self().name}. Copy the file to the Server, or give an https:// address.`)
         }
-        return json({ media: await mediaShelf.share(args, { sessionId: sid, agent: agent.name }), shown: 'It is in the chat now, as a picture or a video he can open, play and save.' })
+        const shownMedia = await mediaShelf.share(args, { sessionId: sid, agent: agent.name })
+        return json({ media: shownMedia, shown: shownMedia.kind === 'html' ? 'It is in the chat now, as an HTML page he can open (scripts and outside files off), download and share.' : 'It is in the chat now, as a picture or a video he can open, play and save.' })
       }
       // Order o3963: a button for a PC's Control screen (shared/screen-bubble.ts). Only names the PC: nothing connects until his tap opens the screen.
       // Order o68f0 (Shubham: "We need you to have tools to do this please, so the users I give this access to can control this PC."): the overlay

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { crmCooldown } from '../claude/crm-cooldown.ts'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { CrmNode, CrmUpload, CrmUploadStart } from '../../shared/crm-files.ts'
@@ -396,6 +397,8 @@ export function createConversations(o: ConversationsOptions): Conversations {
   }
   /** Says each different trouble of a session once (the log is not filled with the same line every few seconds). */
   function trouble(sid: string, what: string) {
+    // F-371: while the app is waiting out a 429 the one line is the cooldown's own (agent/claude/crm-cooldown.ts), not one per chat; nothing is recorded, so a trouble that is still there afterwards is said then.
+    if (crmCooldown.active()) return
     const v = seen.get(sid)
     if (v && v.error === what) return
     if (v) v.error = what

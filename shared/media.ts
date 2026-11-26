@@ -14,8 +14,26 @@ export const MEDIA_ID = /^[A-Za-z0-9_-]{24}$/
 export const MEDIA_PATH_PREFIX = '/agent-api/agentic/media/'
 export const mediaPath = (id: string) => `${MEDIA_PATH_PREFIX}${id}`
 
-/** o528e: a CRM file the agent gave (show_crm_file) is also a PDF (its pages drawn by the app, page by page) or any other file (a card to download it). */
-export type MediaKind = 'image' | 'video' | 'pdf' | 'file'
+/**
+ * o528e: a CRM file the agent gave (show_crm_file) is also a PDF (its pages drawn by the app, page by page) or any other file (a card to download it).
+ * F-246 (Shubham: "show html file, i click, i can download, share or open here as overlay"): an HTML FILE on this PC the agent showed (show_media with a path): a card with Open
+ * (an overlay: a frame with every power off), Download and Share. Only ever the app's own link (never an address), and a CRM file that is HTML stays a file to download.
+ */
+export type MediaKind = 'image' | 'video' | 'pdf' | 'file' | 'html'
+
+/** F-246: the largest HTML file the app will show in its frame (and serve inline). */
+export const HTML_MAX_BYTES = 5 * 1024 * 1024
+
+/**
+ * F-246: what an HTML file is served with, always (the agent's media route, agent/agentic/media.ts), whether it is framed or opened on its own: nothing in it runs and nothing in it
+ * reaches out. `sandbox` with no value is every restriction at once (no scripts, no forms, no popups, no top navigation, no downloads, a one-off origin: no cookie, no storage);
+ * default-src 'none' with only inline style and data: pictures leaves no network request to make; form-action and base-uri are closed too (default-src does not cover them);
+ * frame-ancestors 'self' lets only this app's own pages frame it. A test pins the string here and the one the agent sends to be this one.
+ */
+export const HTML_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox"
+
+/** F-246: the sandbox attribute of the page's frame: EMPTY, which is every restriction (no allow-scripts, no allow-same-origin, no allow-forms, no allow-popups, no allow-top-navigation, no allow-downloads). */
+export const HTML_FRAME_SANDBOX = ''
 
 /** What the tool answers and the chat shows. */
 export interface MediaShown {
@@ -84,9 +102,9 @@ export function parseMediaResult(output: string): MediaShown | null {
   if (typeof m !== 'object' || m === null) return null
   const r = m as Record<string, unknown>
   const src = typeof r.src === 'string' ? safeMediaSrc(r.src) : null
-  if (!src || (r.kind !== 'image' && r.kind !== 'video' && r.kind !== 'pdf' && r.kind !== 'file')) return null
-  // A PDF or another file is only ever the app's own link (a CRM file through this PC).
-  if ((r.kind === 'pdf' || r.kind === 'file') && !src.startsWith(MEDIA_PATH_PREFIX)) return null
+  if (!src || (r.kind !== 'image' && r.kind !== 'video' && r.kind !== 'pdf' && r.kind !== 'file' && r.kind !== 'html')) return null
+  // A PDF, another file or an HTML file is only ever the app's own link (a CRM file through this PC, or a file the agent showed): an HTML address of another site is never framed.
+  if ((r.kind === 'pdf' || r.kind === 'file' || r.kind === 'html') && !src.startsWith(MEDIA_PATH_PREFIX)) return null
   const where = str(r.where, 300)
   return {
     kind: r.kind,

@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Auth, Caller } from '../auth/index.ts'
+import { crmFetch } from '../claude/crm-cooldown.ts'
 import { isPageRequest } from '../auth/types.ts'
 import { validSnapshot, type ViewSnapshot } from '../../shared/view-sync.ts'
 
@@ -36,14 +37,14 @@ export async function savedViewsRequest(auth: Auth | undefined, req: IncomingMes
     const request = async () => {
       const headers: Record<string, string> = { cookie: session.cookie, accept: 'application/json' }
       if (method === 'PUT') {
-        const pair = await fetch(`${session.url}/v1/auth/csrf-token`, { headers, redirect: 'error', signal: AbortSignal.timeout(20_000) })
+        const pair = await crmFetch(`${session.url}/v1/auth/csrf-token`, { headers, redirect: 'error', signal: AbortSignal.timeout(20_000) })
         const data = await pair.json() as { csrfToken?: unknown }
         if (!pair.ok || typeof data.csrfToken !== 'string' || !/^[A-Za-z0-9_-]{16,256}$/.test(data.csrfToken)) throw new Error('CSRF unavailable')
         headers.cookie += `; crm_csrf=${data.csrfToken}`
         headers['x-csrf-token'] = data.csrfToken
         headers['content-type'] = 'application/json'
       }
-      return fetch(`${session.url}/v1/org/agentic-views/mine/${kind}`, { method, headers, body, redirect: 'error', signal: AbortSignal.timeout(20_000) })
+      return crmFetch(`${session.url}/v1/org/agentic-views/mine/${kind}`, { method, headers, body, redirect: 'error', signal: AbortSignal.timeout(20_000) })
     }
     let response = await request()
     if (response.status === 403 && /csrf/i.test(await response.clone().text())) response = await request()

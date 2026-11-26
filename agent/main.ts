@@ -40,6 +40,7 @@ import { createBridge } from './claude/bridge.ts'
 import { createAuth } from './auth/index.ts'
 import { createFeatureAccess } from './auth/feature-access.ts'
 import { CrmError, crmUrlOf } from './claude/crm.ts'
+import { crmCooldown, crmLoginCooldown } from './claude/crm-cooldown.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
 import { openPcKeyStore } from './claude/pc-key.ts'
@@ -313,6 +314,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready, ...(role === 'member' ? { stableBlock: stable.mine() } : {}) })
   // F-339: the ONE CRM address of this run (crm.ts crmUrlOf). The app's sign-in, the Devices sign-in and every reader of a stored CRM login use this one value; a stored login made at another address is ended.
   const crmUrl = crmUrlOf(process.env)
+  // F-371: the app's ONE wait after the CRM answers 429 (claude/crm-cooldown.ts) says so once when it starts and once when it ends, in this log.
+  crmCooldown.setLog(m => log.child('crm').warn(m))
+  crmLoginCooldown.setLog(m => log.child('crm').warn(m))
   // F-351: this PC's OWN key from the CRM (pc-key.ts): with one, the Claude check and the usage report use it, with nobody signed in; with none, everything is as before.
   const pcKey = openPcKeyStore({ file: paths.pcKey, deviceId: () => identity.id })
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, keys: pcKey, log: log.child('claude'), onChange: () => changed() })

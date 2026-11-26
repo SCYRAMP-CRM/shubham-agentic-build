@@ -20,6 +20,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { createReadStream } from 'node:fs'
 import { open as openFile } from 'node:fs/promises'
+import { crmCooldown } from '../claude/crm-cooldown.ts'
 import { createIgnoreRules, type IgnoreRules } from './ignore-rules.ts'
 import { createRemovedIndex, type RemovedProject } from './removed.ts'
 import { createSpool, type Spool } from './spool.ts'
@@ -443,6 +444,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     if (r.status === 403) return new CrmFilesError(403, 'forbidden', `The CRM does not allow ${what}${why ? `: ${why}` : '.'}`)
     if (r.status === 404) return new CrmFilesError(404, 'notfound', `The CRM has no such ${what}.`)
     if (r.status === 409 || r.status === 422) return new CrmFilesError(409, 'conflict', `The CRM did not accept ${what}${why ? `: ${why}` : '.'}`)
+    // F-371: 429 and 503 are the CRM asking to be asked less (the app waits: agent/claude/crm-cooldown.ts): said calmly, not as a refusal of this one thing.
+    if (r.status === 429 || r.status === 503) return new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmBusy)
     if (r.status >= 500) return new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
     return new CrmFilesError(400, 'failed', `The CRM refused ${what} (${r.status})${why ? `: ${why}` : ''}.`)
   }
@@ -480,6 +483,11 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   async function load(): Promise<Snapshot> {
     if (snap && now() - snap.at < ttl) return snap
+    // F-371: while the app is waiting out a 429 the listing is NOT asked for again, by anyone (this is what asked two or three calls for every reader, hundreds a minute): the last one is served, of any age, or the calm refusal when there is none.
+    if (crmCooldown.active()) {
+      if (snap) return snap
+      throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmBusy)
+    }
     // o4fb7: a listing a little older than `ttl` is answered at once and a fresh one is fetched behind it, so opening a folder never waits for the CRM's lists (0.3-0.7 s
     // each time the 10 s ran out); never one older than STALE_MS. A change made here (invalidate) still waits for the fresh one; ttl 0 (tests) always waits.
     if (snap && ttl > 0 && now() - snap.at < STALE_MS) {
@@ -573,6 +581,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   /** Whether this person may upload at all: the CRM answers 403 to the token request of someone who may not. A failed call keeps the last answer. */
   async function mayUpload(): Promise<boolean> {
     if (upload.ok !== null && now() - upload.at < 60_000) return upload.ok
+    // F-371: not asked while the app waits out a 429 (every listing asked it): the last answer stands.
+    if (crmCooldown.active()) return upload.ok === true
     try {
       await driveToken()
       upload = { ok: true, at: now() }

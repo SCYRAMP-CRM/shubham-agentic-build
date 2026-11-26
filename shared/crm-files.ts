@@ -318,6 +318,8 @@ export const CRM_FILES_REASONS = {
   unsupported: 'The CRM drive is for Windows and Linux PCs.',
   noDelete: 'CRM files are never deleted from here. Delete them in the CRM itself.',
   crmDown: 'The CRM did not answer. Try again in a moment.',
+  /** F-371: the CRM (its firewall) said too many requests, so the app is not asking it for a while: said calmly, once, instead of "refused (429)" for every reader. */
+  crmBusy: 'The CRM is busy for a moment (it asked for fewer requests). Try again shortly.',
   noFolder: 'That folder does not exist yet: nothing has been saved through the drive.',
   notMounted: 'The drive is not mounted.',
 } as const

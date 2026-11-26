@@ -5,6 +5,7 @@ import { pipeline } from 'node:stream/promises'
 import type { CrmSessionInfo } from '../../shared/crm.ts'
 import { apiError } from '../api.ts'
 import { SESSION_MS, sameCrm, trimUrl } from '../claude/crm.ts'
+import { withCooldown } from '../claude/crm-cooldown.ts'
 import type { Logger } from '../log.ts'
 
 // F-054: the CRM built into the page talks to the CRM's backend through this. The backend allows
@@ -133,7 +134,8 @@ async function bodyOf(req: IncomingMessage): Promise<Buffer | undefined> {
 }
 
 export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
-  const fetchFn = o.fetch ?? fetch
+  // F-371: every call to the CRM from here goes through the app's one cooldown (agent/claude/crm-cooldown.ts), whatever fetch is under it.
+  const fetchFn = withCooldown(o.fetch ?? fetch)
   const now = o.now ?? Date.now
   /**
    * The CSRF token the CRM gave each session (its double-submit pair, middleware/csrf.js), by the session's cookie: kept in memory only. This PC's

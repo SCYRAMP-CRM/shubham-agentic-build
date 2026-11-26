@@ -129,7 +129,8 @@ export function reconcile(kept: readonly QuestionRow[], seen: { sid: string; ite
     if (r.sid !== seen.sid || r.status !== 'waiting' || r.id === seen.open?.id) continue
     // A row this look holds keeps the status the transcript gave it. One it does not hold (a question that was only seen on the screen, or a call that was running and is gone) is no longer waiting.
     if (seen.items.some(t => t.id === r.id)) continue
-    const written = r.id.startsWith('open:') && seen.items.some(t => t.question === r.question && t.status !== 'waiting' && Date.parse(t.at) >= Date.parse(r.at) - SAME_QUESTION_SLACK_MS)
+    // A transcript row with no time (NO_TIME) cannot be compared by time: the same question, written, is the same question (else the open row was closed next to its own answered row).
+    const written = r.id.startsWith('open:') && seen.items.some(t => t.question === r.question && t.status !== 'waiting' && (t.at === NO_TIME || Date.parse(t.at) >= Date.parse(r.at) - SAME_QUESTION_SLACK_MS))
     if (written) byId.delete(r.id)
     else byId.set(r.id, { ...r, status: 'closed' })
   }

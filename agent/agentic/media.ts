@@ -10,6 +10,13 @@
 // <agentic dir>/media-cache: the copy is served AS IT ARRIVES (a video plays, and is sought within what has come, before the whole file is here); a range
 // far ahead of it (a video's index at its end) is one ranged read of the CRM. A picture or a video (its ending AND its first bytes agree) is shown; a PDF's
 // pages are drawn as pictures by Windows (pdf-pages.ts) and the PDF itself is only downloaded; any other file is only downloaded, as bytes.
+//
+// F-246 (Shubham: "show html file, i click, i can download, share or open here as overlay"): an HTML FILE on this PC the agent showed (show_media with a path) is a served type of its own,
+// under the same door (the same id, the same owner check, the same real-path rules) and these ADDED rules: its ending (.html, .htm) AND its first bytes must say markup (never SVG or
+// XML, no NUL byte), at most HTML_MAX_BYTES, and, at SHARE time only, the whole file must be UTF-8 text with no NUL byte (the frame reads it as UTF-8). At every SERVE only this is looked at again:
+// still a file, still within HTML_MAX_BYTES, still starting like markup (the first 64 bytes). A file changed after it was shown is served as it now is: the policy covers any content. It is served in ONE piece (no Range), always with HTML_CSP (a sandbox with
+// every power off and no outside file) plus nosniff, no-referrer, same-origin resource and frame policies, and no store; a download is octet-stream, never text/html. A CRM file that
+// is HTML is NOT this kind (it stays "a file to download"), and an https address is never HTML. Nothing in this file runs or fetches what the HTML says.
 
 import { createReadStream } from 'node:fs'
 import { mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -21,7 +28,7 @@ import { apiError } from '../api.ts'
 import { parseRange } from './app-update.ts'
 import { createPdfPages, PdfUnreadable, type PdfPages } from './pdf-pages.ts'
 import type { CrmNode } from '../../shared/crm-files.ts'
-import { endingOf, MEDIA_ID, MEDIA_MAX_BYTES, kindOfSrc, mediaPath, nameOfSrc, pdfWidth, safeMediaSrc, sizeWords, type MediaKind, type MediaShown } from '../../shared/media.ts'
+import { endingOf, HTML_CSP, HTML_MAX_BYTES, MEDIA_ID, MEDIA_MAX_BYTES, kindOfSrc, mediaPath, nameOfSrc, pdfWidth, safeMediaSrc, sizeWords, type MediaKind, type MediaShown } from '../../shared/media.ts'
 
 interface Sniff {
   ext: readonly string[]
@@ -32,7 +39,22 @@ interface Sniff {
 }
 const latin = (b: Buffer, from: number, to: number) => b.toString('latin1', from, to)
 
-/** What the app shows. No SVG (it can carry script), nothing a phone's browser cannot draw or play. */
+/**
+ * F-246: an HTML file's first bytes: an optional UTF-8 mark and white space, then "<" and "!" (a doctype or a comment) or a letter (a tag); no NUL byte; and never "<svg" or "<?xml"
+ * (an SVG or an XML file can carry script and is not what this kind is for). The ending has to agree too, and so does the whole file at share time (UTF-8 text).
+ */
+export function isHtmlHead(b: Buffer): boolean {
+  let i = 0
+  if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) i = 3
+  while (i < b.length && (b[i] === 0x20 || b[i] === 0x09 || b[i] === 0x0a || b[i] === 0x0d)) i++
+  if (b[i] !== 0x3c || b.includes(0)) return false
+  const near = latin(b, i, Math.min(b.length, i + 8)).toLowerCase()
+  if (near.startsWith('<?xml') || near.startsWith('<svg')) return false
+  const c = b[i + 1]
+  return c === 0x21 || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)
+}
+
+/** What the app shows. No SVG (it can carry script), nothing a phone's browser cannot draw or play. F-246: and HTML files, framed with every power off (HTML_CSP). */
 export const MEDIA_TYPES: readonly Sniff[] = [
   { ext: ['.png'], type: 'image/png', kind: 'image', is: b => b[0] === 0x89 && latin(b, 1, 4) === 'PNG' },
   { ext: ['.jpg', '.jpeg'], type: 'image/jpeg', kind: 'image', is: b => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
@@ -44,6 +66,7 @@ export const MEDIA_TYPES: readonly Sniff[] = [
   { ext: ['.mp4', '.m4v', '.mov'], type: 'video/mp4', kind: 'video', is: b => latin(b, 4, 8) === 'ftyp' },
   { ext: ['.webm'], type: 'video/webm', kind: 'video', is: b => b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3 },
   { ext: ['.ogv'], type: 'video/ogg', kind: 'video', is: b => latin(b, 0, 4) === 'OggS' },
+  { ext: ['.html', '.htm'], type: 'text/html; charset=utf-8', kind: 'html', is: isHtmlHead },
 ]
 const ENDINGS = MEDIA_TYPES.flatMap(t => t.ext).join(', ')
 
@@ -118,7 +141,7 @@ const isRecord = (r: unknown): r is MediaRecord => {
   const x = r as Record<string, unknown>
   if (typeof x.id !== 'string' || !MEDIA_ID.test(x.id) || typeof x.name !== 'string') return false
   if (x.crm !== undefined) return typeof x.crm === 'string' && CRM_FILE_ID.test(x.crm) && typeof x.type === 'string' && CRM_KINDS.includes(x.kind) && (x.size === null || typeof x.size === 'number')
-  return typeof x.file === 'string' && path.isAbsolute(x.file) && MEDIA_TYPES.some(t => t.type === x.type) && (x.kind === 'image' || x.kind === 'video') && typeof x.size === 'number'
+  return typeof x.file === 'string' && path.isAbsolute(x.file) && MEDIA_TYPES.some(t => t.type === x.type && t.kind === x.kind) && (x.kind === 'image' || x.kind === 'video' || x.kind === 'html') && typeof x.size === 'number'
 }
 
 /** A download's name: plain ASCII in filename=, the real one in filename*. */
@@ -516,6 +539,42 @@ export function createMediaShelf(o: {
     await follow(binOf(rec.id), f && !f.done ? f : null, start, end, res).catch(() => undefined)
   }
 
+  /**
+   * F-246: an HTML file (a record of this PC, never a CRM file): checked again as it is served: still a file, not too big, still starting like markup (the first 64 bytes). NOT the whole-file UTF-8 / NUL check: that runs at SHARE only, and the policy below covers any content. Then sent in ONE piece
+   * with HTML_CSP, nosniff, no referrer, same-origin resource and frame policies and no store. Opened (not downloaded) it is text/html; a download is octet-stream with
+   * Content-Disposition: attachment, so it is never drawn by the browser as a page. No Range: a frame needs the whole file.
+   */
+  async function serveHtml(rec: MediaRecord, req: IncomingMessage, res: ServerResponse, download: boolean): Promise<void> {
+    let size: number
+    try {
+      const st = await stat(rec.file)
+      if (!st.isFile()) throw new Error('not a file')
+      size = st.size
+    } catch {
+      throw apiError(410, `${rec.name} is gone from the PC (moved or deleted).`)
+    }
+    if (size > Math.min(HTML_MAX_BYTES, maxBytes)) throw apiError(413, `${rec.name} is ${sizeWords(size)} now; an HTML file is shown up to ${sizeWords(Math.min(HTML_MAX_BYTES, maxBytes))}.`)
+    const head = await headOf(rec.file).catch(() => Buffer.alloc(0))
+    if (!isHtmlHead(head)) throw apiError(410, `${rec.name} is not the HTML page that was shown any more.`)
+    res.writeHead(200, {
+      'Content-Type': download ? 'application/octet-stream' : rec.type,
+      'Content-Length': size,
+      'Accept-Ranges': 'none',
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': HTML_CSP,
+      'Referrer-Policy': 'no-referrer',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'X-Frame-Options': 'SAMEORIGIN',
+      'Content-Disposition': disposition(download, rec.name),
+    })
+    if (req.method === 'HEAD') {
+      res.end()
+      return
+    }
+    await pipeTo(createReadStream(rec.file, { start: 0, end: size - 1 }), res)
+  }
+
   return {
     async share(input, who) {
       const caption = typeof input.caption === 'string' && input.caption.trim() ? input.caption.trim().slice(0, CAPTION_MAX) : null
@@ -542,10 +601,21 @@ export function createMediaShelf(o: {
       if (st.size > maxBytes) throw apiError(413, `${given} is ${sizeWords(st.size)}; the chat shows files up to ${sizeWords(maxBytes)}.`)
       const ext = path.extname(file).toLowerCase()
       const byName = MEDIA_TYPES.filter(t => t.ext.includes(ext))
-      if (!byName.length) throw apiError(415, `The chat shows pictures and videos only (${ENDINGS}); ${path.basename(file)} is not one.`)
+      if (!byName.length) throw apiError(415, `The chat shows pictures, videos and HTML files only (${ENDINGS}); ${path.basename(file)} is not one.`)
       const head = await headOf(file)
       const t = byName.find(x => x.is(head))
       if (!t) throw apiError(415, `${path.basename(file)} does not hold what its name says (its first bytes are not a ${byName[0].type} file).`)
+      if (t.kind === 'html') {
+        // F-246: an HTML file is small, plain text, and nothing else: its size, then every byte of it (no NUL, valid UTF-8).
+        if (st.size > Math.min(HTML_MAX_BYTES, maxBytes)) throw apiError(413, `${path.basename(file)} is ${sizeWords(st.size)}; an HTML file is shown up to ${sizeWords(Math.min(HTML_MAX_BYTES, maxBytes))}.`)
+        const whole = await readFile(file)
+        if (whole.includes(0)) throw apiError(415, `${path.basename(file)} has bytes that are not text, so it is not shown as an HTML page.`)
+        try {
+          new TextDecoder('utf-8', { fatal: true }).decode(whole)
+        } catch {
+          throw apiError(415, `${path.basename(file)} is not UTF-8 text; save it as UTF-8 to show it.`)
+        }
+      }
       const rec: MediaRecord = { id: randomId(), file, type: t.type, kind: t.kind, name: path.basename(file), size: st.size, caption, at: now().toISOString(), sessionId: who.sessionId, agent: who.agent }
       await keep(rec)
       return { kind: rec.kind, src: mediaPath(rec.id), name: rec.name, size: rec.size, caption }
@@ -577,7 +647,8 @@ export function createMediaShelf(o: {
       }
       // A picture, a video or a PDF only when its first bytes say so too; anything else is a file to download.
       const ext = endingOf(node.name, node.type ?? null)
-      const byName = MEDIA_TYPES.filter(t => t.ext.includes(`.${ext}`))
+      // F-246: an HTML file of the CRM is NOT shown in a frame: it stays a file to download.
+      const byName = MEDIA_TYPES.filter(t => t.kind !== 'html' && t.ext.includes(`.${ext}`))
       let kind: MediaKind = 'file'
       let type = 'application/octet-stream'
       if (byName.length > 0 || ext === 'pdf') {
@@ -613,6 +684,7 @@ export function createMediaShelf(o: {
         if (!o.crm) throw apiError(503, 'The CRM files are not reachable from this PC.')
         return serveCrm(rec, req, res, download)
       }
+      if (rec.kind === 'html') return serveHtml(rec, req, res, download)
       let size: number
       try {
         const st = await stat(rec.file)

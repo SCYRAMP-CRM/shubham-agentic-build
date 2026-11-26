@@ -13,6 +13,8 @@
 // latest (lib/christopherRelease.js), and this app is not one. The password is sent once, in
 // the sign-in, and kept nowhere; the cookie and the token are never logged.
 
+import { crmFetch } from './crm-cooldown.ts'
+
 /** The CRM this app signs in to and talks to (its backend, behind CloudFront). SAD_CRM_URL points the app at another CRM (a test's stand-in). */
 export const CRM_URL = 'https://d3blj8n8yhvyjy.cloudfront.net'
 /** The CRM signs its session for 7 days (authController.js JWT_EXPIRY). */
@@ -88,7 +90,8 @@ export async function call(url: string, init: RequestInit): Promise<{ status: nu
   let res: Response
   try {
     const limit = AbortSignal.timeout(TIMEOUT_MS)
-    res = await fetch(url, { ...init, redirect: 'error', signal: init.signal ? AbortSignal.any([init.signal, limit]) : limit })
+    // F-371: through the app's one CRM cooldown (agent/claude/crm-cooldown.ts): after a 429 nothing is sent until the wait is over.
+    res = await crmFetch(url, { ...init, redirect: 'error', signal: init.signal ? AbortSignal.any([init.signal, limit]) : limit })
   } catch (e) {
     const err = e as { name?: string; message?: string; cause?: { code?: string; message?: string } }
     const why = err.name === 'TimeoutError' ? `no answer in ${TIMEOUT_MS / 1000} s` : (err.cause?.code ?? err.cause?.message ?? err.message ?? String(e))

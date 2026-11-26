@@ -479,6 +479,11 @@ export function createAuth(o: AuthOptions): Auth {
     try {
       session = await crm.signIn(o.crmUrl, login, password)
     } catch (e) {
+      // F-371: the CRM (its firewall) asking to be asked less is not a wrong password: it is said as what it is, and it is NOT counted against the person (five wrong tries a minute lock a sign-in for a minute: a storm of 429s must not lock everyone out).
+      if (e instanceof CrmError && (e.status === 429 || e.status === 503)) {
+        log?.warn(`sign-in for ${login.slice(0, 40)}: the CRM is busy (${e.status})`)
+        throw authError(502, 'The CRM is busy for a moment (it asked for fewer requests). Try again shortly.', 'crm-unreachable')
+      }
       if (e instanceof CrmError && e.status !== null && e.status >= 400 && e.status < 500) {
         for (const key of [login.toLowerCase(), '*']) fails.set(key, [...(fails.get(key) ?? []), now()])
         log?.warn(`sign-in refused for ${login.slice(0, 40)}: the CRM answered ${e.status}`)
