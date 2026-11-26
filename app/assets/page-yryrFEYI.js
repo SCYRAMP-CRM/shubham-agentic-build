@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-BGomJLQe.js";function t(){e(`/goals`)}export{t as default};
