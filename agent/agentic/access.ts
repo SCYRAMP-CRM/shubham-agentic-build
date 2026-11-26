@@ -249,6 +249,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/floors\/([^/]+)\/agents\/copy$/, floor('manage')],
   ['POST', /^\/floors\/([^/]+)\/template$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/template\/undo$/, OWNER],
+  // F-231: sharing every chat of a floor with one person, and taking that person out again: the first owner's only (the routes also ask for a signed-in human and the first owner by id). The per-agent share above is unchanged.
+  ['POST', /^\/floors\/([^/]+)\/share-floor$/, OWNER],
+  ['POST', /^\/floors\/([^/]+)\/unshare-floor$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
   // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).
   ['POST', /^\/floors\/([^/]+)\/import$/, OWNER],

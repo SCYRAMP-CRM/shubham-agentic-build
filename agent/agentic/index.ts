@@ -84,6 +84,7 @@ import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge, uiWhoOf, type UiWho } from './ui-bridge.ts'
+import { parseWindowRef, WINDOWS_OFF_WHY } from '../../shared/ui-windows.ts'
 import { chosen, mcpConfigFor, readRegistry, restrictedNames, strictConfigFor } from './mcp-registry.ts'
 import { MachineMcpsError, readMachineMcps, setMachineMcp, wantedForChat } from './machine-mcps.ts'
 import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, untappedMark, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress, type Untapped } from './orders.ts'
@@ -258,7 +259,7 @@ import { createConversations, type Conversations, type ConvSession } from './con
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
 import { createMemoryDoor } from './memory-door.ts'
-import { createNotebooks, joinSections } from './memory-notebook.ts'
+import { createNotebooks, joinSections, SHARED_WHY } from './memory-notebook.ts'
 import { adminsAreOnlyTheOwner, chatIsShared, chatMemoryPerson, createMemoryPeople, feedFloors, noteFloors, ownProjects, quickMayUseMemory, unfedFloors, type QuickTalker } from './memory-people.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
 import { answer, pullFrom as pullTranscriptFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
@@ -1047,7 +1048,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // the Agents routes whatever Settings › Access says; this mount still shows them only those.
   o.featureAccess?.useShares(c => !!c.person && !access.isAdmin(c) && allFloors().some(f => access.floorSeen(c, f)))
   // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
-  const ui = createUiBridge()
+  // F-274 + F-273: the setting "Windows by name" is read from the hub's Assistant settings (made below); until then, and in a test that never makes them, it is on.
+  let windowsByName: () => boolean = () => true
+  const ui = createUiBridge(undefined, { windows: () => windowsByName() })
   /**
    * Order o355e (+ oe3b1): whose page or call it is, for the screen bridge: the signed-in person (or nobody), and whether it is the owner of the app's. F-322 (F322-1): the owner of the app's scope is the FIRST
    * owner by id (and the open app, and the PC's own program: access.ownerOf), not every administrator: a second owner's pages and his own Assistant are his own scope (ui-bridge.ts uiWhoOf).
@@ -1201,6 +1204,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     copyAgent: (f, req, as, via) => storeFor(f).copyAgent(f, req, as, via),
     stampTemplate: (f, template, as) => storeFor(f).stampTemplate(f, template, as),
     unstampTemplate: (f, id, as) => storeFor(f).unstampTemplate(f, id, as),
+    // F-231: sharing the chats of a floor is done in the store that holds the floor, as setShare is.
+    shareFloor: (f, p, can, as, others) => storeFor(f).shareFloor(f, p, can, as, others),
+    unshareFloor: (f, id, as) => storeFor(f).unshareFloor(f, id, as),
     bindSession: (f, a, s) => storeFor(f).bindSession(f, a, s),
     setCodexThread: (f, a, t) => storeFor(f).setCodexThread(f, a, t),
     setHome: (f, a, h) => storeFor(f).setHome(f, a, h),
@@ -1228,6 +1234,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const defaultsNow = (): ChatDefaults => (mode() === 'member' ? (replica.defaults ?? NO_DEFAULTS) : chatDefaults.get())
   // The overlay Assistant's settings (Settings › Assistant), kept on the hub; the screen tools that use them run on the hub only.
   const assistantSettings = createAssistantSettings(path.join(o.dir, 'assistant-settings.json'))
+  windowsByName = () => assistantSettings.get().windowsByName
   // Which tool list each chat's MCP process was last given (tools-seen.ts), so a chat behind the current one can be seen.
   const toolsSeen = createToolsSeen(path.join(o.dir, 'chat-tools.json'))
   const TOOLS_NOW = toolsVersion(TOOLS)
@@ -6520,6 +6527,40 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, "Only the first owner of this app gives a floor's chats a template.")
   }
+  /**
+   * F-231 (Shubham: "Currently we only have the ability to share agents, not floors. Please add that."): the first owner's door for sharing the chats of a floor. In this order, before anything is read or written: a chat's key
+   * is refused, every caller who is not a signed-in CRM person is refused (humanOnly), every administrator who is not the first owner by id is refused (firstOwnerOnly: a second owner too). The per-agent share (shareChat) is unchanged.
+   */
+  function floorShareOwner(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
+    humanOnly(r)
+    firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, 'Only the first owner of this app shares or unshares a floor.')
+  }
+  /** F-231: POST /floors/:id/share-floor {id, can, includeOthers?}: those keys only; the person must be in the CRM's member list (as for one chat); the level is asked for, never assumed. */
+  function shareFloorRoute(floorId: string, r: MountRequest) {
+    floorShareOwner(r)
+    const b = r.body
+    if (!isObject(b) || Object.keys(b).some(k => k !== 'id' && k !== 'can' && k !== 'includeOthers')) throw apiError(400, "Expected {id, can: 'view' | 'type'} and, if wanted, includeOthers: true")
+    if (b.includeOthers !== undefined && typeof b.includeOthers !== 'boolean') throw apiError(400, 'includeOthers is true or false')
+    if (typeof b.id !== 'string' || !b.id) throw apiError(400, 'Expected {id}: the id of the person')
+    if (b.can !== 'view' && b.can !== 'type') throw apiError(400, "can is 'view' or 'type'")
+    const id = b.id.toLowerCase()
+    if (id === access.ownerOf(callerOf(r)).id.toLowerCase()) throw apiError(400, 'A floor is not shared with yourself.')
+    const who = (o.auth?.directory() ?? []).find(u => u.id.toLowerCase() === id)
+    if (!who) throw apiError(404, `Nobody with id ${id.slice(0, 40)} in the CRM's member list`)
+    const out = floors.shareFloor(floorId, { id, username: who.username, name: who.name }, b.can, access.ownerOf(callerOf(r)), b.includeOthers === true)
+    log?.info(`floor ${floorId.slice(0, 8)}: ${out.shared.length} chats shared with ${who.username || id.slice(0, 8)} (${b.can}), ${out.skipped.length} left as they were`)
+    return out
+  }
+  /** F-231: POST /floors/:id/unshare-floor {id}: takes that one person out of every chat on the floor. */
+  function unshareFloorRoute(floorId: string, r: MountRequest) {
+    floorShareOwner(r)
+    const b = r.body
+    if (!isObject(b) || Object.keys(b).some(k => k !== 'id')) throw apiError(400, 'Expected exactly {id}')
+    const out = floors.unshareFloor(floorId, b.id, access.ownerOf(callerOf(r)))
+    log?.info(`floor ${floorId.slice(0, 8)}: a person was taken out of ${out.removed.length} chats`)
+    return out
+  }
   function notebookOwner(r: MountRequest) {
     if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, "Only the owner's page may do this; not a chat tool.", 'not-yours')
     firstOwnerOnly(callerOf(r), `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`)
@@ -7773,6 +7814,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'message_instance': {
         // notebook-door: K13
         const nb = notebooks.forChat(floor, agent)
+        // F-231 (Agent 14's ruling): a chat shared with other people is closed to instance messages, as it is to the notebook and the app's memory: forChat says so (SHARED_WHY), and it is told so in its own words, not that it is "not an instance".
+        if (!nb.ok && nb.why === SHARED_WHY) throw apiError(403, 'This chat is shared with other people, so it cannot message its sibling instances until that ends. Nothing was sent.')
         if (!nb.ok) throw apiError(409, "This chat is not an instance of a template whose notebook the owner has switched on, so it has no instances to message. Nothing was sent.")
         const group = nb.chat.messaging()
         if (!group) throw apiError(409, `The owner has not switched on messages between the instances of ${nb.chat.template.name}. Nothing was sent.`)
@@ -7977,6 +8020,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
           const climb = pathClimb(args.args)
           if (climb) throw apiError(400, `ui_invoke: an argument may not climb out of a path ("${climb.slice(0, 60)}"): give plain ids and words.`)
         }
+        // F-274 + F-273: an optional `window`, strictly a whole number 1 to 99 (or "Window 2"); anything else is refused before the screen is asked. With the setting off it is refused too. The bridge gets the number only: the
+        // argument is taken out of what is sent to the page.
+        const { window: windowGiven, ...pageArgs } = args
+        let windowNo: number | null = null
+        if (windowGiven !== undefined && windowGiven !== null) {
+          windowNo = parseWindowRef(windowGiven)
+          if (windowNo === null) throw apiError(400, `${name}: window is the number of one of his open windows, like 2 or "Window 2" (ui_screen lists them when he has more than one).`)
+          if (!assistantSettings.get().windowsByName) throw apiError(409, WINDOWS_OFF_WHY)
+        }
         // Order o355e (+ oe3b1): the chat's own person's pages only (its owner's; the owner of the app's own pages and open app on any of his PCs).
         const as = uiWho(me)
         const goalsApi = ui.onPhone(as) === true && assistantSettings.get().goalsOnMobile
@@ -7993,10 +8045,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         try {
           const out = await ui.call(
             name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
-            goalsApi ? { ...args, goalsApi: true } : args,
+            goalsApi ? { ...pageArgs, goalsApi: true } : pageArgs,
             undefined,
             as,
             staff ? staffMayScreen : undefined,
+            windowNo,
           )
           return typeof out === 'string' ? out : json(out)
         } catch (e) {
@@ -9910,7 +9963,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }],
     // Settings › Assistant: "Goals on mobile: use the API". Kept on the hub: a member's page asks the hub (not 'local').
     ['GET', /^\/assistant-settings$/, () => ({ settings: assistantSettings.get() })],
-    ['PUT', /^\/assistant-settings$/, (_, r) => ({ settings: assistantSettings.set(r.body) })],
+    [
+      'PUT',
+      /^\/assistant-settings$/,
+      (_, r) => {
+        const settings = assistantSettings.set(r.body)
+        // F-274 + F-273: "Windows by name" changed: every open page is told again at once ("Window 2 of 3" appears or goes).
+        ui.refresh()
+        return { settings }
+      },
+    ],
     // Order o5007: Settings › Old app reader: the switch and the model (the hub's, so every device agrees) and the old app's folder it reads.
     // Switched off, its process ends and its socket is refused (the /old page, its menu entry and Alt+O go too); on again, it is back.
     ['GET', /^\/old\/settings$/, () => oldInfo()],
@@ -10055,6 +10117,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
         templateOwner(r)
         return floors.unstampTemplate(id, isObject(r.body) ? r.body.id : undefined, access.ownerOf(callerOf(r)))
       },
+    ],
+    [
+      // F-231: the first owner's one click that shares the chats on a floor with one person, and takes that person out again. The per-agent share below is unchanged.
+      'POST',
+      /^\/floors\/([^/]+)\/share-floor$/,
+      ([id], r) => shareFloorRoute(id, r),
+    ],
+    [
+      'POST',
+      /^\/floors\/([^/]+)\/unshare-floor$/,
+      ([id], r) => unshareFloorRoute(id, r),
     ],
     [
       'POST',

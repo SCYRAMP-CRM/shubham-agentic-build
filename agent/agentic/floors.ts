@@ -1,12 +1,14 @@
 import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE, OPENCODE_PROVIDERS, isOpenCodeFreeModel } from '../../shared/opencode.ts'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, constants as fsConstants, copyFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, constants as fsConstants, copyFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import {
   AGENT_BRIEF_MAX,
   AGENT_EFFORTS,
   AGENT_MODELS,
   AGENT_ULTRACODES,
   FLOOR_PREAMBLE_MAX,
+  isOrchestratorAgent,
   isPersonAssistant,
   MAX_AGENTS_PER_FLOOR,
   type AgentEffort,
@@ -16,9 +18,11 @@ import {
   type FloorAgent,
   type FloorPatch,
   type NewAgent,
+  type ShareFloorAnswer,
+  type UnshareFloorAnswer,
 } from '../../shared/agentic.ts'
 import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, ENGINE_CHANGE_CODE, ENGINE_CHANGE_MESSAGE, engineOf, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
-import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
+import { SBSKRRT_ID, SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
 import { cleanTemplate, isTemplateId, templateIdOf, templateName, type AgentTemplate } from '../../shared/agent-template.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -40,6 +44,8 @@ const SESSION_ID_RE = /^[0-9a-zA-Z-]{8,64}$/
 const NAME_MAX = 80
 const ROLE_MAX = 120
 const LIST_MAX = 64
+/** F-231: how many of Share floor's copies of floors.json are kept (the newest). */
+export const SHARE_FLOOR_COPIES_KEPT = 5
 
 /**
  * The most a PATCH /floors/<id> body may weigh (order o869c follow-up). The page saves ONE field by sending EVERY agent (store.ts patchFloor), so the
@@ -266,6 +272,15 @@ export interface FloorStore {
   stampTemplate(floorId: string, template: unknown, as?: ChatOwner | null): { floor: Floor; stamped: number; skipped: number; copy: string | null }
   /** F-316 T2: takes the template away from exactly the chats the last stamping of it on this floor gave it (and that still have it). */
   unstampTemplate(floorId: string, templateId: unknown, as?: ChatOwner | null): { floor: Floor; removed: number }
+  /**
+   * F-231 (Shubham: "Currently we only have the ability to share agents, not floors. Please add that."), the first owner's one click: `person` is added to the share list of every chat on the floor AS IT IS NOW at the level `can`, MERGED (every other
+   * person's share is left exactly as it was), skipping PC Control, a person's own Assistant, the Orchestrator, a chat the person owns and one already shared at that level (all named in the answer). ALL or NONE: worked out on a copy, floors.json
+   * is copied beside itself first (floors.json.before-share-floor-<UTC>; only the last few are kept), then written once; a chat that would pass the 64 people it can be shared with refuses the whole. A chat added later is NOT shared.
+   * A chat owned by a THIRD person (neither the caller nor the person) is left alone ('other-owner') unless `includeOthers` is true: it holds that person's conversation.
+   */
+  shareFloor(floorId: string, person: ChatOwner, can: ShareLevel, as?: ChatOwner | null, includeOthers?: boolean): ShareFloorAnswer
+  /** F-231: takes `personId` out of the share list of every chat on the floor. Only that entry changes. */
+  unshareFloor(floorId: string, personId: unknown, as?: ChatOwner | null): UnshareFloorAnswer
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
   /** F-134: the Codex conversation id of an agent's chat (null: none yet). Only the agent calls this, never a page. */
@@ -521,18 +536,46 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
    * F-316 T2: the way back for the owner's stamping. floors.json is copied to floors.json.before-template-<UTC> (never overwritten, never deleted here); returns that file's name, or null for a store with
    * no file yet or one that writes nothing. When the copy cannot be made the stamping is refused and nothing is changed.
    */
-  function keepFileCopy(): string | null {
+  /**
+   * F-231 (Agent 14): the copies that Share floor keeps before each change (floors.json.before-share-floor-<UTC>) are the way back for the LAST few; each is a whole floors.json (with every chat's brief), so they are not allowed to pile up: only the newest
+   * `keep` are kept, the older ones are removed. Only this label: the template copies are never deleted here.
+   */
+  function pruneCopies(label: string, keep: number, justMade: string): void {
+    const dir = path.dirname(file)
+    const prefix = `${path.basename(file)}.before-${label}-`
+    let names: string[]
+    try {
+      // Oldest first by the file's own time (a name is reused once its older copy is gone, so the name alone cannot say which is newer); the copy just made is never the one removed.
+      names = readdirSync(dir)
+        .filter(n => n.startsWith(prefix) && n !== justMade)
+        .map(n => ({ n, at: statSync(path.join(dir, n)).mtimeMs }))
+        .sort((a, b) => a.at - b.at || a.n.localeCompare(b.n))
+        .map(x => x.n)
+    } catch {
+      return
+    }
+    for (const old of names.slice(0, Math.max(0, names.length - (keep - 1)))) {
+      try {
+        unlinkSync(path.join(dir, old))
+      } catch {
+        // a copy that cannot be removed is left: it is only disk
+      }
+    }
+  }
+  function keepFileCopy(label = 'template'): string | null {
     if (opts.readOnly || !existsSync(file)) return null
     const at = now().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
     for (let i = 1; i <= 50; i++) {
-      const dest = `${file}.before-template-${at}${i > 1 ? `-${i}` : ''}`
+      const dest = `${file}.before-${label}-${at}${i > 1 ? `-${i}` : ''}`
       if (existsSync(dest)) continue
       try {
         copyFileSync(file, dest, fsConstants.COPYFILE_EXCL)
       } catch (error) {
         throw apiError(500, `A copy of floors.json could not be kept (${error instanceof Error ? error.message : String(error)}): nothing was changed.`)
       }
-      return dest.replace(/^.*[\\/]/, '')
+      const made = dest.replace(/^.*[\\/]/, '')
+      if (label === 'share-floor') pruneCopies(label, SHARE_FLOOR_COPIES_KEPT, made)
+      return made
     }
     throw apiError(500, 'A copy of floors.json could not be kept (too many beside it): nothing was changed.')
   }
@@ -1065,6 +1108,73 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         report({ kind: 'template-unstamped', by: actorOf(as), floor: refOf(floor), template: { id: templateId, name }, count: removed })
       }
       return { floor: clone(removed ? next : floor), removed }
+    },
+
+    shareFloor(floorId, person, can, as, includeOthers = false) {
+      assertWritable()
+      if (!(SHARE_LEVELS as readonly unknown[]).includes(can)) throw apiError(400, "can is 'view' or 'type'")
+      const floor = find(floorId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control sharing is managed by the server.'), { code: 'pc-control-immutable' })
+      const pid = person.id.toLowerCase()
+      const next = clone(floor)
+      const shared: ShareFloorAnswer['shared'] = []
+      const skipped: ShareFloorAnswer['skipped'] = []
+      for (const a of next.agents) {
+        const ref = refOf(a)
+        if (a.pcControlSlot) skipped.push({ ...ref, why: 'pc-control' })
+        else if (isPersonAssistant(a) || isOrchestratorAgent(next.name, a)) skipped.push({ ...ref, why: 'assistant' })
+        else if (a.owner?.id.toLowerCase() === pid) skipped.push({ ...ref, why: 'owner' })
+        // A chat that a THIRD person owns holds that person's conversation: left unless the first owner ticked the box that includes them (an owner may share any chat, so this is a default, not a rule).
+        else if (!includeOthers && a.owner?.id && a.owner.id.toLowerCase() !== (as?.id ?? SBSKRRT_ID).toLowerCase()) skipped.push({ ...ref, why: 'other-owner' })
+        else if ((a.sharedWith ?? []).some(s => s.id.toLowerCase() === pid && s.can === can)) skipped.push({ ...ref, why: 'already' })
+        // A bulk share never LOWERS anybody: a view asked for a person who can type there is left as it is, and said so (the per-agent door lowers; or unshare, then share).
+        else if (can === 'view' && (a.sharedWith ?? []).some(s => s.id.toLowerCase() === pid && s.can === 'type')) skipped.push({ ...ref, why: 'has-type' })
+        else {
+          const was = (a.sharedWith ?? []).find(s => s.id.toLowerCase() === pid)?.can === 'view' ? ('view' as const) : null
+          // MERGE: everybody else's entry is kept as it is, in its place; this person's is put at the end at the new level.
+          const raw = [...(a.sharedWith ?? []).filter(s => s.id.toLowerCase() !== pid), { id: pid, username: person.username, name: person.name, can }]
+          if (raw.length > LIST_MAX) throw Object.assign(apiError(409, `"${a.name}" is already shared with ${LIST_MAX} people: nothing was changed.`), { code: 'share-floor-full' })
+          // The list goes through the same normaliser as every share list (ids and names clipped, one row per person, a level that is view or type): what is written is what a load would read back.
+          a.sharedWith = shareList(raw)
+          shared.push({ ...ref, was })
+        }
+      }
+      // Nothing to change: nothing is copied, written or recorded.
+      if (!shared.length) return { floor: clone(floor), shared, skipped, copy: null }
+      // The way back first: if the copy cannot be made, nothing is changed.
+      const copy = keepFileCopy('share-floor')
+      next.updatedAt = now()
+      const previousFloors = floors
+      floors = floors.map(f => (f.id === next.id ? next : f))
+      try { save() } catch (error) { floors = previousFloors; throw error }
+      report({ kind: 'floor-shared', by: actorOf(as), floor: refOf(floor), person: refOf({ id: pid, name: person.name || person.username }), level: can, count: shared.length })
+      return { floor: clone(next), shared, skipped, copy }
+    },
+
+    unshareFloor(floorId, personId, as) {
+      assertWritable()
+      const pid = typeof personId === 'string' ? personId.trim().toLowerCase() : ''
+      if (!pid) throw apiError(400, 'Expected {id}: the id of the person')
+      const floor = find(floorId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control sharing is managed by the server.'), { code: 'pc-control-immutable' })
+      const next = clone(floor)
+      const removed: UnshareFloorAnswer['removed'] = []
+      let who = ''
+      for (const a of next.agents) {
+        const had = (a.sharedWith ?? []).find(s => s.id.toLowerCase() === pid)
+        if (!had) continue
+        who ||= had.name || had.username
+        a.sharedWith = (a.sharedWith ?? []).filter(s => s.id.toLowerCase() !== pid)
+        removed.push({ ...refOf(a), was: had.can === 'type' ? 'type' : 'view' })
+      }
+      if (!removed.length) return { floor: clone(floor), removed, copy: null }
+      const copy = keepFileCopy('share-floor')
+      next.updatedAt = now()
+      const previousFloors = floors
+      floors = floors.map(f => (f.id === next.id ? next : f))
+      try { save() } catch (error) { floors = previousFloors; throw error }
+      report({ kind: 'floor-unshared', by: actorOf(as), floor: refOf(floor), person: refOf({ id: pid, name: who }), count: removed.length })
+      return { floor: clone(next), removed, copy }
     },
 
     setShare(floorId, agentId, list, as) {

@@ -12,5 +12,10 @@ export const isGoalsRoute = (route: string): boolean => /^(goals|goals-2|tasks)(
 export interface AssistantSettings {
   /** On (the default): the phone's Assistant uses the goal tools and may not drive the CRM Goals page. Off: it may, as before. */
   goalsOnMobile: boolean
+  /**
+   * F-274 + F-273: On (the default): the Assistant can name a window of a device that has several open (`window` on the screen tools), ui_screen lists them, and each window says "Window 2 of 3" in the overlay.
+   * Off: the argument is refused and nothing is listed or numbered, as before.
+   */
+  windowsByName: boolean
 }
-export const DEFAULT_ASSISTANT_SETTINGS: AssistantSettings = { goalsOnMobile: true }
+export const DEFAULT_ASSISTANT_SETTINGS: AssistantSettings = { goalsOnMobile: true, windowsByName: true }

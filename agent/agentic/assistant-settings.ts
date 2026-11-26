@@ -8,7 +8,10 @@ import { writeAtomic } from '../config.ts'
 /** What a file says, repaired to something valid (anything but a boolean is the default). */
 export function parseAssistantSettings(raw: unknown): AssistantSettings {
   const r = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
-  return { goalsOnMobile: typeof r.goalsOnMobile === 'boolean' ? r.goalsOnMobile : DEFAULT_ASSISTANT_SETTINGS.goalsOnMobile }
+  return {
+    goalsOnMobile: typeof r.goalsOnMobile === 'boolean' ? r.goalsOnMobile : DEFAULT_ASSISTANT_SETTINGS.goalsOnMobile,
+    windowsByName: typeof r.windowsByName === 'boolean' ? r.windowsByName : DEFAULT_ASSISTANT_SETTINGS.windowsByName,
+  }
 }
 
 export interface AssistantSettingsStore {
@@ -27,11 +30,15 @@ export function createAssistantSettings(file: string): AssistantSettingsStore {
   return {
     get: () => ({ ...now }),
     set(patch) {
-      if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) throw apiError(400, 'Expected {goalsOnMobile?}')
+      if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) throw apiError(400, 'Expected {goalsOnMobile?, windowsByName?}')
       const p = patch as Record<string, unknown>
       if (p.goalsOnMobile !== undefined && typeof p.goalsOnMobile !== 'boolean') throw apiError(400, 'goalsOnMobile is true or false')
-      const next: AssistantSettings = { goalsOnMobile: p.goalsOnMobile !== undefined ? p.goalsOnMobile : now.goalsOnMobile }
-      if (next.goalsOnMobile !== now.goalsOnMobile) {
+      if (p.windowsByName !== undefined && typeof p.windowsByName !== 'boolean') throw apiError(400, 'windowsByName is true or false')
+      const next: AssistantSettings = {
+        goalsOnMobile: p.goalsOnMobile !== undefined ? p.goalsOnMobile : now.goalsOnMobile,
+        windowsByName: p.windowsByName !== undefined ? p.windowsByName : now.windowsByName,
+      }
+      if (next.goalsOnMobile !== now.goalsOnMobile || next.windowsByName !== now.windowsByName) {
         now = next
         writeAtomic(file, `${JSON.stringify(now, null, 2)}\n`)
       }

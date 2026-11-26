@@ -341,6 +341,27 @@ export interface UnstampTemplateAnswer {
   removed: number
 }
 
+/**
+ * F-231 (Shubham, 14 Nov 2026: "Currently we only have the ability to share agents, not floors. Please add that."), POST /agentic/floors/:floorId/share-floor {id, can}: the first owner's one click that shares the chats
+ * ON THE FLOOR NOW with one person (a CRM member, by id) at one level, as the per-agent share does, MERGED into each chat's list. Names of chats only: no content, no session id.
+ */
+export interface ShareFloorAnswer {
+  floor: Floor
+  /** The chats the person was added to (`was` null) or RAISED on (`was` 'view': it is 'type' now). A bulk share never lowers anybody. */
+  shared: { id: string; name: string; was: 'view' | null }[]
+  /** The chats left as they were, and why: 'assistant' (a person's own Assistant or the Orchestrator: never shared in bulk), 'pc-control', 'owner' (the person already owns it), 'other-owner' (a THIRD person owns it: left unless the request said `includeOthers`), 'already' (shared at that level already), 'has-type' (a view was asked for and the person has Can type on it: not lowered). */
+  skipped: { id: string; name: string; why: 'assistant' | 'pc-control' | 'owner' | 'other-owner' | 'already' | 'has-type' }[]
+  /** The copy of floors.json kept first (its file name, beside floors.json): the way back. null when nothing was written. */
+  copy: string | null
+}
+/** POST /agentic/floors/:floorId/unshare-floor {id}: takes ONE person out of every chat's share list on the floor. No chat, agent or conversation is touched. */
+export interface UnshareFloorAnswer {
+  floor: Floor
+  /** The chats the person was taken out of, and what they could do there ('type' means what they typed is in those chats). */
+  removed: { id: string; name: string; was: 'view' | 'type' }[]
+  copy: string | null
+}
+
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */
 export interface ChatOpened {
   /** Actual native runtime engine; absent on legacy apps. */

@@ -36,6 +36,9 @@ export type FloorEventKind =
   | 'agent-copied'
   | 'template-stamped'
   | 'template-unstamped'
+  // F-231: the first owner shared (or unshared) the chats on a floor with one person: who, the level, how many chats; ids and names only.
+  | 'floor-shared'
+  | 'floor-unshared'
   // F-316 T4: one instance of a template messaged another (who to whom, the hop, how many characters; NEVER the words).
   | 'instance-message'
 
@@ -78,6 +81,9 @@ export interface FloorEvent {
   sharedWith?: { id: string; can: string }[]
   /** owners-assigned: how many rows were given an owner. template-stamped / template-unstamped: how many chats. */
   count?: number
+  /** F-231, floor-shared / floor-unshared: the person it was about, and (floor-shared) the level; count is how many chats. */
+  person?: FloorEventRef
+  level?: 'view' | 'type'
   /** F-316, agent-copied / template-stamped / template-unstamped: the template (its id and its name). */
   template?: FloorEventRef
   /** F-316, agent-copied: the chat it was copied from, and its floor. */
@@ -132,6 +138,9 @@ export function floorEventOf(e: FloorEventInput, at: string): FloorEvent {
   if (typeof e.restamped === 'object' && e.restamped !== null) set('restamped', { makers: count(e.restamped.makers) ?? 0, owners: count(e.restamped.owners) ?? 0, sharees: count(e.restamped.sharees) ?? 0 })
   set('sharedWith', Array.isArray(e.sharedWith) ? e.sharedWith.slice(0, LIST_CAP).map(s => ({ id: text(s.id, 64), can: text(s.can, 8) })) : undefined)
   set('count', count(e.count))
+  // F-231: the person a floor share was about, and its level (only 'view' or 'type' is kept).
+  set('person', ref(e.person))
+  if (e.level === 'view' || e.level === 'type') out.level = e.level
   set('template', ref(e.template))
   set('source', ref(e.source))
   set('sourceFloor', ref(e.sourceFloor))
@@ -169,6 +178,8 @@ export function describeFloorEvent(e: FloorEventInput): string {
     case 'agent-copied': return `${who} added "${e.agent?.name ?? '?'}" to ${on} as a copy of "${e.source?.name ?? '?'}" on floor "${e.sourceFloor?.name ?? '?'}", an instance of template "${e.template?.name ?? '?'}"${through}`
     case 'template-stamped': return `${who} made ${e.count ?? '?'} chats on ${on} instances of template "${e.template?.name ?? '?'}"`
     case 'template-unstamped': return `${who} took ${e.count ?? '?'} chats on ${on} out of template "${e.template?.name ?? '?'}"`
+    case 'floor-shared': return `${who} shared ${e.count ?? '?'} chats on ${on} with ${e.person?.name || 'a person'} as ${e.level === 'type' ? 'Can type' : 'Can view'}`
+    case 'floor-unshared': return `${who} took ${e.person?.name || 'a person'} out of the share lists of ${e.count ?? '?'} chats on ${on}`
     case 'instance-message': return `${who}'s chat "${e.agent?.name ?? '?'}" on ${on} sent a message to "${e.peer?.name ?? '?'}" on floor "${e.peerFloor?.name ?? '?'}", both instances of template "${e.template?.name ?? '?'}" (hop ${e.hop ?? '?'}, ${e.chars ?? '?'} characters; the words are not recorded)${through}`
   }
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { UI_WINDOW_MAX, windowName, WINDOWS_OFF_WHY } from '../../shared/ui-windows.ts'
 import { apiError, type WsSocket } from '../api.ts'
 
 // F-070: the way the overlay assistant reaches the screen. Every page of the app keeps one small
@@ -9,6 +10,12 @@ import { apiError, type WsSocket } from '../api.ts'
 //   page -> agent   {t:'state', visible, active, overlayOpen, route, phone}   (also the hello)
 //                   {t:'result', id, ok, result | error}
 //   agent -> page   {t:'cmd', id, cmd, args}
+//
+// F-274 + F-273 (orders o1e3c and ob4c0; his words are in shared/ui-windows.ts): a device (one browser) can have SEVERAL pages open, and now each page has a number, "Window N" (the lowest free one among that person's pages of that
+// device, kept while the page lives). With none named, a call goes exactly where it always went (the rule above). A call that names a window (`window`, 1 to 99) goes to THAT page of the DRIVEN device only: never another device (the
+// choice of device stays his: F-219), never another person's page, and a page that is not on screen is REFUSED, not driven (the Assistant's reading that a hidden window might be driven when named was not his words, and it would drive
+// what nobody is watching). The window named is the only one tried: a read that gets no answer is not moved to another window (the failover below is for a call that named none). Everything is behind the setting
+// "Windows by name" (opts.windows): off, the argument is refused, nothing is listed and no page is told its number.
 //
 // Order o355e (+ o2c59, oe3b1; Shubham: "When people use their screen they will be using localhost"): pages from EVERY origin reach this bridge (a
 // member PC passes its own pages' sockets on to the Server's, index.ts 'ui-page'), and every page and every call belongs to a PERSON. A page is
@@ -72,6 +79,21 @@ interface Client {
   scope: string
   /** o1e3c: until when a call to this page got no answer and it is passed over (a later time than now; 0: not). Any frame from the page ends it. */
   suspectUntil: number
+  /** F-274: this page's window number among its device's pages (0 until it has said which device it is). */
+  win: number
+  /** F-274: the device the number was given for (a page that changes its device id gets a number again). */
+  winDevice: string
+}
+
+/** F-274: one window of the driven device, as the tests and the tool layer see it. */
+export interface UiWindow {
+  n: number
+  name: string
+  visible: boolean
+  overlayOpen: boolean
+  route: string
+  /** The one a call with no `window` would drive. */
+  driven: boolean
 }
 
 /** Order od371: a device that has the overlay open, as the other devices are told about it. */
@@ -116,7 +138,9 @@ export interface UiBridge {
   /** The handler for a page's socket; `who` is whoever is signed in on that page (default: the owner's open app). */
   socket(): (ws: WsSocket, who?: UiWho) => void
   /** Runs `cmd` on the screen being looked at, of `as`'s own pages only, and answers what the page answered. */
-  call(cmd: string, args: unknown, timeoutMs?: number, as?: UiWho, guard?: (route: string) => boolean): Promise<unknown>
+  call(cmd: string, args: unknown, timeoutMs?: number, as?: UiWho, guard?: (route: string) => boolean, window?: number | null): Promise<unknown>
+  /** F-274: the numbered windows of the device `as`'s Assistant drives now (none: no device is driven). */
+  windows(as?: UiWho): UiWindow[]
   /** Is the screen a call of `as` would drive now a phone? null: there is none to drive (nobody is looking, or it is hidden). */
   onPhone(as?: UiWho): boolean | null
   /** Order od371: which device `as`'s Assistant drives now (null: none, or two are open and none is chosen). */
@@ -124,6 +148,8 @@ export interface UiBridge {
   /** Order od371: `as`'s devices with the overlay open right now. */
   overlayDevices(as?: UiWho): OverlayDevice[]
   clients(): UiClientInfo[]
+  /** F-274: tell every open page again what it is told (the setting "Windows by name" changed: "Window 2 of 3" appears or goes now, not at the page's next report). */
+  refresh(): void
   close(): void
 }
 
@@ -144,8 +170,10 @@ function answeredByAnother(result: unknown, skipped: number, ms: number): string
   return `Note: ${who} not answer in ${(ms / 1000).toFixed(1)} s, so this is ${other} window that is on screen. The next actions go to this one.\n\n${typeof result === 'string' ? result : JSON.stringify(result)}`
 }
 
-export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?: number } = {}): UiBridge {
+export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?: number; windows?: () => boolean } = {}): UiBridge {
   const firstTryMs = opts.firstTryMs ?? UI_READ_FIRST_TRY_MS
+  /** F-274: the setting "Windows by name" (index.ts gives the hub's). Without one (the tests that predate it) nothing about windows is said or done. */
+  const windowsOn = opts.windows ?? (() => false)
   const clients = new Set<Client>()
   const waiting = new Map<string, Waiting>()
   /** Order od371: the device he chose ("Act on this device"), per scope (o355e); none: the rule below decides. */
@@ -179,7 +207,9 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
 
   /** o1e3c: the pages a READ may be tried on when the one it went to does not answer: the same device's other pages that are on screen with the overlay open (never another device,
    *  never a hidden page), and, for a staff call, only pages its guard allows; best first. */
-  function alternatives(from: Client, tried: Set<Client>, guard?: (route: string) => boolean): Client[] {
+  function alternatives(from: Client, tried: Set<Client>, guard?: (route: string) => boolean, pinned = false): Client[] {
+    // F-274: a call that NAMED a window is answered by that window or by nobody.
+    if (pinned) return []
     return openClients(from.scope)
       .filter(x => x.device === from.device && x.visible && !tried.has(x) && (!guard || guard(x.route)))
       .sort((a, b) => (better(a, b) ? -1 : better(b, a) ? 1 : 0))
@@ -218,11 +248,57 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
     return best(scope)
   }
 
+  /** F-274: the lowest window number no other page of this page's device (and person) has. 0 when 99 are taken. */
+  function numberFor(me: Client): number {
+    const used = new Set<number>()
+    for (const c of clients) if (c !== me && c.scope === me.scope && c.device === me.device && c.win > 0) used.add(c.win)
+    for (let n = 1; n <= UI_WINDOW_MAX; n++) if (!used.has(n)) return n
+    return 0
+  }
+
+  /** F-274: the numbered pages of one device of one person, by number. */
+  const windowsOf = (scope: string, device: string): Client[] => [...clients].filter(c => c.scope === scope && c.device === device && c.win > 0).sort((a, b) => a.win - b.win)
+
+  /**
+   * F-274: a window's page, in words: its path (no query, 60 characters). A window the staff guard would not let that Assistant look at is called "a page not open to your Assistant": it learns only that such a window EXISTS
+   * (and whether it is on screen), never its path.
+   */
+  const pathWords = (c: Client, guard?: (route: string) => boolean): string => (guard && !guard(c.route) ? 'a page not open to your Assistant' : c.route.split('?')[0].slice(0, 60))
+
+  /** F-274: where a window is, in a few words (on screen or not, and its path). */
+  const whereWords = (c: Client, guard?: (route: string) => boolean): string => `${c.visible ? 'on screen' : 'in the background'}${c.route ? `, ${pathWords(c, guard)}` : ''}`
+
+  /** F-274: "Window 1 (on screen, /agents), Window 2 (this one, in the background, /tasks)": the open windows, `mark` (the one the answer is about) said so. */
+  const windowList = (list: Client[], mark?: Client, guard?: (route: string) => boolean): string => list.map(c => `${windowName(c.win)} (${c === mark ? 'this one, ' : ''}${whereWords(c, guard)})`).join(', ')
+
+  /**
+   * F-274: what an answer begins with when its window matters: the answer to ui_screen, or any answer to a call that named a window, on a device that has more than one window open. A device with one window
+   * (and the setting off) is answered exactly as before: nothing is added.
+   */
+  function labelled(out: unknown, by: Client, cmd: string, named: boolean, guard?: (route: string) => boolean): unknown {
+    if (!windowsOn() || typeof out !== 'string' || by.win === 0) return out
+    const list = windowsOf(by.scope, by.device)
+    if (list.length < 2) return out
+    if (cmd !== 'screen' && !named) return out
+    const head =
+      cmd === 'screen'
+        ? `This is ${windowName(by.win)} (${whereWords(by)}). The windows of this device are: ${windowList(list, by, guard)}. To look at or act on another one, give its number as \`window\`; with none, the one he is looking at is used.`
+        : // The page the call was sent to, by its path as the window last reported it (so a number that now means another page shows at once: "(Window 2, /tasks)").
+          `(${windowName(by.win)}${by.route ? `, ${pathWords(by, guard)}` : ''})`
+    return `${head}\n\n${out}`
+  }
+
   /** Order od371: every open device of a scope is told which one is driven, so each can say "Acting on this device" or "not driven". */
   function tellAll(scope: string) {
     const driven = driving(scope)
-    const msg = JSON.stringify({ t: 'acting', driven: driven?.device ?? null, devices: openDevices(scope).map(c => ({ device: c.device, name: c.name, phone: c.phone })) })
+    const base = { t: 'acting', driven: driven?.device ?? null, devices: openDevices(scope).map(c => ({ device: c.device, name: c.name, phone: c.phone })) }
+    const numbered = windowsOn()
     for (const c of inScope(scope)) {
+      // F-274: a page that is one of several windows of its device is also told which one it is, "Window 2 of 3"; with the setting off, or a lone window, the word is exactly what it was.
+      // "m" is the highest number in use (never fewer than the windows open): numbers are kept while a page lives, so Window 1 and Window 3 can be open with Window 2 gone, and "Window 3 of 2" would be nonsense.
+      const mine = numbered && c.win > 0 ? windowsOf(scope, c.device) : []
+      const of = mine.length > 0 ? Math.max(mine.length, mine[mine.length - 1].win) : 0
+      const msg = JSON.stringify(of > 1 ? { ...base, window: { n: c.win, of } } : base)
       try {
         c.ws.sendText(msg)
       } catch {
@@ -269,7 +345,7 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
   }
 
   /** A call to `first` and, for a READ that gets no answer, to the next page on screen of the same device (the note above UI_READ_FIRST_TRY_MS says why only a read). */
-  async function run(first: Client, cmd: string, args: unknown, timeoutMs: number, guard?: (route: string) => boolean): Promise<unknown> {
+  async function run(first: Client, cmd: string, args: unknown, timeoutMs: number, guard?: (route: string) => boolean, pinned = false): Promise<{ out: unknown; by: Client }> {
     const read = READS.has(cmd)
     const tried = new Set<Client>()
     let budget = timeoutMs
@@ -280,11 +356,11 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
     for (;;) {
       tried.add(c)
       // With another page on screen to try, a read waits only the short first wait; with none, as long as the call allows.
-      const wait = read && alternatives(c, tried, guard).length > 0 ? Math.min(budget, firstTryMs) : budget
+      const wait = read && alternatives(c, tried, guard, pinned).length > 0 ? Math.min(budget, firstTryMs) : budget
       const began = Date.now()
       try {
         const result = await attempt(c, cmd, args, wait, guard)
-        return tried.size > 1 ? answeredByAnother(result, tried.size - 1, lost) : result
+        return { out: tried.size > 1 ? answeredByAnother(result, tried.size - 1, lost) : result, by: c }
       } catch (e) {
         const status = (e as { status?: unknown } | null)?.status
         // An attempt that did not stop at the send (no answer in time, the page went away, the page said no) was a page ASKED; only 'not-sent' means nothing was handed over.
@@ -294,7 +370,7 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
         const spent = Date.now() - began
         lost += spent
         budget -= spent
-        const next = read && (status === 504 || status === 409) ? alternatives(c, tried, guard)[0] : undefined
+        const next = read && (status === 504 || status === 409) ? alternatives(c, tried, guard, pinned)[0] : undefined
         if (!next || budget <= 0) {
           // The LAST attempt may be a 'not-sent' (the second page's socket could not take the command) although the FIRST page was asked: the call was asked. staged() never overwrites, so say it outright.
           if (asked && typeof e === 'object' && e !== null) Object.assign(e, { stage: 'asked' })
@@ -314,7 +390,7 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
         return
       }
       const id = randomUUID()
-      const me: Client = { id, ws, visible: false, overlayOpen: false, route: '', phone: false, activeAt: now(), device: id, name: 'a device', scope, suspectUntil: 0 }
+      const me: Client = { id, ws, visible: false, overlayOpen: false, route: '', phone: false, activeAt: now(), device: id, name: 'a device', scope, suspectUntil: 0, win: 0, winDevice: '' }
       clients.add(me)
       ws.onText(text => {
         // o1e3c: a frame of any kind proves this page is alive: it is no longer passed over for not having answered.
@@ -333,6 +409,11 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
           if (typeof m.device === 'string' && m.device) me.device = m.device.slice(0, 80)
           if (typeof m.name === 'string' && m.name) me.name = m.name.replace(/\s+/g, ' ').trim().slice(0, 60) || 'a device'
           if (m.active === true) me.activeAt = now()
+          // F-274: numbered once it has said which device it is (and again if that changes), then kept while the page lives.
+          if (me.win === 0 || me.winDevice !== me.device) {
+            me.win = numberFor(me)
+            me.winDevice = me.device
+          }
           tellAll(scope)
         } else if (m.t === 'choose') {
           // Order od371: "Act on this device" on that device. Only a device with the overlay open can be chosen, and only among its own scope's.
@@ -363,7 +444,7 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
       })
     },
 
-    call(cmd, args, timeoutMs = UI_CALL_TIMEOUT_MS, as = UI_OWNER, guard?: (route: string) => boolean) {
+    call(cmd, args, timeoutMs = UI_CALL_TIMEOUT_MS, as = UI_OWNER, guard?: (route: string) => boolean, window: number | null = null) {
       // Every refusal in this function is made BEFORE any page is asked (staged 'not-sent'); what run() throws came after one was (staged 'asked').
       const notSent = (e: unknown) => Promise.reject(staged(e, 'not-sent'))
       let scope: string
@@ -375,14 +456,37 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
       if (ambiguous(scope)) {
         return notSent(apiError(409, 'The overlay is open on two of his devices (his phone and his PC) and he has not chosen which one the Assistant should drive. Ask him which one to use, and do not guess.'))
       }
-      const c = driving(scope)
-      if (!c) return notSent(apiError(409, 'No screen of the app is open: nobody is looking at the app right now. Ask him to open it (on any of his PCs, localhost or the tailnet address) and sign in.'))
-      if (!c.visible) return notSent(apiError(409, "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
+      const base = driving(scope)
+      if (!base) return notSent(apiError(409, 'No screen of the app is open: nobody is looking at the app right now. Ask him to open it (on any of his PCs, localhost or the tailnet address) and sign in.'))
+      // F-274: a window named. Only a window of the DRIVEN device (the choice of device is his), of this person's own pages (inScope), numbered; and it must be on screen.
+      let c = base
+      const named = window !== null
+      if (named) {
+        if (!windowsOn()) return notSent(apiError(409, WINDOWS_OFF_WHY))
+        const list = windowsOf(scope, base.device)
+        const found = list.find(x => x.win === window)
+        if (!found) {
+          return notSent(apiError(409, `There is no ${windowName(window)} open on this device. ${list.length > 0 ? `Open windows: ${windowList(list, undefined, guard)}.` : 'This device has no numbered windows yet.'} Name one of them, or leave \`window\` out to use the one he is looking at.`))
+        }
+        c = found
+      }
+      if (!c.visible) {
+        return notSent(apiError(409, named ? `${windowName(c.win)} is open but hidden (a background tab, a covered or minimised window, or a locked phone), so it is not driven. Ask him to bring it to the front, or name a window that is on screen.` : "The app's screen is open but hidden (the phone is locked or the tab is in the background), so there is nothing to drive. Ask him to look at the app."))
+      }
       // F-162 o7e6d: a guard (a staff chat's page rule) is checked against the page that will be driven, in the same step as the pick. Refused, fail closed.
       if (guard && !guard(c.route)) return notSent(apiError(403, 'That page is not open to your Assistant; it can look at the app\'s main pages only.'))
-      return run(c, cmd, args, timeoutMs, guard).catch(e => {
-        throw staged(e, 'asked')
-      })
+      return run(c, cmd, args, timeoutMs, guard, named)
+        .then(({ out, by }) => labelled(out, by, cmd, named, guard))
+        .catch(e => {
+          throw staged(e, 'asked')
+        })
+    },
+
+    windows(as = UI_OWNER) {
+      const scope = uiScope(as)
+      const base = scope === null ? null : driving(scope)
+      if (scope === null || !base) return []
+      return windowsOf(scope, base.device).map(c => ({ n: c.win, name: windowName(c.win), visible: c.visible, overlayOpen: c.overlayOpen, route: c.route, driven: c === base }))
     },
 
     onPhone(as = UI_OWNER) {
@@ -400,6 +504,10 @@ export function createUiBridge(now: () => number = Date.now, opts: { firstTryMs?
     overlayDevices: (as = UI_OWNER) => {
       const scope = uiScope(as)
       return scope === null ? [] : openDevices(scope).map(c => ({ device: c.device, name: c.name, phone: c.phone }))
+    },
+
+    refresh() {
+      for (const scope of new Set([...clients].map(c => c.scope))) tellAll(scope)
     },
 
     clients: () => [...clients].map(c => ({ id: c.id.slice(0, 8), visible: c.visible, overlayOpen: c.overlayOpen, route: c.route, phone: c.phone, idleMs: now() - c.activeAt, scope: c.scope })),

@@ -4,7 +4,7 @@ import { isTemplateId } from '../../shared/agent-template.ts'
 import type { Floor, FloorAgent } from '../../shared/agentic.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
-import { adminsAreOnlyTheOwner, memoryPersonId, ownerIdOfAgent } from './memory-people.ts'
+import { adminsAreOnlyTheOwner, chatIsShared, memoryPersonId, ownerIdOfAgent } from './memory-people.ts'
 import { flatText, snippet, terms, WordIndex } from './memory-search.ts'
 import { cleanSaid, redact } from './memory-turns.ts'
 
@@ -528,6 +528,8 @@ export interface NotebooksOptions {
   now?: () => number
 }
 
+/** F-231 (Agent 14's ruling, 26 Nov): what a chat that is shared with other people is told when it asks for its notebook. */
+export const SHARED_WHY = 'This chat is shared with other people, so its notebook is closed to it until that ends (a notebook is memory by another name). Nothing was saved and nothing was read.'
 const OFF_WHY = "This agent has no notebook (yet): the owner has not switched notebooks on for its floor. Nothing was saved and nothing was lost; use memory_save for the floor's notes."
 
 export function createNotebooks(o: NotebooksOptions): Notebooks {
@@ -1007,7 +1009,8 @@ export function createNotebooks(o: NotebooksOptions): Notebooks {
           for (const a of f.agents) {
             if (a.id === agent.id) continue
             const other = templateOf(settings, f, a, o.appOwnerId)
-            if (other && other.id === t) peers.push({ floorId: f.id, floorName: f.name, agent: a })
+            // F-231: a chat that is shared with other people is nobody's sibling for messages (it has no notebook either: forChat): it is not found, so nothing can be typed into it from here.
+            if (other && other.id === t && !chatIsShared(a)) peers.push({ floorId: f.id, floorName: f.name, agent: a })
           }
         }
         return { template: { id: t, name: row.name }, peers }
@@ -1266,6 +1269,9 @@ export function createNotebooks(o: NotebooksOptions): Notebooks {
 
   return {
     forChat(floor, agent) {
+      // F-231: a chat shared with other people has NO notebook, as it has no app memory (chatIsShared, the one predicate memory-people.ts keeps): a person it is shared with could read the notebook by asking the chat to print it, and one
+      // who can type would WRITE it for every instance on floors not shared with them. Closed here, so every door that asks (the three tools, the recall hook, the brief, message_instance) is closed with it, and opens again when the share ends.
+      if (chatIsShared(agent)) return { ok: false, why: SHARED_WHY }
       const found = templateOf(readSettings(), floor, agent, o.appOwnerId)
       if (!found) return { ok: false, why: OFF_WHY }
       return { ok: true, chat: chatFor(found, agent) }
