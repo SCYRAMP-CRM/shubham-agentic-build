@@ -2263,6 +2263,13 @@ mode, a setting the hub keeps. Types: `shared/crm.ts`. Shubham's words: the CRM 
   that calm sentence, not "refused (429)"; the conversation copies log nothing per chat meanwhile. The app's own sign-in says a CRM 429/503 is "busy", never "wrong password", and does not count it toward the five wrong tries a minute.
   The firewall's ceiling itself is an AWS setting and not this app's. Tests: `claude/crm-cooldown.test.ts`, `claude/crm-cooldown-wiring.test.ts`, `crm-files/crm-cooldown.test.ts`; tests that make a CRM answer 429/503 on purpose end the
   cooldown before each test (`crmCooldown.reset()`).
+  **A failed listing of the CRM drive is remembered (F-372, 26 Nov 2026, the retry-storm audit)** (`agent/crm-files/service.ts`, `LISTING_RETRY_MS`): the drive's listing (`org/hierarchy-access/me`, `org/projects`, `org/files?all=true`) used to be asked
+  again by the very next reader after a failure (the conversation copies every 5 s for each chat with a part due, the pins and the local sync every minute, the spool, the pages), 2-3 calls each time, which the cooldown above does not stop for a
+  500/502/504, a timeout or one route's 503. Now after a failed listing the CRM is not asked for another for 5 s, then 15, 45 and 60 s (the last repeats); readers get what they got before (a listing not older than 5 minutes is served, an older
+  one says the same failure again at once) and the CRM gets no calls. A listing that works, a change made here, a person's own "Try again" on a kept save, or being signed out ends it. The F-371 cooldown still comes first.
+  The audit itself (every retry against an outside service, with the rows that still need a wait): `C:\saw\retry-audit-agent5-20261126.md`.
+  Every wait here is kept as an absolute time, so each is clamped against a clock set back (Agent 14's note): a wait further off than its own maximum (the cooldown's cap, the drive listing's 60 s, the old usage reporter's 30 minutes) is the clock's
+  doing and has ended; the drive's remembered failure also ends at a sign-out or a sign-in; the OpenCode event stream's sleep ends at once on an abort.
 - **Routes** (`/agentic`): `GET /crm?origin=<the page's origin>&fresh=1` -> `{mode, url, check}` (`mode` is `bundled`, the
   default, or `frame`; `url` and `check` are for the frame way: the check of the address, kept 30 s per address and
   origin unless `fresh`; both null while there is no address); `PATCH /crm {url?, mode?}` (400 for a bad address or a

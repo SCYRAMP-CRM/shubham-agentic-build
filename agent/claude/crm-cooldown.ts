@@ -103,11 +103,29 @@ export function createCooldown(o: { now?: () => number; baseMs?: number; capMs?:
       // A logger that fails never decides what the app does.
     }
   }
+  /**
+   * F-372 (Agent 14's clock clamp): the wait is an absolute time, so a clock set back (by hours) would make a short wait last hours. No wait is longer than `cap`, so one further off than that is the clock's doing and has ended;
+   * the same for the time the last wait ended (a busy answer is "stale" if its request began before it) and for busy answers written down in the future.
+   */
+  const settle = (t: number) => {
+    if (until - t > cap) until = 0
+    if (lastUntil - t > cap) lastUntil = 0
+    if (busy.some(b => b.at > t)) busy = busy.filter(b => b.at <= t)
+  }
   return {
-    remaining: () => Math.max(0, until - now()),
-    active: () => until > now(),
+    remaining: () => {
+      const t = now()
+      settle(t)
+      return Math.max(0, until - t)
+    },
+    active: () => {
+      const t = now()
+      settle(t)
+      return until > t
+    },
     enter() {
       const t = now()
+      settle(t)
       if (until > t) return until - t
       if (streak > 0) {
         if (probing) return 1000
@@ -121,6 +139,7 @@ export function createCooldown(o: { now?: () => number; baseMs?: number; capMs?:
     stamp: () => now(),
     note(status, retryAfter, from = {}) {
       const t = now()
+      settle(t)
       if (isBusyStatus(status)) {
         // An answer that was already on its way when the wait began (several calls in flight): the same incident, not a new one.
         if (until > t) return

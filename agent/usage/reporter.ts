@@ -14,6 +14,13 @@ export const ROWS_PER_REPORT = 200
 export const READINGS_PER_REPORT = 20
 /** When the CRM says it is not there yet (404, 503) the usage waits this long. */
 export const CRM_PAUSE_MS = 30 * 60 * 1000
+/**
+ * F-372 (the retry-storm audit): a report that did not arrive, or that the CRM refused for any other reason than "not ready" (a 401, a 429, a 500...), used to be sent again at the next pass (every minute) for as long as it lasted, with a
+ * warn line each time. Now everything waits this long after the first such failure, then the next step; the last repeats. Any answer the CRM takes ends it.
+ */
+export const RETRY_STEPS_MS = [2 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000]
+/** ... and it is said in the log on the first failure and then on every this-many-th one in a row. */
+export const SAY_EVERY = 10
 /** A limits reading the same as the last one sent is not sent again for this long. */
 export const LIMITS_REPEAT_MS = 15 * 60 * 1000
 /** The same diagnostic is not said again for this long. */
@@ -67,7 +74,12 @@ export function createReporter(o: ReporterOptions): Reporter {
   let pauseUntil: number | null = null
   const latest = new Map<string, { reading: LimitsReading; hash: string; sentAt: number | null }>()
 
-  const paused = () => pauseUntil !== null && now() < pauseUntil
+  const paused = () => {
+    const t = now()
+    // F-372 (Agent 14's clock clamp): the clock was set back: no pause is longer than CRM_PAUSE_MS, so one further off than that is a clock's doing and ends now
+    if (pauseUntil !== null && pauseUntil - t > CRM_PAUSE_MS) pauseUntil = null
+    return pauseUntil !== null && t < pauseUntil
+  }
   // A diagnostic is said once per key per six hours, never once per pass (the passes run every minute).
   const said = new Map<string, number>()
   const note = (key: string, message: string) => {
@@ -80,6 +92,14 @@ export function createReporter(o: ReporterOptions): Reporter {
   const pause = (why: string) => {
     pauseUntil = now() + CRM_PAUSE_MS
     o.log?.warn(`claude usage: the CRM is not ready (${why}); trying again in 30 minutes`)
+  }
+  // F-372: failures in a row (a request that did not arrive, or a refusal that is not "not ready"): the wait grows, the log line is the first and every SAY_EVERY-th.
+  let failures = 0
+  const failed = (what: string) => {
+    failures += 1
+    const wait = RETRY_STEPS_MS[Math.min(failures - 1, RETRY_STEPS_MS.length - 1)]
+    pauseUntil = now() + wait
+    if (failures === 1 || failures % SAY_EVERY === 0) o.log?.warn(`claude usage: ${what}${failures > 1 ? ` (${failures} times in a row)` : ''}; trying again in ${Math.round(wait / 60_000)} minutes`)
   }
 
   async function sendRows(rows: LedgerRow[]) {
@@ -107,8 +127,7 @@ export function createReporter(o: ReporterOptions): Reporter {
           answer = await o.post(login, 'v1/org/christopher-usage', body)
         } catch (e) {
           o.ledger.abortSend(part)
-          o.log?.warn(`claude usage: a report did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
-          return
+          return failed(`a report did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
         }
         if (answer.status === 404 || answer.status === 503) {
           o.ledger.abortSend(part)
@@ -116,9 +135,9 @@ export function createReporter(o: ReporterOptions): Reporter {
         }
         if (answer.status < 200 || answer.status >= 300) {
           o.ledger.abortSend(part)
-          o.log?.warn(`claude usage: the CRM refused a report (status ${answer.status}); it is tried again later`)
-          return
+          return failed(`the CRM refused a report (status ${answer.status})`)
         }
+        failures = 0
         o.ledger.markSent(part)
         o.log?.info(`claude usage: ${part.length} hour row${part.length === 1 ? '' : 's'} reported`)
       }
@@ -141,8 +160,7 @@ export function createReporter(o: ReporterOptions): Reporter {
     try {
       answer = await o.post(login, 'v1/org/christopher-usage/limits', { build, readings })
     } catch (e) {
-      o.log?.warn(`claude usage: the limits did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
-      return
+      return failed(`the limits did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
     }
     if (answer.status === 404 || answer.status === 503) return pause(`limits, status ${answer.status}`)
     if (answer.status === 400) {
@@ -151,14 +169,14 @@ export function createReporter(o: ReporterOptions): Reporter {
       const one = { build, observedAt: newest.observedAt, fiveHour: newest.fiveHour, week: newest.week, subscriptionKey: newest.subscriptionKey }
       try {
         const again = await o.post(login, 'v1/org/christopher-usage/limits', one)
-        if (again.status < 200 || again.status >= 300) return o.log?.warn(`claude usage: the CRM refused the limits (status ${again.status})`)
-      } catch {
-        return
+        if (again.status < 200 || again.status >= 300) return failed(`the CRM refused the limits (status ${again.status})`)
+      } catch (e) {
+        return failed(`the limits did not reach the CRM (${e instanceof Error ? e.message : String(e)})`)
       }
     } else if (answer.status < 200 || answer.status >= 300) {
-      o.log?.warn(`claude usage: the CRM refused the limits (status ${answer.status})`)
-      return
+      return failed(`the CRM refused the limits (status ${answer.status})`)
     }
+    failures = 0
     for (const x of due) x.sentAt = now()
     o.log?.info(`claude usage: ${readings.length} limits reading${readings.length === 1 ? '' : 's'} reported (${hash.slice(0, 8)})`)
   }

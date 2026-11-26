@@ -41,9 +41,16 @@ export interface LinkOptions {
    * it. Not asked when another controller took over (two agents must not fight over the host).
    */
   again?: () => Promise<{ port: number; token: string } | null>
-  /** Tests: how long to wait between tries to get the host back. */
+  /** Tests: how long to wait before the first try to get the host back (it doubles with each failure in a row). */
   retryMs?: number
+  /** Tests: the longest wait between tries (30 s, or `retryMs` if that is longer). */
+  retryMaxMs?: number
 }
+
+/** F-372 (the retry-storm audit): the host that is gone is asked for again after 2 s, then 4, 8, 16 and 30 s, and the log says the first failure and then every this-many-th one in a row. */
+export const HOST_RETRY_SAY_EVERY = 10
+/** The wait before the next try to get the host back, after `failures` failures in a row (0 before the first): `base` doubling up to `longest`. */
+export const hostRetryWaitMs = (failures: number, base = 2000, longest = Math.max(base, 30_000)): number => Math.min(base * 2 ** Math.min(Math.max(0, failures), 10), longest)
 
 const str = (v: unknown) => (typeof v === 'string' ? v : null)
 
@@ -85,11 +92,23 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
       if (!o.again || /another controller|shutdown/.test(why)) return
       void (async () => {
         // The chats that ran in it have ended for the pool (-1). A host that is back (or a new one) is joined again.
+        // F-372: each try asks the app to START a host if none is there, so a host that never comes back must not be asked for every 2 s forever: the wait doubles (2, 4, 8, 16, 30 s) and the log is the first failure and every 10th.
+        const base = o.retryMs ?? 2000
+        const longest = o.retryMaxMs ?? Math.max(base, 30_000)
+        let failures = 0
+        const failed = (why: string) => {
+          failures += 1
+          if (failures === 1 || failures % HOST_RETRY_SAY_EVERY === 0) o.log.warn(`chat host: not back yet (${why}${failures > 1 ? `; ${failures} tries in a row` : ''})`)
+        }
         while (!closed) {
-          await new Promise(r => setTimeout(r, o.retryMs ?? 2000).unref())
+          await new Promise(r => setTimeout(r, hostRetryWaitMs(failures, base, longest)).unref())
+          if (closed) return
           try {
             const where = await o.again!()
-            if (!where) continue
+            if (!where) {
+              failed('no host could be started')
+              continue
+            }
             const next = await connectChatHost({ port: where.port, token: where.token })
             if (closed) return void next.close()
             client = next
@@ -100,7 +119,7 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
             for (const cb of backCbs) cb()
             return
           } catch (e) {
-            o.log.warn(`chat host: not back yet (${e instanceof Error ? e.message : String(e)})`)
+            failed(e instanceof Error ? e.message : String(e))
           }
         }
       })()

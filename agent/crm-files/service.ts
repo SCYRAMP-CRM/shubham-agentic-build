@@ -135,6 +135,12 @@ export interface CrmFilesOptions {
 export const BYTES_CACHE_MAX_FILE = 1024 * 1024 * 1024
 /** o4fb7: how old a listing of the CRM may be and still be answered at once while a fresh one is fetched (ms). */
 const STALE_MS = 5 * 60_000
+/**
+ * F-372 (26 Nov 2026, the retry-storm audit): after a listing of the CRM FAILED (a 500, a 502, a timeout, one route's 503 that starts no wait) the CRM is not asked for another listing for this long, the first time; each further
+ * failure in a row waits the next step, and the last repeats. Before this nothing remembered a failure, so every reader (the conversation copies every 5 s for each chat with something to send, the pins and the local sync every minute,
+ * the spool, the pages) asked again at once, 2 or 3 calls each time: hundreds a minute in an outage. Exported for the tests.
+ */
+export const LISTING_RETRY_MS = [5_000, 15_000, 45_000, 60_000]
 
 /**
  * oe692 (Shubham, 14 Nov 2026: "one more folder in the mounted drive called Marketing Projects"): the drive's top folder for the CRM's marketing projects. It is always there
@@ -470,13 +476,32 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   /** o4fb7: changes whenever what this knows of the tree changes (a new listing of the CRM, or a change made here): see generation(). */
   let gen = 0
   let loading: Promise<Snapshot> | null = null
+  /** F-372: the listings that failed in a row, when the next one may be asked for, and the failure to say again until then. */
+  let listFailures = 0
+  let listRetryAt = 0
+  let listFailure: CrmFilesError | null = null
+  /** Who was signed in when that listing failed ('out' when nobody): a sign-out or a sign-in ends the remembered failure. */
+  let listFailureFor = ''
+  const whoIsIn = () => {
+    const s = client.session()
+    return s.signedIn ? `in:${s.username ?? s.name ?? ''}` : 'out'
+  }
   let lastWrite: boolean | null = null
   let upload: { ok: boolean | null; at: number } = { ok: null, at: 0 }
   const groupCache = new Map<string, { at: number; groups: RawGroup[] }>()
 
+  /** F-372: no failed listing is remembered: the next reader may ask the CRM for one. */
+  function forgetListingFailure() {
+    listFailures = 0
+    listRetryAt = 0
+    listFailure = null
+  }
+
   function invalidate(project?: string) {
     snap = null
     gen++
+    // F-372: a change made here means the CRM just answered: a listing may be asked for again at once.
+    forgetListingFailure()
     if (project) groupCache.delete(project)
     else groupCache.clear()
   }
@@ -487,6 +512,14 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     if (crmCooldown.active()) {
       if (snap) return snap
       throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmBusy)
+    }
+    // F-372: after a listing that failed the CRM is not asked again for a while, by anyone. What readers get is what they got before, minus the calls: a listing not older than STALE_MS is served (as the refresh below
+    // would have served it), anything older says the same failure again at once.
+    // The clock was set back (Agent 14): no wait is longer than the last step, so one further off than that is the clock's doing and has ended. A sign-out or a sign-in ends it too.
+    if (listRetryAt - now() > LISTING_RETRY_MS[LISTING_RETRY_MS.length - 1] || (listRetryAt > 0 && listFailureFor !== whoIsIn())) forgetListingFailure()
+    if (listRetryAt > now()) {
+      if (snap && ttl > 0 && now() - snap.at < STALE_MS) return snap
+      throw listFailure ?? new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
     }
     // o4fb7: a listing a little older than `ttl` is answered at once and a fresh one is fetched behind it, so opening a folder never waits for the CRM's lists (0.3-0.7 s
     // each time the 10 s ran out); never one older than STALE_MS. A change made here (invalidate) still waits for the fresh one; ttl 0 (tests) always waits.
@@ -557,7 +590,26 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       gen++
       warmSizes(s)
       return s
-    })().finally(() => (loading = null))
+    })()
+      .then(
+        s => {
+          forgetListingFailure()
+          return s
+        },
+        (e: unknown) => {
+          // Not being signed in is not waited on (signing in again must work at once); anything else the CRM or the line answered is.
+          if (e instanceof CrmFilesError && e.code === 'crm-signin') {
+            forgetListingFailure()
+          } else {
+            listFailure = e instanceof CrmFilesError ? e : new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
+            listFailureFor = whoIsIn()
+            listRetryAt = now() + LISTING_RETRY_MS[Math.min(listFailures, LISTING_RETRY_MS.length - 1)]
+            listFailures += 1
+          }
+          throw e
+        },
+      )
+      .finally(() => (loading = null))
     return loading
   }
 
@@ -1676,6 +1728,12 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         find: async (parent, name) => (await childrenOf(parent)).children.find(c => sameName(c.name, name)) ?? null,
       },
     })
+    // F-372: "Try again" is a person's own request and is made at once: it does not wait for the pause that follows a failed listing (the spool's own timed retries do).
+    const retryKept = spool.retry.bind(spool)
+    spool.retry = id => {
+      forgetListingFailure()
+      return retryKept(id)
+    }
     if (o.spool?.autoStart !== false) spool.start()
   }
 
