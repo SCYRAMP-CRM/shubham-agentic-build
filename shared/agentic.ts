@@ -192,6 +192,11 @@ export interface Floor {
   local?: boolean
   /** F-118: who made the floor (a floor with nothing visible to a person is hidden from them, unless they made it). */
   createdBy?: ChatOwner | null
+  /**
+   * F-231 row 6: computed per connection (shared/auth.ts scopeFloors), never stored. True for a person who does not manage the floor (not an administrator, not the one who made it): its `codeDir`, `folders` and `createdBy`
+   * are then blanked, and the page says the folder is its owner's rather than showing an empty box. Absent for everyone who sees them.
+   */
+  folderHidden?: true
   agents: FloorAgent[]
 }
 
@@ -265,8 +270,11 @@ export interface FloorsAnswer {
   /** F-021: where sessions running nowhere were run last. */
   last: Record<string, ChatLast>
   team: AgenticTeam | null
-  /** The folder a floor without its own works in. */
-  defaultCodeDir: string
+  /**
+   * The folder a floor without its own works in. F-231 row 6 (Agent 14's read): null for anyone who is not an administrator (it carries the owner's Windows user name); the page then falls back to
+   * the generic "Documents\shubham-agentic" in its hint. An administrator, and a machine (a member PC), get it as before.
+   */
+  defaultCodeDir: string | null
 }
 
 /** PATCH /agentic/floors/:id. `agents` replaces the whole list; session bindings are kept by the agent. */

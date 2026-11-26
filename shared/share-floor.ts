@@ -86,9 +86,12 @@ export function shareWarnings(personName: string, n: number): { history: string;
 export function othersLine(others: { ownerName: string }[]): string {
   const names = [...new Set(others.map(o => o.ownerName))]
   const n = others.length
-  return `${n} of these ${n === 1 ? 'chat belongs' : 'chats belong'} to ${names.join(', ')}, not to you: ${n === 1 ? 'it holds' : 'they hold'} ${n === 1 ? 'that' : 'their'} conversation${n === 1 ? '' : 's'}.`
+  return `${n} of these chats ${n === 1 ? 'belongs' : 'belong'} to ${andList(names)}, not to you: ${n === 1 ? 'it holds' : 'they hold'} ${n === 1 ? 'that' : 'their'} conversation${n === 1 ? '' : 's'}.`
 }
 export const OTHERS_TICK = 'Include them too'
+
+/** "A", "A and B", "A, B and C": names read as a sentence, not as a comma list that could be one long name. */
+export const andList = (names: string[]): string => (names.length <= 1 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`)
 
 /** Said beside every Take out: it is not an undo. */
 export const unshareNotUndo = (personName: string): string =>
@@ -111,15 +114,17 @@ export function unshareTypedWarning(personName: string, typed: number): string |
 
 export const unshareButtonWords = (floorName: string, n: number, personName: string) => `Take ${personName} out of the ${chats(n)} on ${floorName}`
 
-const WHY: Record<SkipWhy, string> = {
-  assistant: 'an Assistant (never shared in bulk)',
-  'pc-control': 'a PC Control chat',
-  owner: 'already theirs',
-  'other-owner': 'belongs to someone else (tick the box to include it)',
-  already: 'already shared that way',
-  'has-type': 'has Can type there (not lowered)',
+// Each reason is a head and, for three of them, a note. In the preview the whole reason sits in brackets after the chat's name, so the note follows a colon (never a second bracket inside the first); the receipt keeps the note in brackets, as it was.
+const WHY: Record<SkipWhy, { head: string; note: string | null }> = {
+  assistant: { head: 'an Assistant', note: 'never shared in bulk' },
+  'pc-control': { head: 'a PC Control chat', note: null },
+  owner: { head: 'already theirs', note: null },
+  'other-owner': { head: 'belongs to someone else', note: 'tick the box to include it' },
+  already: { head: 'already shared that way', note: null },
+  'has-type': { head: 'has Can type there', note: 'not lowered' },
 }
-export const skipWhyWords = (why: SkipWhy): string => WHY[why]
+export const skipWhyWords = (why: SkipWhy): string => (WHY[why].note ? `${WHY[why].head}: ${WHY[why].note}` : WHY[why].head)
+const whyInReceipt = (why: SkipWhy): string => (WHY[why].note ? `${WHY[why].head} (${WHY[why].note})` : WHY[why].head)
 
 /** What the receipt says after a share: how many, how many raised, what was left and why, and the copy kept. */
 export function sharedReceipt(answer: Pick<ShareFloorAnswer, 'shared' | 'skipped' | 'copy'>, personName: string, can: ShareLevel): string[] {
@@ -128,7 +133,7 @@ export function sharedReceipt(answer: Pick<ShareFloorAnswer, 'shared' | 'skipped
   if (answer.skipped.length) {
     const by = new Map<SkipWhy, string[]>()
     for (const s of answer.skipped) by.set(s.why, [...(by.get(s.why) ?? []), s.name])
-    for (const [why, names] of by) lines.push(`Left as it was, ${WHY[why]}: ${names.join(', ')}.`)
+    for (const [why, names] of by) lines.push(`Left as it was, ${whyInReceipt(why)}: ${names.join(', ')}.`)
   }
   if (answer.copy) lines.push(`A copy of floors.json was kept first (${answer.copy}).`)
   return lines

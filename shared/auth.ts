@@ -208,6 +208,8 @@ interface OwnedAgent {
 }
 interface OwnedFloor<A extends OwnedAgent> {
   createdBy?: ChatOwner | null
+  codeDir?: string | null
+  folders?: Record<string, string>
   agents: A[]
 }
 
@@ -216,14 +218,18 @@ interface OwnedFloor<A extends OwnedAgent> {
  * nothing visible left removed (unless this person made it), every chat tagged with `access` and
  * `can`, and `sharedWith` kept only for the owner and the admins. Copies: the input is not changed.
  * `scope` narrows to one tab; 'all' is the admin's (the caller refuses it for anyone else).
+ *
+ * F-231 row 6 (Agent 14's read: "a sharee already sees the floor's instructions, work folder (with the owner's Windows user name)"; the Lead's ruling): a person who does NOT manage a floor (not an
+ * administrator, not the open app, not the one who made it: the same test as `needFloor` 'manage') gets its folder blanked: `codeDir` null, `folders` {}, `createdBy` null, and `folderHidden` true so the
+ * page can say so instead of showing an empty box. The floor's instructions (`globalPrompt`) and each chat's brief stay visible.
  */
 export function scopeFloors<A extends OwnedAgent, F extends OwnedFloor<A>>(
   floors: readonly F[],
   person: Pick<AuthPerson, 'id'> | null,
   admins: readonly string[] = [SBSKRRT_ID],
   scope?: AuthScope,
-): (Omit<F, 'agents'> & { agents: (A & { access: ChatAccess; can: ChatCan })[] })[] {
-  const out: (Omit<F, 'agents'> & { agents: (A & { access: ChatAccess; can: ChatCan })[] })[] = []
+): (Omit<F, 'agents'> & { agents: (A & { access: ChatAccess; can: ChatCan })[]; folderHidden?: true })[] {
+  const out: (Omit<F, 'agents'> & { agents: (A & { access: ChatAccess; can: ChatCan })[]; folderHidden?: true })[] = []
   for (const f of floors) {
     const agents: (A & { access: ChatAccess; can: ChatCan })[] = []
     for (const a of f.agents) {
@@ -234,7 +240,9 @@ export function scopeFloors<A extends OwnedAgent, F extends OwnedFloor<A>>(
       agents.push({ ...a, access: r.access, can: r.can, sharedWith: seesList ? (a.sharedWith ?? []) : [] })
     }
     const madeByMe = !!person && f.createdBy?.id === person.id && (!scope || scope === 'mine')
-    if (agents.length || madeByMe) out.push({ ...f, agents })
+    if (!agents.length && !madeByMe) continue
+    const manages = !person || admins.includes(person.id) || f.createdBy?.id === person.id
+    out.push(manages ? { ...f, agents } : { ...f, agents, codeDir: null, folders: {}, createdBy: null, folderHidden: true })
   }
   return out
 }

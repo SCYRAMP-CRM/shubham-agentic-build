@@ -8163,8 +8163,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const all = allFloors()
     const seen = access.visible(c, all)
     const mine = <T>(m: Record<string, T>) => (seen ? Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid))) : m)
-    return { floors: access.scope(c, all.filter(f => !isPcControl(f)), want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir,
+    // F-231 row 6 (Agent 14's read): the default folder carries the owner's Windows user name, so it goes to an administrator only (isAdmin is also true for a machine: a member PC is unaffected). The page uses it as the
+    // placeholder and hint of a floor's Folder box, which only someone who manages the floor sees; it has its own generic fallback.
+    return { floors: access.scope(c, all.filter(f => !isPcControl(f)), want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir: access.isAdmin(c) ? defaultCodeDir : null,
       engineSwitchContinuity: mode() === 'member' ? replica.engineSwitchContinuity : { version: 1, failClosed: true, homePcPreparation: true } }
+  }
+
+  /**
+   * F-231 row 6 (Agent 14's third door): an answer that carries a FLOOR to a person (the tune and the session answers: a chat's owner may ask for them on a floor they do not manage) is that floor as the person may see it, by the
+   * same function the floors list and the floors event use (access.scope). Without it a chat that was moved onto someone's floor handed them the whole floor back: its folder, its maker and every other chat's brief and share list.
+   * An administrator, and a call with no caller (an internal one), get the floor as it is.
+   */
+  function floorFor(c: Caller | undefined, floor: Floor): Floor {
+    if (!c || access.isAdmin(c)) return floor
+    return access.scope(c, [floor])[0] ?? { ...floor, agents: [], codeDir: null, folders: {}, createdBy: null, folderHidden: true }
   }
 
   /** F-118: replaces who a chat is shared with. People are named by CRM id; their names are the CRM's, from the sign-in directory. */
@@ -9274,7 +9286,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function tuneAgent(floorId: string, agentId: string, raw: unknown, caller?: Caller): Promise<TuneAnswer> {
     requireLegacyExecution(agentOf(floorOf(floorId), agentId), defaultsNow())
     if (!isObject(raw)) throw apiError(400, 'Expected {model?, effort?, ultracode?}')
-    if (raw.codexModel !== undefined || raw.codexEffort !== undefined) return tuneCodex(floorId, agentId, raw)
+    if (raw.codexModel !== undefined || raw.codexEffort !== undefined) return tuneCodex(floorId, agentId, raw, caller)
     const req: TuneRequest = {}
     if (raw.model !== undefined) {
       if (!(AGENT_MODELS as readonly unknown[]).includes(raw.model)) throw apiError(400, 'model is opus, sonnet, haiku, or "" for the default')
@@ -9295,7 +9307,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const model = req.model ?? a.model
     const effort = req.effort ?? a.effort
     const ultracode = req.ultracode ?? a.ultracode
-    const floor = floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, model, effort, ultracode } : x)) })
+    const floor = floorFor(caller, floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, model, effort, ultracode } : x)) }))
 
     const d = defaultsNow()
     const effUltra = ultracode ? ultracode === 'on' : d.ultracode
@@ -9327,7 +9339,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * F-134: a Codex agent's model and effort. They are kept on the agent and used at its chat's next start (a running Codex chat is not typed into: its model and
    * reasoning level are read from its profile when it starts).
    */
-  async function tuneCodex(floorId: string, agentId: string, raw: Row): Promise<TuneAnswer> {
+  async function tuneCodex(floorId: string, agentId: string, raw: Row, caller?: Caller): Promise<TuneAnswer> {
     const before = floorOf(floorId)
     const a = agentOf(before, agentId)
     requireLegacyExecution(a, defaultsNow())
@@ -9336,7 +9348,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (raw.codexEffort !== undefined && !(CODEX_EFFORTS as readonly unknown[]).includes(raw.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, max, or "" for the one Codex chooses')
     const codexModel = raw.codexModel !== undefined ? String(raw.codexModel).trim().slice(0, CODEX_MODEL_MAX) : (a.codexModel ?? '')
     const codexEffort = raw.codexEffort !== undefined ? (raw.codexEffort as CodexEffort) : (a.codexEffort ?? '')
-    const floor = floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, codexModel, codexEffort } : x)) })
+    const floor = floorFor(caller, floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, codexModel, codexEffort } : x)) }))
     const running = !!a.sessionId && !!whereAll()[a.sessionId]
     return {
       floor,
@@ -10224,14 +10236,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const floor = floorOf(id)
         const a = agentOf(floor, agentId)
         const next = r.body.sessionId.trim()
+        // F-231 row 6 (Agent 14's third door): the floor in the answer is the floor as THIS person may see it (floorFor).
+        const who = callerOf(r)
         if (keepsAssistantHistory(a) && a.sessionId && next !== a.sessionId) {
           if (next) throw apiError(409, 'The Assistant keeps its conversation when closed. Replacing its session here is refused; use a checked engine conversion to carry history.')
           stopAnywhere(a.sessionId)
-          return { floor, hasTranscript: !!historyFile(a.sessionId), preserved: true }
+          return { floor: floorFor(who, floor), hasTranscript: !!historyFile(a.sessionId), preserved: true }
         }
         if (a.sessionId && a.sessionId !== next) stopAnywhere(a.sessionId)
         const after = floors.bindSession(id, agentId, next || null)
-        return { floor: after, hasTranscript: next ? !!findTranscript(next, projectsDir) : false }
+        return { floor: floorFor(who, after), hasTranscript: next ? !!findTranscript(next, projectsDir) : false }
       },
     ],
     [
