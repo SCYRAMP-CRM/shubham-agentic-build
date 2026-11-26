@@ -57,6 +57,7 @@ import {
   type FloorAgent,
   type FloorPatch,
   type FloorsAnswer,
+  type OrgDefaultAnswer,
   type NewAgent,
   type DefaultModel,
   type OpenChatRequest,
@@ -178,6 +179,7 @@ import { templateName } from '../../shared/agent-template.ts'
 import { INSTANCE_TEXT_MAX, instanceHeader } from '../../shared/instance-message.ts'
 import { createInstanceMessages, instanceTextProblem } from './instance-messages.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
+import { appliedFromCopy, createOrgDefault, NO_ORG_DEFAULT, orgDefaultView, parseOrgCopy, type OrgApplied, type OrgDefaultKept } from './org-default.ts'
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
 import { createChatSettings } from './chat-settings.ts'
@@ -523,6 +525,8 @@ export interface AgenticOptions {
   log?: Logger
   /** Where a floor with no folder of its own works: Documents\shubham-agentic. */
   defaultCodeDir?: string
+  /** F-284, tests: the clock the office default's cache and timer use (default Date.now), so a test can let ten minutes or a day pass. */
+  orgDefaultClock?: () => number
   /** CLAUDE_CODE_OAUTH_TOKEN as this account has it now (F-007). */
   token?: () => string | null
   /** 10 Nov 2026: an agent's message to a plain native Claude chat is typed the old direct way (one paste, one Enter, no receipt). true = the checked
@@ -672,6 +676,8 @@ export interface Agentic {
   crmProxy: Pick<CrmProxy, 'requestAs'>
   /** F-211: every chat's conversation copied into the CRM drive (conversations.ts); tests look now with tick(). */
   conversations: Pick<Conversations, 'tick' | 'status'>
+  /** F-284: reads the office's default model and effort from the CRM now (the timer does it soon after the app starts and every 10 minutes; a chat start never does): for tests, and for the page's "read it again". Never throws. */
+  refreshOrgDefault(): Promise<void>
   mount: ApiMount
   /** Order o5dc4: the Browser's routes and live view, under /browser (agent/browser/mount.ts; the owner's only). */
   browserMount: ApiMount
@@ -807,6 +813,8 @@ interface Replica {
   floors: Floor[]
   /** F-067: the hub's defaults for model, effort and ultracode. */
   defaults?: ChatDefaults
+  /** F-284: the hub's last good read of the CRM's office default (org-default.ts), as its state frame says it; null: none. Not saved to replica.json: a restart waits for the hub's next frame. */
+  orgDefault?: OrgDefaultKept | null
   where: Record<string, { id: string; name: string; state: ChatState }>
   last: Record<string, ChatLast>
   marks: Record<string, FileMark>
@@ -1256,6 +1264,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
   let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'), log: o.log, ...(o.crmUrl !== undefined ? { crmUrl: o.crmUrl } : {}) })
+  // F-284 (Shubham, order o3177): the office's default model and effort, read from the CRM when it has saved one, on the same PC session (org-default.ts): ONE GET, never a write, never waited for at a chat start. A member PC reads
+  // nothing here (its hub does). What it gives a chat is orgDefaultFor, used at the Claude start and at a tune.
+  const orgDefault = createOrgDefault({ proxy: crmProxy, ...(o.log ? { log: o.log } : {}), ...(o.orgDefaultClock ? { now: o.orgDefaultClock } : {}), active: () => mode() !== 'member', onChange: () => pushState() })
+  orgDefault.start()
+  /**
+   * F-284: what the office's default gives this agent's chat when neither the agent nor Settings > Chats says (a fallback only, field by field, model and effort; never ultracode): only a native-Claude chat (not a Codex, OpenCode or
+   * Codex-in-Claude one), and only what the office SAVED. The empty answer is exactly "nothing", so a start without it is byte-identical to the one before F-284 (spawn-golden.test.ts).
+   */
+  function orgDefaultFor(agent: FloorAgent): OrgApplied {
+    if (executionIdentityOf(agent, defaultsNow()).profile !== 'claude-native-v1') return NO_ORG_DEFAULT
+    // A member PC never asks the CRM: it has the hub's last good read from the state frame, kept 24 hours from when the hub read it.
+    return mode() === 'member' ? appliedFromCopy(replica.orgDefault ?? null, Date.now()) : orgDefault.get()
+  }
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
   const crmGoals = createCrmGoals({ proxy: crmProxy, ...(o.log ? { log: o.log } : {}) })
   // F-334: which CRM goal was made by which floor's chat (the app's own small file; the CRM keeps no such field). Written only by the crm_goal_add case of toolFor, read only by GET /goal-floors.
@@ -3022,8 +3043,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // memory-door: B1
     const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, withNotebook(o.memory?.start ? memoryBrief(agent) : '', floor, agent), orderReplies(), tasksToGoalsFor(agent)))
     // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
+    // F-284 (order o3177): and, when neither the agent nor Settings > Chats says, the office's default model and effort from the CRM, if the office has SAVED one (org-default.ts): a fallback, after both, as spawn flags
+    // (nothing is typed into a chat, nothing is written to Claude Code's settings). Nothing saved, no answer, an old CRM: nothing, and the chat starts exactly as before.
     const dflt = defaultsNow()
-    const effort = agent.effort || dflt.effort
+    const org = orgDefaultFor(agent)
+    const effort = agent.effort || dflt.effort || org.effort
     const ultracode = agent.ultracode ? agent.ultracode === 'on' : dflt.ultracode
     // Per-agent MCP servers (mcp-registry.ts): only what this agent was given, else the shared file as ever.
     // F-078 scope fix: with the strict way (the default) the chat's file is its own and lists the servers by name in the log (never their values).
@@ -3044,7 +3068,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     voiceLockGiven = null
     // Order occ4c: a managed native Claude run starts at the executable its capability proved (nativeExecutable), never a fresh lookup.
-    const started = chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows,
+    const started = chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model || org.model, effort, resume, cols: size.cols, rows: size.rows,
       ...(nativeExecutable ? { claudeBin: nativeExecutable } : {}) })
     // F-221 (ob98a, T4): this run has the voice lock when its start was given hooks-orchestrator.json (chatSettings); kept by its start time.
     if (voiceLockGiven === sid) voiceLocks.started(sid, started.startedAt)
@@ -3370,7 +3394,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const staffClasses = hubStaffClasses(list)
       classesPushed = classesFingerprint(staffClasses)
       // Orders of95c / o9ccb / ocf0e: staffTyping, the choice in force here, so the members type by the Server's choice (PC link only).
-      const state = { t: 'state', floors: list, staffClasses, staffTyping: staffTyping.get(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true }, terminalJudgesPerson: 1 }
+      const state = { t: 'state', floors: list, staffClasses, staffTyping: staffTyping.get(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), orgDefault: orgDefault.copy(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true }, terminalJudgesPerson: 1 }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -3560,6 +3584,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         floors: raw.floors as Floor[],
         pcControl: isObject(raw.pcControl) && Array.isArray(raw.pcControl.workspaces) ? raw.pcControl as unknown as PcControlAnswer : undefined,
         defaults: parseDefaults(raw.defaults),
+        orgDefault: parseOrgCopy(raw.orgDefault, Date.now()),
         where: isObject(raw.where) ? (raw.where as Replica['where']) : {},
         last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {},
         marks: isObject(raw.marks) ? (raw.marks as Record<string, FileMark>) : {},
@@ -9311,10 +9336,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
     const d = defaultsNow()
     const effUltra = ultracode ? ultracode === 'on' : d.ultracode
+    // F-284 (the Lead's condition 2, 26 Nov 2026: nothing about the office default is ever typed into a chat): set BACK TO DEFAULT, with neither this agent nor Settings > Chats naming one, under a saved office model (or effort), the chat is
+    // not told `/model default` (or `/effort auto`) now. That would put it on Claude's own choice while its next start takes the office's, and `/model` writes Claude Code's own global settings. It applies at the chat's next start.
+    const org = orgDefaultFor(a)
+    const officeModel = req.model !== undefined && model === '' && d.model === '' && org.model !== ''
+    const officeEffort = req.effort !== undefined && effort === '' && d.effort === '' && org.effort !== ''
     // What to type: a /effort level turns ultracode off, so with ultracode wanted it is asked for again after one.
     const commands: string[] = []
-    if (req.model !== undefined) commands.push(`/model ${model || d.model || 'default'}`)
-    if (req.effort !== undefined) {
+    if (req.model !== undefined && !officeModel) commands.push(`/model ${model || d.model || 'default'}`)
+    if (req.effort !== undefined && !officeEffort) {
       commands.push(`/effort ${effort || d.effort || 'auto'}`)
       if (effUltra) commands.push('/effort ultracode')
     } else if (req.ultracode !== undefined) commands.push(effUltra ? '/effort ultracode' : '/effort ultracode off')
@@ -9327,6 +9357,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-302 (Agent 14's L5): /model and /effort are TYPED into the running chat, so a caller who is not an administrator needs the typing right on it (mayType, with the Server scope). The setting itself is theirs as the
     // chat's owner and is kept; it applies at the chat's next start.
     if (caller && !access.mayType(caller, a)) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; typing into its running chat is not open to you on this chat, so it applies at its next start.` }
+    if (!commands.length) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; the office's default applies when its chat next starts (nothing is typed into it).` }
     for (const [i, c] of commands.entries()) {
       if (i > 0) await new Promise(r => setTimeout(r, TUNE_GAP_MS))
       if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, c, { human: true }))) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat stopped before it could be set now, so it applies at its next start.` }
@@ -9973,6 +10004,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       return { defaults: chatDefaults.set(r.body) }
     }],
+    // F-284 (the Lead's go, 26 Nov 2026): what the CRM's office default is and what this app does with it (shared/agentic.ts OrgDefaultView). READ ONLY: there is no write route for it, here or anywhere (the CRM page is where the office
+    // changes it). Nothing secret in it. 'local' like GET /defaults: a member answers from the hub's copy (the state frame), never from the CRM.
+    ['GET', /^\/org-default$/, (): OrgDefaultAnswer => ({ orgDefault: orgDefaultView(mode() === 'member' ? (replica.orgDefault ?? null) : orgDefault.kept(), Date.now()) }), 'local'],
     // Settings › Assistant: "Goals on mobile: use the API". Kept on the hub: a member's page asks the hub (not 'local').
     ['GET', /^\/assistant-settings$/, () => ({ settings: assistantSettings.get() })],
     [
@@ -11870,6 +11904,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       bridge: () => chats.live().filter(c => c.bridgeRunId !== undefined).map(c => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)),
     },
     autoUpdateStatus: () => autoUpdate.read(),
+    refreshOrgDefault: () => orgDefault.refresh(),
     async retireChatHost() {
       // Written down first: ending them would otherwise empty the list.
       recovery?.freeze()
@@ -11880,6 +11915,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
       goalProgress.close()
+      orgDefault.close()
       serverData.close()
       executionService?.close()
       messageReceipts.close()

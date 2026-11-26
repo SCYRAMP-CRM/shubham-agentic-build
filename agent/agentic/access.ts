@@ -177,6 +177,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PATCH', /^\/floors\/([^/]+)$/, floor('manage')],
   ['DELETE', /^\/floors\/([^/]+)$/, floor('delete')],
   ['GET', /^\/defaults$/, SIGNED],
+  // F-284: what the CRM's office default is and what this app does with it: read only, nothing secret, like /defaults.
+  ['GET', /^\/org-default$/, SIGNED],
   ['GET', /^\/engine-switch-capabilities$/, SIGNED],
   ['PUT', /^\/defaults$/, OWNER],
   // Settings › Assistant › "Goals on mobile: use the API": the owner's own setting, for the owner's own Assistant.

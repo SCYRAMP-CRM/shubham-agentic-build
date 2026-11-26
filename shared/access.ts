@@ -210,7 +210,7 @@ export const ROUTES: readonly RouteRule[] = [
   r('POST', `${AGENT}\\/(tune|move|chat|run-on|terminate|restart|session|say|say-direct|draft\\/clear|share|attach)`, ['agents'], true),
   // of95c (gate A): conversion-progress too (the chat's own owner's, agent/agentic/index.ts profileOwner), so a non-admin owner's page reads it.
   r('GET', `${AGENT}\\/(messages|chat|draft|deliveries|deliveries\\/[^/]+|attachment\\/[^/]+|conversion-progress)`, ['agents'], true),
-  r('GET', `${A}\\/(offline-chats|codex\\/status|opencode\\/status|codex\\/settings|sync-mode|defaults|engine-switch-capabilities|previews|runs)`, ['agents', 'pc-control'], true),
+  r('GET', `${A}\\/(offline-chats|codex\\/status|opencode\\/status|codex\\/settings|sync-mode|defaults|org-default|engine-switch-capabilities|previews|runs)`, ['agents', 'pc-control'], true),
   // o7e6d (refinement2 line 56): approvals and Send as me are the owner's only: no feature and no share opens them (the policy is OWNER in agent/agentic/access.ts).
   // Orders o66aa / oa76b / o7e97: except a floor's waiting prompts for the people he chose to decide for it, who are always people the floor is
   // shared with: so a share (no feature) lets the list and an answer or a cancel past this gate, and the routes decide (decides(): that chat's

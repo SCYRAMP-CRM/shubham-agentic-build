@@ -596,6 +596,28 @@ export interface ChatRun {
   launchedUltracode?: boolean | null
 }
 
+/**
+ * F-284 (Shubham, order o3177, 18 Nov 2026: "also one more thign to wokrin ont is in teh usage int eh crm please add a defautl tab called defautl for stting deult modle and defautlt effor tand that shit"): GET /agentic/org-default, what the
+ * CRM's office default is and what this app does with it. Read only; nothing in it is secret; there is no write route. CONSTANTS ONLY (Agent 14's rule): the app starts a chat with `appliedModel` and `appliedEffort` ('' = none; a model from
+ * opus, sonnet, haiku and an effort from low..max, chosen by this app) when neither the chat's own agent nor Settings › Chats names one; `notApplied` lists what the office set that this app cannot start a chat with (a model it cannot name, an
+ * effort claude does not take), WITHOUT naming it: the CRM's own strings are never carried on to the page; `ultracode` is what the office set and is never applied (`ultracodeApplied` is false: "set, not yet honoured"). `saved` false: the office
+ * never saved a default (the CRM's placeholder is not shown as a setting: everything is empty).
+ */
+export interface OrgDefaultView {
+  saved: boolean
+  appliedModel: AgentModel
+  appliedEffort: AgentEffort
+  notApplied: ('model' | 'effort')[]
+  ultracode: boolean | null
+  ultracodeApplied: false
+  /** When the hub read it from the CRM (ISO, on this PC's clock). */
+  at: string
+}
+/** GET /agentic/org-default: null while no answer is kept (nobody signed in to the CRM here, an older CRM, nothing read yet, or the last answer is over 24 hours old). */
+export interface OrgDefaultAnswer {
+  orgDefault: OrgDefaultView | null
+}
+
 /** The model a chat without a pinned one runs on, and how the agent came to know it. */
 export interface DefaultModel {
   model: string

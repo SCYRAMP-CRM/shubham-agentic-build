@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-Djtu1LUZ.js";function t(){e(`/goals`)}export{t as default};
