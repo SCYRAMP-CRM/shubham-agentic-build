@@ -218,6 +218,7 @@ import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals, dayOf } from './crm-goals.ts'
 import { createGoalFloors } from './goal-floors.ts'
 import { createGoalProgress } from './goal-progress.ts'
+import { createServerData } from './server-data.ts'
 import { createGoalWait } from './goal-wait.ts'
 import { ANSWERED_LINE, ANSWER_NOT_CLEARED_WORDS, ANSWER_STATUS, ANSWER_WORDS, DISMISSED_LINE, WAIT_OK_WORDS, WAIT_STATUS, WAIT_WORDS, answerMessage, type AnswerRefusal } from '../../shared/goal-wait.ts'
 import { REPORT_OK_WORDS, REPORT_STATUS, REPORT_WORDS, updatePhrase } from '../../shared/goal-progress.ts'
@@ -601,6 +602,8 @@ export interface AgenticOptions {
   orderReplyWaits?: { confirmMs: number; retypeAfterMs: number[] }
   /** F-211, tests: the conversations' copy in the CRM drive on (true) or off (false); left out: on, except inside a test run (and never on a member, nor when switched off). */
   conversationsDrive?: boolean
+  /** F-368, tests: the two folders the data sizes are counted in (left out: this app's state folder and the home folder of the account the chats run as). */
+  serverDataRoots?: { state: string; home: string }
   /** F-211, tests: how often the conversations are looked at (ms); 0: only when a test asks (agentic.conversations.tick). */
   conversationsTickMs?: number
   /**
@@ -1256,6 +1259,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // change tells the first owner's pages with a text-free poke on the events socket (eventFor lets it go to the first owner and nobody else).
   const tellPagesAboutGoals = (floorId: string) => emit({ t: 'goal-progress', floorId })
   const goalProgress = createGoalProgress({ dir: o.dir, log: o.log, onChange: tellPagesAboutGoals })
+  // F-368 (the "i" button's Data tab): how much room each kind of data takes here (server-data.ts). Numbers and fixed ids only; counted when the owner's page asks, and the route never waits for the count. Read only by GET /server-data.
+  const serverData = createServerData({ state: o.serverDataRoots?.state ?? path.resolve(o.dir, '..', '..'), home: o.serverDataRoots?.home ?? os.homedir(), cacheFile: path.join(o.dir, 'server-data.json'), role: mode })
   // F-362: the goals that WAIT for him (one cleaned line each, in the module's own file). Set only by the goal_wait case of toolFor; ended only by his answer or his dismissal (answerWait, dismissWait: his page, human-only);
   // read by GET /floors/:id/goal-progress, by his answer route and by the heartbeat (agentIsWaiting). The same poke tells his pages.
   const goalWait = createGoalWait({ dir: o.dir, log: o.log, onChange: tellPagesAboutGoals })
@@ -3913,6 +3918,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function claudePcsOwnerOnly(r: MountRequest): Caller {
     const c = requireCrmHuman(o.auth, r, true)
     firstOwnerOnly(c, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, 'Which Claude subscription each PC runs on is for the first owner of this app.')
+    return c
+  }
+  /**
+   * F-368, S4 (the Lead's call on Agent 14's point 8): the door of GET /server-data is the FIRST owner's, Shubham's, by id: a signed-in app administrator (requireCrmHuman: a chat's key and every caller who is not a signed-in person
+   * are refused), and then firstOwnerOnly (a second owner is refused 403, so he does not learn how many secrets or ssh files there are). Both come BEFORE the counter is asked, so a refused call starts no count.
+   */
+  function serverDataOwnerOnly(r: MountRequest): Caller {
+    const c = requireCrmHuman(o.auth, r, true)
+    firstOwnerOnly(c, `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`, "How much room the app's data takes is for the first owner of this app.")
     return c
   }
   /** This PC's own status. `detail` false (a PC that is not the owner's own asks the Server): no running chat (their session ids, states and start times) and no CRM account name. */
@@ -9778,6 +9792,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).
     ['GET', /^\/conversations-drive$/, () => conversations.status(), 'local'],
+    // F-368 (the "i" button's Data tab): how much room each kind of data takes on THIS PC: sizes and file counts under fixed ids, never a name or a line of content (server-data.ts). The FIRST owner's only, by id (S4): a signed-in
+    // administrator, not a chat tool, and not a second owner (serverDataOwnerOnly, before the counter is asked); a member answers for itself. "?refresh=1" asks for a new count (at most every 30 s); the answer never waits for the count.
+    ['GET', /^\/server-data$/, (_, r) => (serverDataOwnerOnly(r), serverData.read(r.query.get('refresh') === '1')), 'local'],
     // F-134: Codex on this PC.
     ['GET', /^\/opencode\/status$/, () => openCode.status(), 'local'],
     ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
@@ -11775,6 +11792,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
       goalProgress.close()
+      serverData.close()
       executionService?.close()
       messageReceipts.close()
       nativeReceipts.close()

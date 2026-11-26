@@ -46,19 +46,44 @@ export function needsPcAsk(agent: PcAskAgent, ctx: PcAskContext): boolean {
 }
 
 export interface PcAskPc { id: string; name: string; here: boolean }
-export interface PcChoice extends PcAskPc { label: string }
+/** A PC the app knows of (PC Control's list), and whether it is on now. */
+export interface PcKnown { id: string; name: string; online: boolean }
+/** Why a PC shown in the question cannot be picked now: it is off, or it is on but not linked to the Server (a chat cannot be run on it). */
+export type PcOff = 'off' | 'not-linked'
+/** `off` is left out of a PC that can be picked. */
+export interface PcChoice extends PcAskPc { label: string; off?: PcOff }
 
 /**
  * The PCs the dialog offers, in the order the app lists them, none chosen beforehand. Fail closed: there is no per-person "PCs you may use" rule in
  * the app today, so the FIRST owner (Shubham) sees every PC linked to the Server now, and anyone else (a second owner, staff) only the PC their page is
  * on. (The server's run-on is chat('owner'): it does not look at who may use which PC, so this list is stricter than the route, on purpose.) A PC
  * alone has no list: it still has its one PC, so it is still asked.
+ *
+ * F-329 (Lead's order, 26 Nov: "a picker with the PC names and which are online"): the FIRST owner also sees the other PCs the app knows of that are
+ * not on the list, after the ones that can be picked, each saying why it cannot be (off now, or not linked to the Server). They are never offered
+ * as a choice: a start on them would only fail. A second owner sees none of them (they are not hers to know).
  */
-export function pcChoices(pcs: readonly PcAskPc[], firstOwner: boolean): PcChoice[] {
-  const list = (firstOwner ? pcs : pcs.filter(p => p.here)).map(p => ({ id: p.id, name: p.name, here: p.here, label: p.here ? `${p.name} (this PC)` : p.name }))
-  return list.length ? list : [{ id: '', name: 'This PC', here: true, label: 'This PC' }]
+export function pcChoices(pcs: readonly PcAskPc[], firstOwner: boolean, known: readonly PcKnown[] = []): PcChoice[] {
+  const list: PcChoice[] = (firstOwner ? pcs : pcs.filter(p => p.here)).map(p => ({ id: p.id, name: p.name, here: p.here, label: p.here ? `${p.name} (this PC)` : p.name }))
+  if (!list.length) list.push({ id: '', name: 'This PC', here: true, label: 'This PC' })
+  if (firstOwner) {
+    const seen = new Set<string>([...pcs.map(p => p.id), ''])
+    for (const k of known) {
+      if (seen.has(k.id)) continue
+      seen.add(k.id)
+      const name = k.name.trim() || k.id
+      const off: PcOff = k.online ? 'not-linked' : 'off'
+      list.push({ id: k.id, name, here: false, label: `${name} (${pcOffWords(off)})`, off })
+    }
+  }
+  return list
 }
+
+export const pcOffWords = (off: PcOff) => (off === 'off' ? 'off now' : 'not linked to the Server')
 
 export const pcAskTitle = (agentName: string) => `Open ${agentName.trim() || 'this agent'} on which PC?`
 export const PC_ASK_TEXT = 'Nothing starts until you choose. The chat runs on the PC you pick, and that PC becomes its home.'
 export const PC_ASK_FOOTER = 'A PC that is off or not linked to the Server is not listed.'
+/** Said instead of PC_ASK_FOOTER when a PC that cannot be picked is shown. */
+export const PC_ASK_FOOTER_OFF = 'A PC that is off, or not linked to the Server, is shown but cannot be picked. Start it, then open this agent again.'
+export const pcAskFooter = (choices: readonly PcChoice[]) => (choices.some(c => c.off) ? PC_ASK_FOOTER_OFF : PC_ASK_FOOTER)

@@ -8,13 +8,13 @@ export type OverlayTab = 'chat' | 'goals' | 'notes' | 'tab4' | 'tab5'
 export const OVERLAY_TAB_ORDER: readonly OverlayTab[] = ['chat', 'goals', 'notes', 'tab4', 'tab5']
 
 /** What each tab says on its button and to a screen reader ("Chats": his word; Tab 4 and Tab 5 are labels only). */
-export const OVERLAY_TAB_LABELS: Readonly<Record<OverlayTab, string>> = { chat: 'Chats', goals: 'Goals', notes: 'Notes', tab4: 'Tab 4', tab5: 'Tab 5' }
+export const OVERLAY_TAB_LABELS: Readonly<Record<OverlayTab, string>> = { chat: 'Chats', goals: 'Goals', notes: 'Notes', tab4: 'Questions', tab5: 'Tab 5' }
 
 /** What a tab's button says: the old two-tab row (a setting: the old way stays) says "Chat" as it always did; the five say "Chats". */
 export const tabLabel = (tab: OverlayTab, choice: TabsChoice): string => (choice === 'two' && tab === 'chat' ? 'Chat' : OVERLAY_TAB_LABELS[tab])
 
-/** The tabs that have nothing in them (yet): their body is empty. */
-export const EMPTY_TABS: readonly OverlayTab[] = ['tab4', 'tab5']
+/** The tabs that have nothing in them (yet): their body is empty. F-317 (his order o0933): Tab 4 is the Questions tab now (src/overlay-notes/QuestionsTab.tsx); only Tab 5 is empty. */
+export const EMPTY_TABS: readonly OverlayTab[] = ['tab5']
 
 /** 'five': the row he asked for (the start). 'two': the old row, Chat and Goals only (a device setting, Settings > Chats > Assistant style: the old way stays). */
 export type TabsChoice = 'five' | 'two'

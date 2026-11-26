@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import {
@@ -18,7 +18,7 @@ import {
   type AuthUser,
 } from '../../shared/auth.ts'
 import { apiError } from '../api.ts'
-import { CrmError, listMembers, signIn as crmSignIn, type CrmMember, type CrmSession } from '../claude/crm.ts'
+import { CrmError, listMembers, SESSION_MS as CRM_SESSION_MS, signIn as crmSignIn, type CrmMember, type CrmSession } from '../claude/crm.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { authCookieName } from './cookie-name.ts'
@@ -29,9 +29,11 @@ import { authError, type Caller } from './types.ts'
 // their own CRM account; the agent then issues its OWN session cookie. What is kept, in auth.json
 // (mode 0600): the sha-256 of each session token (never the token), who it is (CRM id, username,
 // name), when it began and was last used; the CRM's member list for the Share picker; and the
-// settings. NEVER a password, a CRM cookie or a session token: the password goes to the CRM once,
-// the CRM cookie is retained only in a private memory companion for F-144 saved-view sync;
-// it is removed with its app session and is unavailable after restart. No CRM cookie is persisted BY THIS MODULE. F-342: the first owner's CRM session is also handed, once, to the
+// settings. NEVER a password, a CRM cookie or a session token IN THE CLEAR: the password goes to the CRM once. A person's own CRM session (the F-144 viewer transport) lives in a private memory companion
+// and is removed with its app session. F-314 (Shubham: "sometimes when people log in to the application ... their CRM is not automatically logged in"): it is ALSO kept in the session's row SEALED
+// under the person's own app cookie (AES-256-GCM, key = HKDF of that cookie's token, which only their browser holds and this file never does), so after a restart their next request unseals it and they are
+// not asked to sign in to the CRM again; the file alone opens nothing. It goes with the row (sign-out, revoke, expiry), when the CRM turns it down (forgetViewerCrm) and after the CRM's own 7 days.
+// SAD_AUTH_CRM_KEEP=off is the way before: memory only, nothing sealed (what an earlier run sealed is scrubbed). The cookie, the key and the plaintext are never logged and never in an answer. F-342: the first owner's CRM session is also handed, once, to the
 // PC's own CRM login (option adoptPcLogin, main.ts): the Claude module keeps it where the Devices sign-in keeps its login, with the same writer, file and mode.
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -62,7 +64,57 @@ interface SessionRow {
   user: AuthUser
   createdAt: number
   lastSeen: number
+  /** F-314: the person's own CRM session, sealed under this session's token (sealCrm). Absent when there is none, or when SAD_AUTH_CRM_KEEP=off. */
+  crm?: SealedCrm
 }
+
+/** F-314: AES-256-GCM, all base64url; useless without the session token, which this file never holds. */
+export interface SealedCrm {
+  v: 1
+  iv: string
+  tag: string
+  data: string
+}
+
+/** F-314: whether a CRM session is kept sealed across a restart when nothing says otherwise. The owner decides this default; SAD_AUTH_CRM_KEEP=on|off overrides it. */
+export const CRM_KEEP_DEFAULT = true
+export const crmKeepOf = (env: NodeJS.ProcessEnv): boolean => (env.SAD_AUTH_CRM_KEEP === 'off' ? false : env.SAD_AUTH_CRM_KEEP === 'on' ? true : CRM_KEEP_DEFAULT)
+
+const SEAL_SALT = 'sad-viewer-crm-v1'
+/** The GCM tag is always 16 bytes (stated on both sides, and checked on what is read back). */
+const SEAL_TAG_BYTES = 16
+const sealKey = (token: string, h: string) => Buffer.from(hkdfSync('sha256', token, SEAL_SALT, h, 32))
+
+/** F-314: seals a person's CRM session under their app session token. The row's hash is bound in (a blob cannot be moved to another row). */
+export function sealCrm(token: string, session: CrmSession): SealedCrm {
+  const h = hash(token)
+  const iv = randomBytes(12)
+  const c = createCipheriv('aes-256-gcm', sealKey(token, h), iv, { authTagLength: SEAL_TAG_BYTES })
+  c.setAAD(Buffer.from(h))
+  const data = Buffer.concat([c.update(JSON.stringify(session), 'utf8'), c.final()])
+  return { v: 1, iv: iv.toString('base64url'), tag: c.getAuthTag().toString('base64url'), data: data.toString('base64url') }
+}
+
+/** F-314: the session back, or null for anything that is not exactly what sealCrm made under this token (wrong token, another row, a changed byte, a shape that is not a CRM session). Never throws, never says why. */
+export function unsealCrm(token: string, sealed: SealedCrm): CrmSession | null {
+  try {
+    const h = hash(token)
+    // A shortened GCM tag is accepted by Node unless the length is stated (DEP0182): the tag must be exactly 16 bytes, here and in the decipher, so a cut tag opens nothing.
+    const tag = Buffer.from(sealed.tag, 'base64url')
+    if (tag.length !== SEAL_TAG_BYTES) return null
+    const d = createDecipheriv('aes-256-gcm', sealKey(token, h), Buffer.from(sealed.iv, 'base64url'), { authTagLength: SEAL_TAG_BYTES })
+    d.setAAD(Buffer.from(h))
+    d.setAuthTag(tag)
+    const raw: unknown = JSON.parse(Buffer.concat([d.update(Buffer.from(sealed.data, 'base64url')), d.final()]).toString('utf8'))
+    if (!isObject(raw) || !str(raw.url) || !str(raw.cookie) || typeof raw.signedInAt !== 'string' || !isObject(raw.user) || !str(raw.user.id)) return null
+    return raw as unknown as CrmSession
+  } catch {
+    return null
+  }
+}
+
+const sealedOf = (v: unknown): SealedCrm | null =>
+  isObject(v) && v.v === 1 && str(v.iv) && v.iv.length <= 32 && str(v.tag) && v.tag.length <= 32 && str(v.data) && v.data.length <= 16_384 ? { v: 1, iv: v.iv, tag: v.tag, data: v.data } : null
 
 interface Trial {
   previous: AuthRequire
@@ -108,7 +160,8 @@ export function parseFile(raw: unknown): FileShape {
     for (const s of raw.sessions) {
       const user = isObject(s) ? userOf(s.user) : null
       if (!isObject(s) || !user || !str(s.h) || typeof s.createdAt !== 'number' || typeof s.lastSeen !== 'number') continue
-      f.sessions.push({ h: s.h, user, createdAt: s.createdAt, lastSeen: s.lastSeen })
+      const crm = sealedOf(s.crm)
+      f.sessions.push({ h: s.h, user, createdAt: s.createdAt, lastSeen: s.lastSeen, ...(crm ? { crm } : {}) })
     }
   }
   if (Array.isArray(raw.directory)) f.directory = raw.directory.map(userOf).filter((u): u is AuthUser => u !== null)
@@ -209,6 +262,7 @@ export function createAuth(o: AuthOptions): Auth {
   // (cookieOf) and every write (cookieHeader: the sign-in and the one that ends a session); a cookie with any other name is never this agent's session.
   const cookieName = authCookieName(env, m => log?.warn(m))
 
+  const keepCrm = crmKeepOf(env)
   let f = load()
   const viewerSessions = new Map<string, CrmSession>()
   let dirty = false
@@ -236,6 +290,12 @@ export function createAuth(o: AuthOptions): Auth {
     dirty = false
     savedAt = now()
     writeAtomic(o.file, `${JSON.stringify(f, null, 2)}\n`, 0o600)
+  }
+
+  // SAD_AUTH_CRM_KEEP=off is the way before: nothing sealed stays on disk (what an earlier run sealed is scrubbed at once).
+  if (!keepCrm && f.sessions.some(s => s.crm)) {
+    for (const s of f.sessions) delete s.crm
+    save()
   }
 
   /** Break-glass: SAD_AUTH=off, or the file. Read again at most once a second. */
@@ -307,6 +367,32 @@ export function createAuth(o: AuthOptions): Auth {
       const why: AuthEnded | null = t - s.createdAt >= SESSION_MS ? 'expired' : t - s.lastSeen >= IDLE_MS ? 'idle' : null
       if (why) drop(s.h, why)
     }
+  }
+
+  /** F-314: this row's sealed CRM session is no good any more (not what was sealed, the CRM turned it down, its 7 days are up): it is taken out, once. */
+  function unseal(h: string) {
+    const row = f.sessions.find(s => s.h === h)
+    if (!row?.crm) return
+    delete row.crm
+    save()
+  }
+
+  /** F-314: a session's viewer transport: in memory, or after a restart unsealed from its row with the token THIS request brought (only the person's own browser has it). */
+  function viewerSession(token: string): CrmSession | null {
+    const h = hash(token)
+    const live = viewerSessions.get(h)
+    if (live || !keepCrm) return live ?? null
+    const row = f.sessions.find(s => s.h === h)
+    if (!row?.crm) return null
+    const session = unsealCrm(token, row.crm)
+    const signedIn = session ? Date.parse(session.signedInAt) : Number.NaN
+    // Not what was sealed here, or another person's, or past the CRM's own 7 days: gone for good (a non-date is left to the CRM to answer for).
+    if (!session || session.user.id.toLowerCase() !== row.user.id.toLowerCase() || (Number.isFinite(signedIn) && now() >= signedIn + CRM_SESSION_MS)) {
+      unseal(h)
+      return null
+    }
+    viewerSessions.set(h, session)
+    return session
   }
 
   function drop(h: string, why: AuthEnded) {
@@ -422,9 +508,13 @@ export function createAuth(o: AuthOptions): Auth {
     fails.delete(login.toLowerCase())
     const token = randomBytes(32).toString('base64url')
     const t = now()
-    f.sessions.push({ h: hash(token), user, createdAt: t, lastSeen: t })
-    // Only a validated office member gets a viewer transport; never persist it.
-    if (self && self.role !== 'client') viewerSessions.set(hash(token), session)
+    const row: SessionRow = { h: hash(token), user, createdAt: t, lastSeen: t }
+    f.sessions.push(row)
+    // Only a validated office member gets a viewer transport. F-314: it is kept in memory and, unless SAD_AUTH_CRM_KEEP=off, sealed in this row under the token (never in the clear).
+    if (self && self.role !== 'client') {
+      viewerSessions.set(row.h, session)
+      if (keepCrm) row.crm = sealCrm(token, session)
+    }
     sweep()
     save()
     log?.info(`${user.username} (${user.id.slice(0, 8)}) signed in${c.via === 'tailnet' ? ' over the tailnet' : ''}`)
@@ -570,7 +660,7 @@ export function createAuth(o: AuthOptions): Auth {
       const c = caller(headers)
       const token = cookieOf(headers)
       if (!c.person || !token) return null
-      const session = viewerSessions.get(hash(token))
+      const session = viewerSession(token)
       return session?.user.id.toLowerCase() === c.person.id ? session : null
     },
     viewerLoginFor(userId) {
@@ -586,7 +676,10 @@ export function createAuth(o: AuthOptions): Auth {
     },
     forgetViewerCrm(headers) {
       const token = cookieOf(headers)
-      if (token) viewerSessions.delete(hash(token))
+      if (!token) return
+      const h = hash(token)
+      viewerSessions.delete(h)
+      unseal(h)
     },
     caller,
     require,

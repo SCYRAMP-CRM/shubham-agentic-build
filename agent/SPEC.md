@@ -3493,6 +3493,17 @@ agent, on HTTP, on every WebSocket and in the chats' tools, never only hidden in
   "sign out everywhere" end it at once; open sockets get `{t:'auth', ended}` and close with 4401). Five wrong tries a minute per
   username, thirty for the whole app (429 `slow-down`). Nothing secret is logged: deny lines carry the username, the id's first 8
   characters, the route and the chat id's first 8.
+  F-314 (Shubham: "sometimes when people log in to the application ... their CRM is not automatically logged in"): a person's own CRM session (the
+  viewer transport the CRM proxy, saved views and the Drive use) was kept in memory only, so after a restart (an Update) they were still signed in to
+  the app (7 days) but the CRM said "sign in again". It is now ALSO kept in the session's row in `auth.json` SEALED under their own app cookie:
+  AES-256-GCM, key = HKDF-SHA256 of the cookie's token (which only their browser holds; the file keeps its sha-256), the row's hash bound in as
+  associated data, a fresh 96-bit iv. The next request after a restart unseals it with the cookie it brings. The file alone opens nothing. It goes
+  with the row (sign-out, revoke, 7 days, 12 h idle), when the CRM turns the session down (`forgetViewerCrm`) and after the CRM's own 7 days; a blob
+  that does not open, is another person's, or is past those days is taken out of the file. `SAD_AUTH_CRM_KEEP=off` is the way before (memory only;
+  what an earlier run sealed is scrubbed at start); `on` keeps it; with neither, `CRM_KEEP_DEFAULT` decides. The first owner's CRM login for this PC
+  (F-342, `crm-session.json`) is a different thing and unchanged. In plain words: a sealed CRM bearer now sits on disk for up to 7 days, and opening it
+  needs both the file and the person's own cookie, so the file alone is not enough. The GCM tag is always 16 bytes: it is stated when sealing and
+  unsealing, and a tag that does not decode to exactly 16 bytes opens nothing (the blob is removed).
 - **Where it sits**: the token (`x-sad-token`, added by the page server) stays the machine boundary; the cookie is the person boundary
   on top. `api.ts` resolves the cookie after the token check (`callerOf`), gates every route and WebSocket (`gate`: 401 `sign-in` when
   this request has to be signed in, 403 `admin-only` for the core routes and every mount that is not `scoped`), and gives the caller to

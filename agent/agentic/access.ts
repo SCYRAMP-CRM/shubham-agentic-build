@@ -137,6 +137,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/offline-chats$/, SIGNED],
   // F-211: the conversations' copy in the CRM drive, chat by chat (the owner of the app only).
   ['GET', /^\/conversations-drive$/, OWNER],
+  // F-368: how much room each kind of data takes here (the "i" button's Data tab): sizes under fixed ids only. The owner of the app by this row; the route then asks for a signed-in administrator and the FIRST owner by id (a second owner is refused),
+  // and refuses a chat's key, all before the counter is asked.
+  ['GET', /^\/server-data$/, OWNER],
   // F-134: Codex on this PC: its status (names only), asking the CRM now, and the setting.
   ['GET', /^\/codex\/status$/, SIGNED],
   ['GET', /^\/opencode\/status$/, SIGNED],
