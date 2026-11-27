@@ -29,7 +29,10 @@ export const AGENTS_AKASH_ROUTE = '/agents-akash'
 export const MEMORY_AKASH_ROUTE = '/memory-akash'
 
 // F-340: "Agents (new)" is now Agents (Shubham): the same blank page, the same address and Access key (agents-new), only the words changed.
-export const AGENTS_NEW: BlankPage = { route: AGENTS_NEW_ROUTE, label: 'Agents (Shubham)', blurb: 'New Agents page for Shubham, blank', key: 'agents-new', access: 'Shubham’s new Agents page: blank for now, redesigned step by step.' }
+// F-374 (his words, 27 Nov 2026: "Please create an Add Agent button and only have the name in it so only the agent will be added ... Basically add agents and just the name of the agent, nothing else", then "There is already
+// a page Agents(Shubham)"): the page is NOT blank any more (src/pages/AgentsShubham.tsx: a list of agents, each only a name, and an Add Agent button; the right side stays blank). Its address, label and Access key stay as F-340
+// left them, so the router, the chooser, Settings > Access and the owner's list still name it from this one place; only its two sentences changed, as the Memory page's did (F-328). It left BLANK_PAGES below.
+export const AGENTS_NEW: BlankPage = { route: AGENTS_NEW_ROUTE, label: 'Agents (Shubham)', blurb: 'Your agents, just their names', key: 'agents-new', access: 'Shubham’s Agents page: add agents, each just a name. Only the owners can see or add them.' }
 export const PLATFORM_SHUBHAM: BlankPage = { route: PLATFORM_SHUBHAM_ROUTE, label: 'Agentic Platform (Shubham)', blurb: 'New platform for Shubham, blank', key: 'platform-shubham', access: 'Shubham’s new Agentic Platform: blank for now, he designs it step by step.' }
 export const PLATFORM_AKASH: BlankPage = { route: PLATFORM_AKASH_ROUTE, label: 'Agentic Platform (Akash)', blurb: 'New platform for Akash, blank', key: 'platform-akash', access: 'Akash’s new Agentic Platform: blank for now.' }
 export const AGENTS_AKASH: BlankPage = { route: AGENTS_AKASH_ROUTE, label: 'Agents (Akash)', blurb: 'New Agents page for Akash, blank', key: 'agents-akash', access: 'Akash’s Agents page: blank for now.' }
@@ -38,5 +41,5 @@ export const MEMORY_AKASH: BlankPage = { route: MEMORY_AKASH_ROUTE, label: 'Memo
 // Settings > Access and the owner's list still name it from this one place; only its two sentences changed. This file keeps its name for now.
 export const MEMORY: BlankPage = { route: MEMORY_ROUTE, label: 'Memory (Shubham)', blurb: 'What the app has kept about you', key: 'memory', access: 'The Memory page: your own memory, read only. Other people’s memory comes later.' }
 
-/** The pages that are still blank (F-328 built the Memory page; F-340 added four), in the menu's order. */
-export const BLANK_PAGES: readonly BlankPage[] = [PLATFORM_SHUBHAM, PLATFORM_AKASH, AGENTS_NEW, AGENTS_AKASH, MEMORY_AKASH]
+/** The pages that are still blank (F-328 built the Memory page, F-374 the Agents (Shubham) page; F-340 added four), in the menu's order. */
+export const BLANK_PAGES: readonly BlankPage[] = [PLATFORM_SHUBHAM, PLATFORM_AKASH, AGENTS_AKASH, MEMORY_AKASH]

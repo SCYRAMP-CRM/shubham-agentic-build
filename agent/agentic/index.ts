@@ -183,6 +183,7 @@ import { appliedFromCopy, createOrgDefault, NO_ORG_DEFAULT, orgDefaultView, pars
 import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createQuickSettings } from './quick-settings.ts'
 import { createChatSettings } from './chat-settings.ts'
+import { createNamedAgents, type NamedAgentsStore } from './named-agents.ts'
 import { createGoalAddCap, GOAL_ADD_ALL_CAP_WORDS, GOAL_ADD_CAP_WORDS, GOAL_ADD_OTHER_PERSON_WORDS } from './goal-add-cap.ts'
 import { createQuickForwarding } from './quick-forwarding.ts'
 import { quickUntappedSender } from '../../shared/quick-forwarding.ts'
@@ -888,6 +889,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const briefsDir = path.join(o.dir, 'briefs')
   // F-345: "Chats put tasks in Goals" (the hub's one choice, default on; see tasksToGoalsFor). Declared here, before any chat can start.
   const tasksToGoalsStore = createChatSettings(path.join(o.dir, 'chat-settings.json'))
+  // F-374 (Shubham, 27 Nov 2026: "Please create an Add Agent button and only have the name in it"; the page "Agents (Shubham)", /agents-new): the list of NAMED AGENTS, an agent being ONLY a name, in one small file
+  // (named-agents.json) on the hub. Read and written only by the two /named-agents routes (the owner's page); no chat tool, no floor, no notebook and no memory layer touches it.
+  const namedAgents = createNamedAgents({ dir: o.dir, log })
   if (tasksToGoalsStore.unreadable()) log?.warn('chats put tasks in Goals: the saved choice (chat-settings.json) could not be read; chats start the old way (no standing paragraph) until he chooses again in Settings')
   // F-345 (Agent 14's read): at most 20 new goals an hour from one agent's chat, and 60 across all chats (toolFor's crm_goal_add case, the one place; the owner's hand-add is a person's tap and is not counted).
   const goalAddCap = createGoalAddCap()
@@ -6471,6 +6475,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     throw authError(403, words, 'admin-only')
   }
   /**
+   * F-374: who a /named-agents route is for: a signed-in CRM person who is an administrator of the app. In this order, and BEFORE the list is read or written: a chat's key is refused (a chat must not make or read agents),
+   * then every non-person (humanOnly: the open app, a machine token, an expired cookie), then a person who is not an administrator (403). Fail closed here as well as in the policy row (OWNER).
+   */
+  function namedAgentsOwner(r: MountRequest): NamedAgentsStore {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, 'Only the owner\'s page may do this; not a chat tool.', 'not-yours')
+    humanOnly(r)
+    if (!access.isAdmin(callerOf(r))) throw authError(403, 'The agents list is for the owners of this app.', 'admin-only')
+    return namedAgents
+  }
+  /**
    * F-359: GET /beats -> { engineOn, unreadable, beats: { "<floorId>|<agentId>": ChatBeatView } }. A signed-in person (humanOnly: a chat's key and a machine token are refused) who is the FIRST owner by id (firstOwnerOnly: a second owner too).
    */
   function beatsRead(r: MountRequest) {
@@ -9822,6 +9836,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (store.get().tasksToGoals !== was) log?.info(`chats put tasks in Goals: ${store.get().tasksToGoals ? 'on' : 'off'} (a chat gets it when it next starts)`)
       return store.answer()
     }],
+    // F-374: the list of named agents ("Agents (Shubham)"): the owners' page lists them and adds one; the body's `name` is all that is read. Each row first asks namedAgentsOwner(r).
+    ['GET', /^\/named-agents$/, (_, r) => ({ agents: namedAgentsOwner(r).list() })],
+    ['POST', /^\/named-agents$/, (_, r) => ({ agent: namedAgentsOwner(r).add(r.body) })],
     [
       'POST',
       /^\/fast\/names$/,

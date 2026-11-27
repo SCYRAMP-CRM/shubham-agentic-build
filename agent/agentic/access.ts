@@ -110,6 +110,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // F-345: "Chats put tasks in Goals" (the first owner's only: the route asks for the first owner by id, and a signed-in person for the PUT).
   ['GET', /^\/chat-settings$/, OWNER],
   ['PUT', /^\/chat-settings$/, OWNER],
+  // F-374: the list of named agents (the Agents (Shubham) page): the owners of the app, each route asking for a signed-in person who is an administrator.
+  ['GET', /^\/named-agents$/, OWNER],
+  ['POST', /^\/named-agents$/, OWNER],
   ['GET', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/morning$/, OWNER],
   ['PATCH', /^\/heartbeat$/, OWNER],
